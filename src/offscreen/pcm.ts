@@ -49,6 +49,14 @@ export class SpeechPreprocessor {
     this.firHistory = new Float32Array(FIR_TAPS - 1);
   }
 
+  reset(): void {
+    this.hpPrevIn = 0;
+    this.hpPrevOut = 0;
+    this.firHistory.fill(0);
+    this.resampleBuffer = new Float32Array(0);
+    this.resamplePos = 0;
+  }
+
   process(chunk: Float32Array<ArrayBuffer>): Float32Array<ArrayBuffer> {
     // 1. Highpass (zustandsbehaftet über Chunk-Grenzen)
     const hp = new Float32Array(chunk.length);

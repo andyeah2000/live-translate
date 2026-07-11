@@ -1,4 +1,6 @@
 // Läuft im AudioWorklet-Kontext (eigener Thread, eigene Globals).
+export {};
+
 declare abstract class AudioWorkletProcessor {
   readonly port: MessagePort;
 }

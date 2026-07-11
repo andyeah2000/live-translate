@@ -1,15 +1,15 @@
 import type { AudioSettings, Message, SessionSettings } from '../messages';
 import { GeminiTranslator } from './gemini';
-import { SourceVoiceDetector, sourceDuckGain, sourcePathMix } from './voice-detector';
+import { NeuralVoiceDetector } from './neural-vad';
+import { sourceDuckGain, sourcePathMix } from './voice-detector';
 
-// Dynamisches Ducking wird ausschließlich von Sprache im englischen Quellton
-// gesteuert. Musik, Raketenklang und Atmo bleiben bei 100 %, sobald niemand
-// spricht. Während Quellsprache sinkt der komplette Originalmix weich auf den
-// eingestellten Pegel (standardmäßig 10 %).
+// Dynamisches Ducking wird ausschließlich von Sprachaktivität im Quellton
+// gesteuert. Im vorgesehenen englischen Video bleiben Musik, Raketenklang und
+// Atmo bei 100 %, sobald niemand spricht. Während Sprache sinkt der komplette
+// Originalmix weich auf den eingestellten Pegel (standardmäßig 10 %).
 //
-// Robustheitsprinzip: Ein Tick berechnet alle Soll-Werte alle 50 ms komplett
-// neu aus dem aktuellen Zustand – es gibt keine Einzel-Events, die verloren
-// gehen könnten.
+// Silero v6.2 analysiert lückenlos 32-ms-Frames lokal in einem Worker. Der Tick
+// überträgt nur den daraus abgeleiteten Zustand auf den Audio-Graphen.
 const TICK_MS = 50;
 const DUCK_ATTACK_S = 0.025;
 const DUCK_RELEASE_S = 0.08;
@@ -29,11 +29,7 @@ interface ActiveSession {
   translatedGain: GainNode;
   modelDirect: GainNode;
   modelBoosted: GainNode;
-  bandAnalyser: AnalyserNode;
-  totalAnalyser: AnalyserNode;
-  bandBuffer: Float32Array<ArrayBuffer>;
-  totalBuffer: Float32Array<ArrayBuffer>;
-  voiceDetector: SourceVoiceDetector;
+  vad: NeuralVoiceDetector;
   client: GeminiTranslator;
   tickTimer: number;
   dubbing: boolean;
@@ -45,7 +41,12 @@ interface ActiveSession {
   lastTranslatedTarget: number;
   lastCalloutTarget: number;
   lastSourcePathTarget: number;
-  wasSpeaking: boolean;
+  sourceSpeaking: boolean;
+  resumePending: boolean;
+  vadReady: boolean;
+  vadProbability: number;
+  vadError: string | null;
+  geminiReady: boolean;
 }
 
 let session: ActiveSession | null = null;
@@ -110,7 +111,10 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
 
     const ctx = new AudioContext();
     pendingContext = ctx;
-    if (ctx.state !== 'running') await ctx.resume().catch(() => {});
+    if (ctx.state !== 'running') await ctx.resume();
+    if (ctx.state !== 'running') {
+      throw new Error(`Chrome konnte die Audio-Engine nicht starten (Status: ${ctx.state}).`);
+    }
     if (generation !== startGeneration) {
       for (const track of media.getTracks()) track.stop();
       void ctx.close().catch(() => {});
@@ -134,24 +138,6 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     const sourceDynamicGain = ctx.createGain();
     sourceDynamicGain.gain.value = initialSourceMix.dynamic;
     source.connect(sourceDynamicGain).connect(ctx.destination);
-
-    // Separater Analysepfad: 250–4000 Hz gegen den Gesamtpegel. Dadurch lösen
-    // tiefe Triebwerke und Rumpeln das Ducking nicht aus; der hörbare Pfad
-    // selbst bleibt vollständig breitbandig und unverfälscht.
-    const speechHighpass = ctx.createBiquadFilter();
-    speechHighpass.type = 'highpass';
-    speechHighpass.frequency.value = 250;
-    speechHighpass.Q.value = Math.SQRT1_2;
-    const speechLowpass = ctx.createBiquadFilter();
-    speechLowpass.type = 'lowpass';
-    speechLowpass.frequency.value = 4000;
-    speechLowpass.Q.value = Math.SQRT1_2;
-    const bandAnalyser = ctx.createAnalyser();
-    bandAnalyser.fftSize = 1024;
-    source.connect(speechHighpass).connect(speechLowpass).connect(bandAnalyser);
-    const totalAnalyser = ctx.createAnalyser();
-    totalAnalyser.fftSize = 1024;
-    source.connect(totalAnalyser);
 
     // KI-Feed mit live umschaltbarem Callout-Boost: zwei parallele Wege
     // (direkt / komprimiert) in einen Sammelbus – das Gehörte ist unberührt.
@@ -217,8 +203,17 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       },
       onStatus: (status: string) => {
         if (session?.sessionId !== sessionId) return;
-        send({ type: 'offscreen-status', sessionId, status });
+        send({ type: 'offscreen-status', sessionId, status: withDuckingWarning(status) });
       },
+      onReadyChange: (ready: boolean) => {
+        if (session?.sessionId !== sessionId) return;
+        session.geminiReady = ready;
+        session.lastDuckGain = Number.NaN;
+        tick();
+        publishDuckingTelemetry(sessionId);
+      },
+      canContinueWithoutTranscript: () =>
+        session?.sessionId === sessionId && session.dubbing,
       onError: (detail: string) => {
         console.error('[live-translate] Gemini-Fehler:', detail);
         if (session?.sessionId !== sessionId) return;
@@ -227,6 +222,25 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       }
     };
     const client = new GeminiTranslator(clientOptions);
+    const vad = new NeuralVoiceDetector({
+      ctx,
+      source,
+      onSpeechChange: (speaking, probability) => {
+        if (session?.sessionId !== sessionId) return;
+        session.sourceSpeaking = speaking;
+        session.vadProbability = probability;
+        session.lastDuckGain = Number.NaN;
+        console.debug(
+          `[live-translate] Silero-Ducking ${speaking ? 'AN' : 'AUS'} (p=${probability.toFixed(3)})`
+        );
+        tick();
+        publishDuckingTelemetry(sessionId);
+      },
+      onError: (detail) => {
+        if (session?.sessionId !== sessionId) return;
+        handleVadFailure(sessionId, detail);
+      }
+    });
 
     session = {
       sessionId,
@@ -238,11 +252,7 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       translatedGain,
       modelDirect,
       modelBoosted,
-      bandAnalyser,
-      totalAnalyser,
-      bandBuffer: new Float32Array(bandAnalyser.fftSize),
-      totalBuffer: new Float32Array(totalAnalyser.fftSize),
-      voiceDetector: new SourceVoiceDetector(),
+      vad,
       client,
       tickTimer: setInterval(() => {
         try {
@@ -260,7 +270,12 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       lastTranslatedTarget: -1,
       lastCalloutTarget: -1,
       lastSourcePathTarget: -1,
-      wasSpeaking: false
+      sourceSpeaking: false,
+      resumePending: false,
+      vadReady: false,
+      vadProbability: 0,
+      vadError: null,
+      geminiReady: false
     };
     pendingMedia = null;
     pendingContext = null;
@@ -279,6 +294,15 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       return;
     }
     applyAudioSettings(latestAudio);
+    try {
+      await vad.start();
+      if (session?.sessionId !== sessionId) return;
+      session.vadReady = true;
+      publishDuckingTelemetry(sessionId);
+    } catch (error) {
+      if (session?.sessionId !== sessionId) return;
+      handleVadFailure(sessionId, error instanceof Error ? error.message : String(error));
+    }
     await client.start();
   } catch (err) {
     console.error('[live-translate] Start fehlgeschlagen:', err);
@@ -297,42 +321,37 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
   }
 }
 
-function rmsOf(analyser: AnalyserNode, buffer: Float32Array<ArrayBuffer>): number {
-  analyser.getFloatTimeDomainData(buffer);
-  let sum = 0;
-  for (let i = 0; i < buffer.length; i++) {
-    const value = buffer[i] ?? 0;
-    sum += value * value;
-  }
-  return Math.sqrt(sum / buffer.length);
-}
-
 function tick(): void {
   if (!session) return;
   const { ctx } = session;
-  // Selbstheilung, falls Chrome den AudioContext pausiert hat.
-  if (ctx.state === 'suspended') void ctx.resume().catch(() => {});
-
-  const bandRms = rmsOf(session.bandAnalyser, session.bandBuffer);
-  const totalRms = rmsOf(session.totalAnalyser, session.totalBuffer);
-  const decision = session.voiceDetector.update({
-    bandRms,
-    totalRms,
-    nowMs: performance.now()
-  });
-  const speaking = decision.speaking;
-  if (speaking !== session.wasSpeaking) {
-    session.wasSpeaking = speaking;
-    console.debug(
-      `[live-translate] Quellen-Ducking ${speaking ? 'AN' : 'AUS'} (band=${bandRms.toFixed(4)}, ratio=${decision.bandRatio.toFixed(2)})`
-    );
+  // Selbstheilung mit sichtbarem Fehler statt stumm geschluckter Resume-Probleme.
+  if (ctx.state === 'suspended' && !session.resumePending) {
+    session.resumePending = true;
+    const sessionId = session.sessionId;
+    void ctx
+      .resume()
+      .then(() => {
+        if (session?.sessionId === sessionId) session.resumePending = false;
+      })
+      .catch((error) => {
+        if (session?.sessionId !== sessionId) return;
+        stop();
+        send({
+          type: 'offscreen-error',
+          sessionId,
+          detail: `Chrome hat die Audio-Engine angehalten: ${error instanceof Error ? error.message : String(error)}`
+        });
+      });
   }
+
+  const speaking = session.sourceSpeaking;
 
   // Soll-Werte komplett aus dem aktuellen Zustand ableiten.
   const duckGain = sourceDuckGain({
     dubbing: session.dubbing,
     fullOriginal: session.fullOriginal,
     sourceSpeaking: speaking,
+    translationReady: session.geminiReady,
     backgroundVolume: session.originalVolume
   });
   const sourceMix = sourcePathMix({
@@ -395,19 +414,70 @@ function applyAudioSettings(settings: AudioSettings): void {
   session.lastTranslatedTarget = -1;
   session.lastCalloutTarget = -1;
   session.lastSourcePathTarget = -1;
+  publishDuckingTelemetry(session.sessionId);
 }
 
 function clamp01(value: number, fallback: number): number {
   return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : fallback;
 }
 
+function withDuckingWarning(status: string): string {
+  return session?.vadError ? `${status} · Ducking aus (Original 100 %)` : status;
+}
+
+function handleVadFailure(sessionId: string, detail: string): void {
+  if (session?.sessionId !== sessionId || session.vadError) return;
+  console.error('[live-translate] Lokale Spracherkennung ausgefallen:', detail);
+  session.vad.stop();
+  session.vadReady = false;
+  session.vadError = detail;
+  session.sourceSpeaking = false;
+  session.vadProbability = 0;
+  session.lastDuckGain = Number.NaN;
+  tick();
+  publishDuckingTelemetry(sessionId);
+  send({
+    type: 'offscreen-status',
+    sessionId,
+    status: 'Ducking nicht verfügbar · Original bleibt bei 100 %'
+  });
+}
+
+function publishDuckingTelemetry(sessionId: string): void {
+  if (session?.sessionId !== sessionId) return;
+  const sourceGain = sourceDuckGain({
+    dubbing: session.dubbing,
+    fullOriginal: session.fullOriginal,
+    sourceSpeaking: session.sourceSpeaking,
+    translationReady: session.geminiReady,
+    backgroundVolume: session.originalVolume
+  });
+  send({
+    type: 'ducking-telemetry',
+    sessionId,
+    telemetry: {
+      ready: session.vadReady,
+      speaking: session.sourceSpeaking,
+      sourceGain,
+      probability: session.vadProbability,
+      error: session.vadError,
+      translationReady: session.geminiReady
+    }
+  });
+}
+
 function stop(): void {
   startGeneration++;
   if (!session) return;
-  const { client, media, captureTrack, ctx, tickTimer } = session;
+  const { client, vad, media, captureTrack, ctx, tickTimer } = session;
   session = null;
   clearInterval(tickTimer);
   captureTrack.onended = null;
+  try {
+    vad.stop();
+  } catch (err) {
+    console.warn('[live-translate] Spracherkennung konnte nicht sauber gestoppt werden:', err);
+  }
   try {
     client.stop();
   } catch (err) {

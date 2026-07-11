@@ -85,6 +85,21 @@
         color: var(--danger);
         font-weight: 600;
       }
+      #duckingMonitor {
+        margin: 8px 0;
+        padding: 7px 9px;
+        border-radius: 6px;
+        font-weight: 600;
+        background: color-mix(in srgb, currentColor 7%, transparent);
+      }
+      #duckingMonitor[data-state="active"] {
+        color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 14%, transparent);
+      }
+      #duckingMonitor[data-state="error"] {
+        color: var(--danger);
+        background: color-mix(in srgb, var(--danger) 12%, transparent);
+      }
       .hint {
         opacity: 0.7;
         font-size: 11px;
@@ -201,17 +216,21 @@
         100&nbsp;%, sobald im englischen Quellvideo niemand spricht. Nur während
         englischer Sprache sinkt der komplette Originalmix weich auf den Pegel unten.
       </div>
+      <div id="duckingMonitor" data-state="idle" role="status" aria-live="polite">
+        Lokale Silero-KI: bereit
+      </div>
       <label>
         Gemini-Stimme: <strong id="translationValue"></strong>
         <input type="range" id="translationVolume" min="0" max="100" step="5" />
       </label>
       <label>
-        Original während der Übersetzung: <strong id="volumeValue"></strong>
+        Original während erkannter Sprache: <strong id="volumeValue"></strong>
         <input type="range" id="originalVolume" min="0" max="100" step="5" />
       </label>
       <div class="hint">
-        Standard: 10&nbsp;%. Die Absenkung reagiert auf Sprache im Quellvideo,
-        nicht auf die später einsetzende Gemini-Stimme. Sobald die englische
+        Standard: 10&nbsp;%. Eine vollständig lokale neuronale Silero-KI erkennt
+        Sprache im Quellvideo – auch über Musik und Raketen-Atmo – und steuert
+        die Absenkung. Sie reagiert nicht auf die später einsetzende Gemini-Stimme. Sobald die englische
         Sprache endet, kehrt der Originalton automatisch auf exakt 100&nbsp;% zurück.
       </div>
     </fieldset>

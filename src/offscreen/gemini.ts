@@ -9,6 +9,7 @@ const SEND_CHUNK_MS = 100;
 const MAX_RECONNECTS = 8;
 const CONNECT_TIMEOUT_MS = 15_000;
 const MAX_BUFFERED_BYTES = 1_000_000;
+const BACKPRESSURE_RECOVERY_BYTES = MAX_BUFFERED_BYTES / 2;
 // Close-Codes, bei denen ein Reconnect sinnlos ist (Konfig-/Protokollfehler).
 // 1008 gehört bewusst NICHT dazu: Gemini beendet damit auch reguläre
 // Sitzungen nach Ablauf des Zeitlimits (goAway) – das ist reconnectbar.
@@ -26,6 +27,8 @@ interface GeminiServerMessage {
   error?: { message?: string };
 }
 
+export type TranscriptionPlacement = 'setup' | 'generation' | 'disabled';
+
 export interface GeminiTranslatorOptions {
   apiKey: string;
   ctx: AudioContext;
@@ -34,37 +37,57 @@ export interface GeminiTranslatorOptions {
   targetLanguage: string;
   onTranscript(text: string, final: boolean): void;
   onStatus(status: string): void;
+  onReadyChange(ready: boolean): void;
+  canContinueWithoutTranscript(): boolean;
   onError(detail: string): void;
 }
 
-export function createGeminiSetup(targetLanguage: string): object {
-  return {
-    setup: {
-      model: MODEL,
-      generationConfig: {
-        responseModalities: ['AUDIO'],
-        translationConfig: {
-          targetLanguageCode: targetLanguage,
-          echoTargetLanguage: false
-        }
-      },
-      // Wichtig: Der Raw-v1beta-WebSocket erwartet dieses Feld direkt unter
-      // `setup`. In generationConfig beendet die produktive Runtime die
-      // Verbindung mit Code 1007 (Unknown name "outputAudioTranscription").
-      outputAudioTranscription: {},
-      // Gegen falsch erkannte Wörter bei Musik/Atmo im Hintergrund:
-      // Sprachanfänge eifrig erkennen und mit Vorlauf senden (nichts
-      // abschneiden), Sätze nicht vorschnell beenden.
-      realtimeInputConfig: {
-        automaticActivityDetection: {
-          startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
-          prefixPaddingMs: 300,
-          endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
-          silenceDurationMs: 800
-        }
+export function createGeminiSetup(
+  targetLanguage: string,
+  transcriptionPlacement: TranscriptionPlacement = 'setup'
+): object {
+  const generationConfig: Record<string, unknown> = {
+    responseModalities: ['AUDIO'],
+    translationConfig: {
+      targetLanguageCode: targetLanguage,
+      echoTargetLanguage: false
+    }
+  };
+  const setup: Record<string, unknown> = {
+    model: MODEL,
+    generationConfig,
+    // Gegen falsch erkannte Wörter bei Musik/Atmo im Hintergrund:
+    // Sprachanfänge eifrig erkennen und mit Vorlauf senden (nichts
+    // abschneiden), Sätze nicht vorschnell beenden.
+    realtimeInputConfig: {
+      automaticActivityDetection: {
+        startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
+        prefixPaddingMs: 300,
+        endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
+        silenceDurationMs: 800
       }
     }
   };
+  // Die produktive Raw-v1beta-Runtime und die aktuelle Live-Translate-Doku
+  // haben dieses Feld zeitweise an unterschiedlichen Stellen verlangt. Der
+  // Client beherrscht beide Schemata und kann als letzte Stufe ohne Transkript
+  // weiterübersetzen.
+  if (transcriptionPlacement === 'setup') setup.outputAudioTranscription = {};
+  else if (transcriptionPlacement === 'generation') {
+    generationConfig.outputAudioTranscription = {};
+  }
+  return { setup };
+}
+
+export function nextTranscriptionPlacement(
+  current: TranscriptionPlacement,
+  closeCode: number,
+  reason: string
+): TranscriptionPlacement | null {
+  if (closeCode !== 1007 || !/output.?audio.?transcription/i.test(reason)) return null;
+  if (current === 'setup') return 'generation';
+  if (current === 'generation') return 'disabled';
+  return null;
 }
 
 export class GeminiTranslator {
@@ -72,6 +95,8 @@ export class GeminiTranslator {
   private worklet: AudioWorkletNode | null = null;
   private silentSink: GainNode | null = null;
   private ready = false;
+  private connectionReady = false;
+  private backpressured = false;
   private stopped = false;
   private reconnectAttempts = 0;
   private pendingChunks: Int16Array[] = [];
@@ -79,13 +104,14 @@ export class GeminiTranslator {
   private nextPlayTime = 0;
   private reconnectTimer: number | null = null;
   private connectTimer: number | null = null;
+  private transcriptionPlacement: TranscriptionPlacement = 'setup';
   private readonly playingSources = new Set<AudioBufferSourceNode>();
   private readonly preprocessor: SpeechPreprocessor;
   private readonly sendRate = 16000;
 
   constructor(private readonly opts: GeminiTranslatorOptions) {
     // Gemini Live Translate akzeptiert ausschließlich PCM16/16 kHz. Der
-    // Der optionale Highpass sitzt bereits im Audio-Graphen;
+    // optionale Highpass sitzt bereits im Audio-Graphen;
     // hier folgen nur Anti-Aliasing und Resampling.
     this.preprocessor = new SpeechPreprocessor(opts.ctx.sampleRate, { highpass: false });
   }
@@ -111,7 +137,7 @@ export class GeminiTranslator {
 
   stop(): void {
     this.stopped = true;
-    this.ready = false;
+    this.setConnectionReady(false);
     this.clearTimers();
     this.clearPlaybackQueue();
     if (this.worklet) {
@@ -134,9 +160,10 @@ export class GeminiTranslator {
 
   private openSocket(): void {
     if (this.stopped) return;
-    this.ready = false;
+    this.setConnectionReady(false);
     this.pendingChunks = [];
     this.pendingSamples = 0;
+    this.preprocessor.reset();
     this.clearConnectTimer();
 
     const ws = new WebSocket(`${WS_URL}?key=${encodeURIComponent(this.opts.apiKey)}`);
@@ -150,7 +177,9 @@ export class GeminiTranslator {
       }
     }, CONNECT_TIMEOUT_MS);
     ws.onopen = () => {
-      ws.send(JSON.stringify(createGeminiSetup(this.opts.targetLanguage)));
+      ws.send(
+        JSON.stringify(createGeminiSetup(this.opts.targetLanguage, this.transcriptionPlacement))
+      );
     };
     ws.onmessage = (event) =>
       void this.handleServerMessage(ws, event.data as string | Blob | ArrayBuffer);
@@ -160,8 +189,9 @@ export class GeminiTranslator {
   private handleClose(ws: WebSocket, event: CloseEvent): void {
     if (this.stopped || ws !== this.ws) return;
     this.clearConnectTimer();
-    this.ready = false;
+    this.setConnectionReady(false);
     const reason = `Code ${event.code}${event.reason ? `: ${event.reason}` : ''}`;
+    if (this.scheduleTranscriptionFallback(event.code, event.reason, reason)) return;
     if (PERMANENT_CLOSE_CODES.has(event.code)) {
       this.fail(`Gemini hat die Verbindung abgelehnt (${reason})`);
       return;
@@ -191,10 +221,18 @@ export class GeminiTranslator {
   }
 
   private handleCapturedAudio(chunk: Float32Array<ArrayBuffer>): void {
-    if (!this.ready || this.ws?.readyState !== WebSocket.OPEN) return;
-    // Bei einem langsamen Netz lieber den aktuellsten kurzen Abschnitt
-    // verwerfen als mehrere Sekunden verspätetes Audio anzustauen.
-    if (this.ws.bufferedAmount > MAX_BUFFERED_BYTES) return;
+    if (!this.connectionReady || this.ws?.readyState !== WebSocket.OPEN) return;
+    // Bei einem langsamen Netz keine Sprache leise stellen, die Gemini nicht
+    // erhält. Hysterese verhindert Flattern an der Puffergrenze.
+    if (this.ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+      this.enterBackpressure();
+      return;
+    }
+    if (this.backpressured) {
+      if (this.ws.bufferedAmount > BACKPRESSURE_RECOVERY_BYTES) return;
+      this.setBackpressured(false);
+      this.opts.onStatus(this.runningStatus());
+    }
     const samples = this.preprocessor.process(chunk);
     if (samples.length === 0) return;
     const pcm = floatToInt16(samples);
@@ -202,7 +240,10 @@ export class GeminiTranslator {
     this.pendingSamples += pcm.length;
     const chunkSize = (this.sendRate * SEND_CHUNK_MS) / 1000;
     while (this.pendingSamples >= chunkSize) {
-      if (this.ws.bufferedAmount > MAX_BUFFERED_BYTES) break;
+      if (this.ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+        this.enterBackpressure();
+        break;
+      }
       const outgoing = this.takePendingSamples(chunkSize);
       this.ws.send(
         JSON.stringify({
@@ -233,6 +274,13 @@ export class GeminiTranslator {
     }
 
     if (msg.error?.message) {
+      if (this.scheduleTranscriptionFallback(1007, msg.error.message, msg.error.message)) {
+        // Der folgende Close-Event gehört noch zur verworfenen Verbindung und
+        // darf keinen zweiten Reconnect auslösen.
+        this.ws = null;
+        if (ws.readyState === WebSocket.OPEN) ws.close(1000, 'transcription schema fallback');
+        return;
+      }
       this.fail(`Gemini-Fehler: ${msg.error.message}`);
       return;
     }
@@ -245,11 +293,11 @@ export class GeminiTranslator {
       return;
     }
     if (msg.setupComplete !== undefined) {
-      this.ready = true;
+      this.setConnectionReady(true);
       this.clearConnectTimer();
       // Erfolgreich verbunden – Reconnect-Budget zurücksetzen.
       this.reconnectAttempts = 0;
-      this.opts.onStatus('Übersetzung läuft (Gemini)');
+      this.opts.onStatus(this.runningStatus());
       return;
     }
 
@@ -311,6 +359,67 @@ export class GeminiTranslator {
   private clearConnectTimer(): void {
     if (this.connectTimer !== null) window.clearTimeout(this.connectTimer);
     this.connectTimer = null;
+  }
+
+  private setReady(ready: boolean): void {
+    if (this.ready === ready) return;
+    this.ready = ready;
+    this.opts.onReadyChange(ready);
+  }
+
+  private setConnectionReady(ready: boolean): void {
+    this.connectionReady = ready;
+    if (!ready) this.backpressured = false;
+    this.setReady(ready && !this.backpressured);
+  }
+
+  private setBackpressured(backpressured: boolean): void {
+    this.backpressured = backpressured;
+    this.setReady(this.connectionReady && !backpressured);
+  }
+
+  private enterBackpressure(): void {
+    if (this.backpressured) return;
+    this.pendingChunks = [];
+    this.pendingSamples = 0;
+    this.preprocessor.reset();
+    this.setBackpressured(true);
+    this.opts.onStatus('Netz überlastet · Original bleibt bei 100 %');
+  }
+
+  private runningStatus(): string {
+    return this.transcriptionPlacement === 'disabled'
+      ? 'Übersetzung läuft (Gemini, Untertitel-Transkript nicht verfügbar)'
+      : 'Übersetzung läuft (Gemini)';
+  }
+
+  private scheduleTranscriptionFallback(
+    closeCode: number,
+    serverReason: string,
+    logReason: string
+  ): boolean {
+    const fallback = nextTranscriptionPlacement(
+      this.transcriptionPlacement,
+      closeCode,
+      serverReason
+    );
+    if (!fallback || (fallback === 'disabled' && !this.opts.canContinueWithoutTranscript())) {
+      return false;
+    }
+    this.clearConnectTimer();
+    this.setConnectionReady(false);
+    this.transcriptionPlacement = fallback;
+    const status =
+      fallback === 'disabled'
+        ? 'Gemini verbindet ohne Untertitel-Transkript neu…'
+        : 'Gemini passt das Transkript-Protokoll an…';
+    console.warn(`[live-translate] ${status} (${logReason})`);
+    this.opts.onStatus(status);
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.openSocket();
+    }, 250);
+    return true;
   }
 
   private clearTimers(): void {

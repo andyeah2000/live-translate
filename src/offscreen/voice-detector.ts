@@ -1,27 +1,20 @@
-export interface VoiceMeasurement {
-  bandRms: number;
-  totalRms: number;
-  nowMs: number;
-}
-
 export interface VoiceDecision {
   speaking: boolean;
-  bandRatio: number;
+  probability: number;
 }
 
-// Hysterese hält kurze Silbenpausen zusammen. Der Verhältniswert unterdrückt
-// tieffrequente Raketen-/Motorgeräusche, deren Energie überwiegend außerhalb
-// des Sprachbands liegt.
-const START_MIN_RMS = 0.01;
-const START_MIN_RATIO = 0.48;
-const CONTINUE_MIN_RMS = 0.005;
-const CONTINUE_MIN_RATIO = 0.3;
-const RELEASE_HOLD_MS = 80;
+const POSITIVE_THRESHOLD = 0.55;
+const IMMEDIATE_THRESHOLD = 0.85;
+const NEGATIVE_THRESHOLD = 0.25;
+const ATTACK_WINDOW_FRAMES = 3;
+const ATTACK_POSITIVE_FRAMES = 2;
+const RELEASE_NEGATIVE_FRAMES = 4;
 
 export interface DuckingState {
   dubbing: boolean;
   fullOriginal: boolean;
   sourceSpeaking: boolean;
+  translationReady: boolean;
   backgroundVolume: number;
 }
 
@@ -30,13 +23,20 @@ export interface DuckingState {
  * Sprache im Quellvideo darf das Original absenken.
  */
 export function sourceDuckGain(state: DuckingState): number {
-  if (!state.dubbing || state.fullOriginal || !state.sourceSpeaking) return 1;
+  if (
+    !state.dubbing ||
+    state.fullOriginal ||
+    !state.sourceSpeaking ||
+    !state.translationReady
+  ) {
+    return 1;
+  }
   return Number.isFinite(state.backgroundVolume)
     ? Math.min(1, Math.max(0, state.backgroundVolume))
     : 1;
 }
 
-/** Exakte Pfadwahl: Full-Modus ist 100 % Dry und 0 % EQ-Pfad. */
+/** Exakte Pfadwahl: Full-Modus ist 100 % Dry und 0 % dynamischer Pfad. */
 export function sourcePathMix(state: Pick<DuckingState, 'dubbing' | 'fullOriginal'>): {
   dry: number;
   dynamic: number;
@@ -45,31 +45,45 @@ export function sourcePathMix(state: Pick<DuckingState, 'dubbing' | 'fullOrigina
   return useDryBypass ? { dry: 1, dynamic: 0 } : { dry: 0, dynamic: 1 };
 }
 
-/** Zustandsbehaftete Aktivitätserkennung auf dem englischen Quellton. */
-export class SourceVoiceDetector {
+/**
+ * Hysterese für Silero-v6-Wahrscheinlichkeiten (ein Frame = 32 ms).
+ * Zwei positive Frames innerhalb von drei starten das Ducking; vier sicher
+ * negative Frames beenden es. Ungültige Werte gelten immer als Nicht-Sprache,
+ * damit ein VAD-Fehler den Originalton niemals dauerhaft leise hält.
+ */
+export class SpeechProbabilityDetector {
   private speaking = false;
-  private lastVoiceAt = Number.NEGATIVE_INFINITY;
+  private readonly attackWindow: boolean[] = [];
+  private negativeFrames = 0;
 
-  update(measurement: VoiceMeasurement): VoiceDecision {
-    const bandRms = finitePositive(measurement.bandRms);
-    const totalRms = finitePositive(measurement.totalRms);
-    const nowMs = Number.isFinite(measurement.nowMs) ? measurement.nowMs : 0;
-    const bandRatio = totalRms > 0.001 ? bandRms / totalRms : 0;
-    const hasVoiceEnergy = this.speaking
-      ? bandRms >= CONTINUE_MIN_RMS && bandRatio >= CONTINUE_MIN_RATIO
-      : bandRms >= START_MIN_RMS && bandRatio >= START_MIN_RATIO;
-
-    if (hasVoiceEnergy) {
-      this.lastVoiceAt = nowMs;
-      this.speaking = true;
-    } else if (this.speaking && nowMs - this.lastVoiceAt >= RELEASE_HOLD_MS) {
-      this.speaking = false;
+  update(value: number): VoiceDecision {
+    const probability = Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+    if (!this.speaking) {
+      if (probability >= IMMEDIATE_THRESHOLD) {
+        this.speaking = true;
+        this.negativeFrames = 0;
+        this.attackWindow.length = 0;
+        return { speaking: true, probability };
+      }
+      this.attackWindow.push(probability >= POSITIVE_THRESHOLD);
+      if (this.attackWindow.length > ATTACK_WINDOW_FRAMES) this.attackWindow.shift();
+      if (this.attackWindow.filter(Boolean).length >= ATTACK_POSITIVE_FRAMES) {
+        this.speaking = true;
+        this.negativeFrames = 0;
+        this.attackWindow.length = 0;
+      }
+    } else if (probability < NEGATIVE_THRESHOLD) {
+      this.negativeFrames++;
+      if (this.negativeFrames >= RELEASE_NEGATIVE_FRAMES) this.reset();
+    } else {
+      this.negativeFrames = 0;
     }
-
-    return { speaking: this.speaking, bandRatio };
+    return { speaking: this.speaking, probability };
   }
-}
 
-function finitePositive(value: number): number {
-  return Number.isFinite(value) && value > 0 ? value : 0;
+  reset(): void {
+    this.speaking = false;
+    this.negativeFrames = 0;
+    this.attackWindow.length = 0;
+  }
 }

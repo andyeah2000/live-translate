@@ -7,7 +7,7 @@ const mock = `<script>
 globalThis.chrome = {
   storage: {
     local: {
-      async get() { return { settingsVersion: 3, geminiKey: 'test-key', dubbing: true }; },
+      async get() { return { settingsVersion: 4, geminiKey: 'test-key', dubbing: true }; },
       async set() {},
       async remove() {}
     }
@@ -15,7 +15,7 @@ globalThis.chrome = {
   runtime: {
     lastError: null,
     async sendMessage(message) {
-      if (message.type === 'get-state') return { running: false, tabId: null, sessionId: null, status: 'Bereit', error: null };
+      if (message.type === 'get-state') return { running: false, tabId: null, sessionId: null, status: 'Bereit', error: null, ducking: null };
       return { ok: true };
     },
     onMessage: { addListener() {} }

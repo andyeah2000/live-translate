@@ -34,7 +34,8 @@ let state: SessionState = {
   tabId: null,
   sessionId: null,
   status: 'Bereit',
-  error: null
+  error: null,
+  ducking: null
 };
 
 function selectedAudioMode(): AudioMode {
@@ -43,7 +44,7 @@ function selectedAudioMode(): AudioMode {
 
 function collectSettings(): SessionSettings {
   return {
-    settingsVersion: 3,
+    settingsVersion: 4,
     subtitles: subtitlesInput.checked,
     dubbing: dubbingInput.checked,
     originalVolume: Number(originalVolumeInput.value) / 100,
@@ -67,6 +68,33 @@ function renderState(): void {
   toggleButton.setAttribute('aria-pressed', String(state.running));
   if (state.error) setStatus(state.error, true);
   else setStatus(state.status === 'Bereit' ? '' : state.status);
+  renderDuckingState();
+}
+
+function renderDuckingState(): void {
+  const monitor = el<HTMLDivElement>('#duckingMonitor');
+  if (!state.running) {
+    monitor.textContent = 'Lokale Silero-KI: bereit';
+    monitor.dataset.state = 'idle';
+  } else if (state.ducking?.error) {
+    monitor.textContent = 'Ducking nicht verfügbar · Original 100 %';
+    monitor.dataset.state = 'error';
+  } else if (!state.ducking?.ready) {
+    monitor.textContent = 'Lokale Silero-KI wird geladen…';
+    monitor.dataset.state = 'loading';
+  } else if (state.ducking.speaking && !state.ducking.translationReady) {
+    monitor.textContent = 'Stimme erkannt · Gemini verbindet · Original 100 %';
+    monitor.dataset.state = 'loading';
+  } else if (state.ducking.speaking && state.ducking.sourceGain < 1) {
+    monitor.textContent = `Stimme erkannt · Original ${Math.round(state.ducking.sourceGain * 100)} %`;
+    monitor.dataset.state = 'active';
+  } else if (state.ducking.speaking) {
+    monitor.textContent = 'Stimme erkannt · Ducking ist deaktiviert';
+    monitor.dataset.state = 'idle';
+  } else {
+    monitor.textContent = 'Keine Stimme · Original 100 %';
+    monitor.dataset.state = 'idle';
+  }
 }
 
 function getStreamId(tabId: number): Promise<string> {

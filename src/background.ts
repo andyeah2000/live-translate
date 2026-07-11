@@ -6,7 +6,8 @@ const EMPTY_STATE: SessionState = {
   tabId: null,
   sessionId: null,
   status: 'Bereit',
-  error: null
+  error: null,
+  ducking: null
 };
 
 // Zählt Sitzungswechsel, damit ein fehlgeschlagener Start keine später
@@ -25,12 +26,14 @@ async function getState(): Promise<SessionState> {
   const validTabId = typeof stored.tabId === 'number' ? stored.tabId : null;
   const validSessionId = typeof stored.sessionId === 'string' ? stored.sessionId : null;
   const running = stored.running === true && validTabId !== null && validSessionId !== null;
+  const ducking = parseDuckingTelemetry(stored.ducking);
   return {
     running,
     tabId: running ? validTabId : null,
     sessionId: running ? validSessionId : null,
     status: typeof stored.status === 'string' ? stored.status : EMPTY_STATE.status,
-    error: typeof stored.error === 'string' ? stored.error : null
+    error: typeof stored.error === 'string' ? stored.error : null,
+    ducking: running ? ducking : null
   };
 }
 
@@ -101,7 +104,21 @@ async function startSession(
     }
     await ensureOffscreenDocument();
     await chrome.storage.session.set({ subtitlesEnabled: settings.subtitles });
-    await setState({ running: true, tabId, sessionId, status: 'Verbinde…', error: null });
+    await setState({
+      running: true,
+      tabId,
+      sessionId,
+      status: 'Verbinde…',
+      error: null,
+      ducking: {
+        ready: false,
+        speaking: false,
+        sourceGain: 1,
+        probability: 0,
+        error: null,
+        translationReady: false
+      }
+    });
     await sendToOffscreen({ type: 'offscreen-start', sessionId, streamId, settings });
     return { ok: true };
   } catch (err) {
@@ -130,7 +147,8 @@ async function stopSession(error: string | null = null): Promise<void> {
     tabId: null,
     sessionId: null,
     status: error ? 'Fehler' : 'Gestoppt',
-    error
+    error,
+    ducking: null
   });
 }
 
@@ -214,11 +232,38 @@ chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse) => {
         if (state.running && state.sessionId === msg.sessionId) await stopSession(msg.detail);
       }).catch((err) => console.warn('[live-translate] Fehlerbehandlung fehlgeschlagen:', err));
       break;
+    case 'ducking-telemetry':
+      void enqueueSessionOperation(async () => {
+        const state = await getState();
+        if (state.running && state.sessionId === msg.sessionId) {
+          await setState({ ...state, ducking: parseDuckingTelemetry(msg.telemetry) });
+        }
+      }).catch((err) => console.warn('[live-translate] Ducking-Status fehlgeschlagen:', err));
+      break;
     default:
       break;
   }
   return undefined;
 });
+
+function parseDuckingTelemetry(value: unknown): SessionState['ducking'] {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as Record<string, unknown>;
+  return {
+    ready: candidate.ready === true,
+    speaking: candidate.speaking === true,
+    sourceGain:
+      typeof candidate.sourceGain === 'number' && Number.isFinite(candidate.sourceGain)
+        ? Math.min(1, Math.max(0, candidate.sourceGain))
+        : 1,
+    probability:
+      typeof candidate.probability === 'number' && Number.isFinite(candidate.probability)
+        ? Math.min(1, Math.max(0, candidate.probability))
+        : 0,
+    error: typeof candidate.error === 'string' ? candidate.error : null,
+    translationReady: candidate.translationReady === true
+  };
+}
 
 // Nach Browser-Neustart oder Extension-Update: eventuell übrig gebliebene
 // Offscreen-Dokumente schließen und den Zustand zurücksetzen.

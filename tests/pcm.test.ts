@@ -49,6 +49,17 @@ test('invalid input sample rates fail explicitly', () => {
   assert.throws(() => new SpeechPreprocessor(8_000), /Samplerate/);
 });
 
+test('reset discards pre-reconnect filter and resampler history', () => {
+  const stale = Float32Array.from({ length: 4_321 }, (_, i) => Math.sin(i * 0.13));
+  const freshInput = Float32Array.from({ length: 7_777 }, (_, i) => Math.cos(i * 0.07));
+  const reused = new SpeechPreprocessor(48_000, { highpass: false });
+  reused.process(stale);
+  reused.reset();
+  const afterReset = reused.process(freshInput);
+  const clean = new SpeechPreprocessor(48_000, { highpass: false }).process(freshInput);
+  assert.deepEqual(afterReset, clean);
+});
+
 test('one second remains one second at common browser sample rates', () => {
   for (const rate of [44_100, 48_000, 96_000]) {
     const input = new Float32Array(rate);

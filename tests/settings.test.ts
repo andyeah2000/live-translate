@@ -6,7 +6,7 @@ test('sanitizeSettings falls back safely for corrupt storage', () => {
   assert.deepEqual(sanitizeSettings(null), DEFAULT_SETTINGS);
   assert.deepEqual(
     sanitizeSettings({
-      settingsVersion: 3,
+      settingsVersion: 4,
       subtitles: 'yes',
       dubbing: 1,
       originalVolume: Number.NaN,
@@ -43,7 +43,7 @@ test('legacy settings migrate once to Gemini-only 10-percent dynamic ducking', (
     audioMode: 'filtered',
     calloutBoost: false
   });
-  assert.equal(migrated.settingsVersion, 3);
+  assert.equal(migrated.settingsVersion, 4);
   assert.equal(migrated.originalVolume, 0.1);
   assert.equal(migrated.translationVolume, 0.8);
   assert.equal(migrated.fullOriginal, false);

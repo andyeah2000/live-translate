@@ -21,7 +21,7 @@ const TARGET_LANGUAGES = new Set([
   'ar'
 ]);
 export const DEFAULT_SETTINGS: SessionSettings = {
-  settingsVersion: 3,
+  settingsVersion: 4,
   subtitles: true,
   dubbing: true,
   originalVolume: 0.1,
@@ -66,9 +66,9 @@ export function sanitizeSettings(value: unknown): SessionSettings {
     settingsVersion: DEFAULT_SETTINGS.settingsVersion,
     subtitles: booleanValue(candidate.subtitles, DEFAULT_SETTINGS.subtitles),
     dubbing: booleanValue(candidate.dubbing, DEFAULT_SETTINGS.dubbing),
-    // Version 3 ersetzt das alte, frequenzselektive EQ-Ducking durch echtes
-    // Pegel-Ducking. Alte 15-%-/Bypass-Defaults würden die neue Funktion sonst
-    // unbemerkt deaktivieren; deshalb einmalig auf den gewünschten 10-%-Modus.
+    // Version 4 ersetzt das alte RMS-Gate durch lokale Silero-VAD. Alte
+    // 15-%-/Bypass-Werte würden die neue Funktion sonst unbemerkt deaktivieren;
+    // deshalb einmalig auf den gewünschten dynamischen 10-%-Modus migrieren.
     originalVolume: isCurrentVersion
       ? volumeValue(candidate.originalVolume, DEFAULT_SETTINGS.originalVolume)
       : DEFAULT_SETTINGS.originalVolume,
