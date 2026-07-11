@@ -10,8 +10,8 @@ ab. Es gibt keinen zweiten Sprachdienst und keinen Zwischenserver.
 Der Originalton läuft normalerweise unverarbeitet mit 100 %. Erkennt der
 lokale Analysepfad Sprache im englischen Quellvideo, wird der komplette
 Originalmix weich auf den eingestellten Pegel abgesenkt (Standard: 10 %).
-Sobald die Quellsprache endet, kehren Musik, Raketenklang und Atmo innerhalb
-weniger Millisekunden auf 100 % zurück.
+Sobald die Quellsprache endet, kehren Musik, Raketenklang und Atmo mit einer
+kurzen, pumpfreien Ausblendung (typisch unter 250 ms) auf 100 % zurück.
 
 Die Spracherkennung hört ausschließlich den Quellstream. Geminis zeitversetzte
 Übersetzungsstimme kann das Ducking daher nicht künstlich verlängern. Ein
