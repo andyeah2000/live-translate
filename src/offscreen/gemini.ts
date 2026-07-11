@@ -43,15 +43,15 @@ export function createGeminiSetup(targetLanguage: string): object {
       model: MODEL,
       generationConfig: {
         responseModalities: ['AUDIO'],
-        // Aktuelles offizielles Live-Translate-Schema: Transkription gehört in
-        // generationConfig. Sie liefert die übersetzten Untertitel parallel
-        // zur nativen Gemini-Audioausgabe.
-        outputAudioTranscription: {},
         translationConfig: {
           targetLanguageCode: targetLanguage,
           echoTargetLanguage: false
         }
       },
+      // Wichtig: Der Raw-v1beta-WebSocket erwartet dieses Feld direkt unter
+      // `setup`. In generationConfig beendet die produktive Runtime die
+      // Verbindung mit Code 1007 (Unknown name "outputAudioTranscription").
+      outputAudioTranscription: {},
       // Gegen falsch erkannte Wörter bei Musik/Atmo im Hintergrund:
       // Sprachanfänge eifrig erkennen und mit Vorlauf senden (nichts
       // abschneiden), Sätze nicht vorschnell beenden.

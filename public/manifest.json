@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Live Translate DE",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Übersetzt englische Videos und Livestreams live mit Gemini – inklusive intelligenter Originalton-Absenkung.",
   "permissions": ["tabCapture", "offscreen", "storage", "activeTab", "scripting"],
   "host_permissions": [
