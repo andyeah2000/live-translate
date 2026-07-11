@@ -1,0 +1,19 @@
+{
+  "name": "live-translate",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "bundle": "node build.mjs",
+    "build": "npm run typecheck && npm test && npm run bundle",
+    "check": "npm run build && npm audit --audit-level=moderate"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.280",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.23.0",
+    "typescript": "^5.6.0"
+  }
+}

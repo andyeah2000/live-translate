@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <title>Live Translate DE</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --accent: #1a7f37;
+        --danger: #cf222e;
+      }
+      body {
+        font-family: system-ui, sans-serif;
+        font-size: 13px;
+        line-height: 1.4;
+        width: 340px;
+        box-sizing: border-box;
+        margin: 0;
+        padding: 14px;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 12px;
+      }
+      fieldset {
+        border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+        border-radius: 6px;
+        margin: 0 0 10px;
+        padding: 8px 10px;
+      }
+      legend {
+        font-weight: 600;
+        padding: 0 4px;
+      }
+      label {
+        display: block;
+        margin: 6px 0;
+      }
+      label.inline {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      input[type="password"],
+      input[type="text"],
+      select {
+        width: 100%;
+        box-sizing: border-box;
+        margin-top: 2px;
+        padding: 4px 6px;
+      }
+      input[type="range"] {
+        width: 100%;
+      }
+      #toggle {
+        width: 100%;
+        padding: 8px;
+        font-size: 14px;
+        font-weight: 600;
+        border-radius: 6px;
+        border: none;
+        cursor: pointer;
+        color: white;
+        background: var(--accent);
+      }
+      #toggle.running {
+        background: var(--danger);
+      }
+      #toggle:disabled {
+        cursor: wait;
+        opacity: 0.65;
+      }
+      #toggle:focus-visible,
+      input:focus-visible,
+      select:focus-visible {
+        outline: 2px solid #0969da;
+        outline-offset: 2px;
+      }
+      #status {
+        margin-top: 8px;
+        min-height: 16px;
+        white-space: pre-wrap;
+      }
+      #status.error {
+        color: var(--danger);
+        font-weight: 600;
+      }
+      .hint {
+        opacity: 0.7;
+        font-size: 11px;
+        margin-top: 2px;
+      }
+      label:has(input:disabled) {
+        opacity: 0.55;
+      }
+      .full-original {
+        margin: 8px 0 4px;
+        padding: 7px 8px;
+        border-radius: 6px;
+        background: color-mix(in srgb, currentColor 7%, transparent);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --accent: #2da44e;
+          --danger: #ff7b72;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        * {
+          scroll-behavior: auto !important;
+          transition: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Live Translate</h1>
+
+    <fieldset>
+      <legend>Sprachen</legend>
+      <label>
+        Zielsprache (Übersetzung)
+        <select id="targetLanguage">
+          <option value="de">Deutsch</option>
+          <option value="en">Englisch</option>
+          <option value="es">Spanisch</option>
+          <option value="fr">Französisch</option>
+          <option value="it">Italienisch</option>
+          <option value="pt-BR">Portugiesisch (Brasilien)</option>
+          <option value="pt-PT">Portugiesisch (Portugal)</option>
+          <option value="nl">Niederländisch</option>
+          <option value="pl">Polnisch</option>
+          <option value="tr">Türkisch</option>
+          <option value="ru">Russisch</option>
+          <option value="uk">Ukrainisch</option>
+          <option value="ja">Japanisch</option>
+          <option value="ko">Koreanisch</option>
+          <option value="zh-Hans">Chinesisch (vereinfacht)</option>
+          <option value="zh-Hant">Chinesisch (traditionell)</option>
+          <option value="hi">Hindi</option>
+          <option value="ar">Arabisch</option>
+        </select>
+      </label>
+      <div class="hint">
+          Für englische Videos optimiert. Gemini erkennt Sprache automatisch;
+          Änderungen gelten ab dem nächsten Start.
+      </div>
+    </fieldset>
+
+      <fieldset>
+        <legend>Gemini Live Translate</legend>
+        <label>
+          Gemini API-Key
+          <input type="password" id="geminiKey" placeholder="AIza..." autocomplete="off" />
+        </label>
+        <div class="hint">
+          Einzige Übersetzungs- und Sprach-Engine. Der Key wird nur lokal in
+          diesem Browser gespeichert.
+        </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Audio zur KI</legend>
+      <label class="inline">
+        <input type="radio" name="audioMode" value="filtered" />
+        Sprachoptimiert (empfohlen)
+      </label>
+      <label class="inline">
+        <input type="radio" name="audioMode" value="native" />
+        Natürlich, ohne Sprach-Highpass
+      </label>
+      <label class="inline">
+        <input type="checkbox" id="calloutBoost" />
+        Leise Stimmen anheben (Funk-Callouts)
+      </label>
+      <div class="hint">
+        „Sprachoptimiert" entfernt Tiefbass; „Natürlich" erhält den Klang vor
+        der für Gemini nötigen Übertragung möglichst unverändert. Gemini
+        wird in beiden Modi normgerecht auf 16&nbsp;kHz umgerechnet.
+        Der Callout-Boost hebt leise Sprecher nur für die KI an – das Gehörte
+        bleibt unverändert – und wirkt sofort.
+      </div>
+    </fieldset>
+
+      <fieldset>
+        <legend>Ausgabe &amp; intelligentes Ducking</legend>
+      <label class="inline">
+        <input type="checkbox" id="subtitles" />
+        Untertitel einblenden
+      </label>
+      <label class="inline">
+        <input type="checkbox" id="dubbing" />
+        Übersetzte Tonspur abspielen
+      </label>
+      <label class="inline full-original">
+        <input type="checkbox" id="fullOriginal" />
+        <strong>Originalton immer 100 % (Ducking aus)</strong>
+      </label>
+      <div class="hint">
+        Ausgeschaltet (empfohlen): Musik, Raketenklang und Atmo bleiben bei
+        100&nbsp;%, sobald im englischen Quellvideo niemand spricht. Nur während
+        englischer Sprache sinkt der komplette Originalmix weich auf den Pegel unten.
+      </div>
+      <label>
+        Gemini-Stimme: <strong id="translationValue"></strong>
+        <input type="range" id="translationVolume" min="0" max="100" step="5" />
+      </label>
+      <label>
+        Original während der Übersetzung: <strong id="volumeValue"></strong>
+        <input type="range" id="originalVolume" min="0" max="100" step="5" />
+      </label>
+      <div class="hint">
+        Standard: 10&nbsp;%. Die Absenkung reagiert auf Sprache im Quellvideo,
+        nicht auf die später einsetzende Gemini-Stimme. Sobald die englische
+        Sprache endet, kehrt der Originalton automatisch auf exakt 100&nbsp;% zurück.
+      </div>
+    </fieldset>
+
+    <button id="toggle" type="button" aria-pressed="false">Übersetzung starten</button>
+    <div id="status" role="status" aria-live="polite"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
