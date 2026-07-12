@@ -24,8 +24,7 @@ const runningState = (tabId: number, sessionId: string, status = 'Läuft') => ({
 });
 
 let sessionStore: Record<string, unknown> = {
-  sessionState: runningState(1, 'session-a'),
-  subtitlesEnabled: true
+  sessionState: runningState(1, 'session-a')
 };
 let runtimeListener!: (
   message: Record<string, unknown>,
@@ -38,7 +37,6 @@ let updatedListener!: (tabId: number, changeInfo: { status?: string }) => void;
 let sessionGetGate:
   | { snapshot: unknown; started: boolean; release: Deferred<void> }
   | null = null;
-let subtitlesGetGate: { started: boolean; release: Deferred<void>; value: boolean } | null = null;
 let subtitleSendGate: Deferred<void> | null = null;
 let clearSendGate: Deferred<void> | null = null;
 let tabMessages: Array<{ tabId: number; message: Record<string, unknown> }> = [];
@@ -61,13 +59,6 @@ const chromeMock = {
             await gate.release.promise;
             return { sessionState: gate.snapshot };
           }
-        }
-        if (key === 'subtitlesEnabled' && subtitlesGetGate) {
-          const gate = subtitlesGetGate;
-          subtitlesGetGate = null;
-          gate.started = true;
-          await gate.release.promise;
-          return { subtitlesEnabled: gate.value };
         }
         return { [key]: sessionStore[key] };
       },
@@ -157,9 +148,8 @@ async function sessionBarrier(sessionId: string, status: string): Promise<void> 
 }
 
 function reset(state = runningState(1, 'session-a')): void {
-  sessionStore = { sessionState: state, subtitlesEnabled: true };
+  sessionStore = { sessionState: state };
   sessionGetGate = null;
-  subtitlesGetGate = null;
   subtitleSendGate = null;
   clearSendGate = null;
   tabMessages = [];
@@ -167,14 +157,18 @@ function reset(state = runningState(1, 'session-a')): void {
   executeScriptFails = false;
 }
 
-test('forwardTranscript rechecks the session after the subtitles setting await', async () => {
+test('forwardTranscript rechecks the session after an asynchronous state read', async () => {
   reset();
   const release = deferred<void>();
-  const gate = { started: false, release, value: true };
-  subtitlesGetGate = gate;
+  const gate = {
+    snapshot: runningState(1, 'session-a'),
+    started: false,
+    release
+  };
+  sessionGetGate = gate;
 
   emit({ type: 'transcript', sessionId: 'session-a', text: 'alt', final: false });
-  await waitFor(() => gate.started, 'Untertitel-Settings wurden nicht gelesen');
+  await waitFor(() => gate.started, 'Sitzungszustand wurde nicht gelesen');
   sessionStore.sessionState = runningState(1, 'session-b');
   release.resolve(undefined);
   await sessionBarrier('session-b', 'barrier-forward');

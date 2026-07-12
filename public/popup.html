@@ -2,240 +2,223 @@
 <html lang="de">
   <head>
     <meta charset="utf-8" />
-    <title>Live Translate DE</title>
+    <title>Live Translate</title>
     <style>
       :root {
-        color-scheme: light dark;
-        --accent: #1a7f37;
-        --danger: #cf222e;
+        color-scheme: dark;
+        --ink: #f3f5ed;
+        --muted: #858b80;
+        --panel: #151714;
+        --line: #292c27;
+        --accent: #d9ff43;
+        --danger: #ff695f;
       }
-      body {
-        font-family: system-ui, sans-serif;
-        font-size: 13px;
-        line-height: 1.4;
-        width: 340px;
+
+      * {
         box-sizing: border-box;
+      }
+
+      body {
+        width: 320px;
         margin: 0;
-        padding: 14px;
+        padding: 20px;
+        overflow: hidden;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 105% -15%, #344016 0, transparent 38%),
+          #0b0c0a;
+        font: 500 13px/1.35 "Avenir Next", Avenir, sans-serif;
       }
-      h1 {
-        font-size: 15px;
-        margin: 0 0 12px;
-      }
-      fieldset {
-        border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-        border-radius: 6px;
-        margin: 0 0 10px;
-        padding: 8px 10px;
-      }
-      legend {
-        font-weight: 600;
-        padding: 0 4px;
-      }
-      label {
-        display: block;
-        margin: 6px 0;
-      }
-      label.inline {
+
+      header {
         display: flex;
         align-items: center;
-        gap: 6px;
+        justify-content: space-between;
+        margin-bottom: 22px;
       }
-      input[type="password"],
-      input[type="text"],
+
+      h1 {
+        margin: 0;
+        font: 700 16px/1 "Avenir Next Condensed", "DIN Alternate", sans-serif;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      #monitor {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--muted);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      #monitor::before {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: currentColor;
+        content: "";
+      }
+
+      #monitor[data-state="active"] {
+        color: var(--accent);
+      }
+
+      #monitor[data-state="loading"]::before {
+        animation: pulse 1.1s ease-in-out infinite;
+      }
+
+      #monitor[data-state="error"] {
+        color: var(--danger);
+      }
+
+      .field {
+        display: block;
+        margin-bottom: 14px;
+      }
+
+      .field span {
+        display: block;
+        margin: 0 0 6px 2px;
+        color: var(--muted);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      input,
       select {
         width: 100%;
-        box-sizing: border-box;
-        margin-top: 2px;
-        padding: 4px 6px;
+        height: 42px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 0 12px;
+        color: var(--ink);
+        background: var(--panel);
+        font: inherit;
+        outline: none;
+        transition: border-color 140ms ease, background 140ms ease;
       }
-      input[type="range"] {
-        width: 100%;
+
+      input:hover,
+      select:hover {
+        border-color: #3d423a;
       }
-      #toggle {
-        width: 100%;
-        padding: 8px;
-        font-size: 14px;
-        font-weight: 600;
-        border-radius: 6px;
-        border: none;
-        cursor: pointer;
-        color: white;
-        background: var(--accent);
-      }
-      #toggle.running {
-        background: var(--danger);
-      }
-      #toggle:disabled {
-        cursor: wait;
-        opacity: 0.65;
-      }
-      #toggle:focus-visible,
+
       input:focus-visible,
       select:focus-visible {
-        outline: 2px solid #0969da;
-        outline-offset: 2px;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
       }
-      #status {
-        margin-top: 8px;
-        min-height: 16px;
-        white-space: pre-wrap;
-      }
-      #status.error {
-        color: var(--danger);
-        font-weight: 600;
-      }
-      #duckingMonitor {
-        margin: 8px 0;
-        padding: 7px 9px;
-        border-radius: 6px;
-        font-weight: 600;
-        background: color-mix(in srgb, currentColor 7%, transparent);
-      }
-      #duckingMonitor[data-state="active"] {
-        color: var(--accent);
-        background: color-mix(in srgb, var(--accent) 14%, transparent);
-      }
-      #duckingMonitor[data-state="error"] {
-        color: var(--danger);
-        background: color-mix(in srgb, var(--danger) 12%, transparent);
-      }
-      .hint {
-        opacity: 0.7;
-        font-size: 11px;
-        margin-top: 2px;
-      }
-      label:has(input:disabled) {
+
+      input:disabled,
+      select:disabled {
         opacity: 0.55;
       }
-      .full-original {
-        margin: 8px 0 4px;
-        padding: 7px 8px;
-        border-radius: 6px;
-        background: color-mix(in srgb, currentColor 7%, transparent);
+
+      #toggle {
+        width: 100%;
+        height: 46px;
+        margin-top: 4px;
+        border: 0;
+        border-radius: 9px;
+        color: #11130d;
+        background: var(--accent);
+        font: 800 12px/1 "Avenir Next", Avenir, sans-serif;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        cursor: pointer;
+        transition: transform 120ms ease, filter 120ms ease, background 160ms ease;
       }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --accent: #2da44e;
-          --danger: #ff7b72;
-        }
+
+      #toggle:hover {
+        filter: brightness(1.08);
       }
+
+      #toggle:active {
+        transform: translateY(1px);
+      }
+
+      #toggle.running {
+        color: var(--ink);
+        background: #292c27;
+      }
+
+      #toggle:disabled {
+        cursor: wait;
+        opacity: 0.55;
+      }
+
+      #toggle:focus-visible {
+        outline: 2px solid var(--ink);
+        outline-offset: 3px;
+      }
+
+      #status {
+        min-height: 18px;
+        margin-top: 12px;
+        color: var(--muted);
+        font-size: 11px;
+        text-align: center;
+      }
+
+      #status.error {
+        color: var(--danger);
+      }
+
+      @keyframes pulse {
+        0%, 100% { opacity: 0.35; transform: scale(0.8); }
+        50% { opacity: 1; transform: scale(1); }
+      }
+
       @media (prefers-reduced-motion: reduce) {
-        * {
-          scroll-behavior: auto !important;
+        *, *::before {
+          animation: none !important;
           transition: none !important;
         }
       }
     </style>
   </head>
   <body>
-    <h1>Live Translate</h1>
+    <header>
+      <h1>Live Translate</h1>
+      <div id="monitor" data-state="idle" role="status" aria-live="polite">Bereit</div>
+    </header>
 
-    <fieldset>
-      <legend>Sprachen</legend>
-      <label>
-        Zielsprache (Übersetzung)
-        <select id="targetLanguage">
-          <option value="de">Deutsch</option>
-          <option value="en">Englisch</option>
-          <option value="es">Spanisch</option>
-          <option value="fr">Französisch</option>
-          <option value="it">Italienisch</option>
-          <option value="pt-BR">Portugiesisch (Brasilien)</option>
-          <option value="pt-PT">Portugiesisch (Portugal)</option>
-          <option value="nl">Niederländisch</option>
-          <option value="pl">Polnisch</option>
-          <option value="tr">Türkisch</option>
-          <option value="ru">Russisch</option>
-          <option value="uk">Ukrainisch</option>
-          <option value="ja">Japanisch</option>
-          <option value="ko">Koreanisch</option>
-          <option value="zh-Hans">Chinesisch (vereinfacht)</option>
-          <option value="zh-Hant">Chinesisch (traditionell)</option>
-          <option value="hi">Hindi</option>
-          <option value="ar">Arabisch</option>
-        </select>
-      </label>
-      <div class="hint">
-          Für englische Videos optimiert. Gemini erkennt Sprache automatisch;
-          Änderungen gelten ab dem nächsten Start.
-      </div>
-    </fieldset>
+    <label class="field">
+      <span>Zielsprache</span>
+      <select id="targetLanguage">
+        <option value="de">Deutsch</option>
+        <option value="en">Englisch</option>
+        <option value="es">Spanisch</option>
+        <option value="fr">Französisch</option>
+        <option value="it">Italienisch</option>
+        <option value="pt-BR">Portugiesisch (Brasilien)</option>
+        <option value="pt-PT">Portugiesisch (Portugal)</option>
+        <option value="nl">Niederländisch</option>
+        <option value="pl">Polnisch</option>
+        <option value="tr">Türkisch</option>
+        <option value="ru">Russisch</option>
+        <option value="uk">Ukrainisch</option>
+        <option value="ja">Japanisch</option>
+        <option value="ko">Koreanisch</option>
+        <option value="zh-Hans">Chinesisch (vereinfacht)</option>
+        <option value="zh-Hant">Chinesisch (traditionell)</option>
+        <option value="hi">Hindi</option>
+        <option value="ar">Arabisch</option>
+      </select>
+    </label>
 
-      <fieldset>
-        <legend>Gemini Live Translate</legend>
-        <label>
-          Gemini API-Key
-          <input type="password" id="geminiKey" placeholder="AIza..." autocomplete="off" />
-        </label>
-        <div class="hint">
-          Einzige Übersetzungs- und Sprach-Engine. Der Key wird nur lokal in
-          diesem Browser gespeichert.
-        </div>
-    </fieldset>
+    <label class="field">
+      <span>Gemini API-Key</span>
+      <input type="password" id="geminiKey" placeholder="AIza…" autocomplete="off" />
+    </label>
 
-    <fieldset>
-      <legend>Audio zur KI</legend>
-      <label class="inline">
-        <input type="radio" name="audioMode" value="filtered" />
-        Sprachoptimiert (empfohlen)
-      </label>
-      <label class="inline">
-        <input type="radio" name="audioMode" value="native" />
-        Natürlich, ohne Sprach-Highpass
-      </label>
-      <label class="inline">
-        <input type="checkbox" id="calloutBoost" />
-        Leise Stimmen anheben (Funk-Callouts)
-      </label>
-      <div class="hint">
-        „Sprachoptimiert" entfernt Tiefbass; „Natürlich" erhält den Klang vor
-        der für Gemini nötigen Übertragung möglichst unverändert. Gemini
-        wird in beiden Modi normgerecht auf 16&nbsp;kHz umgerechnet.
-        Der Callout-Boost hebt leise Sprecher nur für die KI an – das Gehörte
-        bleibt unverändert – und wirkt sofort.
-      </div>
-    </fieldset>
-
-      <fieldset>
-        <legend>Ausgabe &amp; intelligentes Ducking</legend>
-      <label class="inline">
-        <input type="checkbox" id="subtitles" />
-        Untertitel einblenden
-      </label>
-      <label class="inline">
-        <input type="checkbox" id="dubbing" />
-        Übersetzte Tonspur abspielen
-      </label>
-      <label class="inline full-original">
-        <input type="checkbox" id="fullOriginal" />
-        <strong>Originalton immer 100 % (Ducking aus)</strong>
-      </label>
-      <div class="hint">
-        Ausgeschaltet (empfohlen): Musik, Raketenklang und Atmo bleiben bei
-        100&nbsp;%, sobald im englischen Quellvideo niemand spricht. Nur während
-        englischer Sprache sinkt der komplette Originalmix weich auf feste 10&nbsp;%.
-      </div>
-      <div id="duckingMonitor" data-state="idle" role="status" aria-live="polite">
-        Lokale Silero-KI: bereit
-      </div>
-      <label>
-        Gemini-Stimme: <strong id="translationValue"></strong>
-        <input type="range" id="translationVolume" min="0" max="100" step="5" />
-      </label>
-      <div class="full-original">
-        Original während erkannter Sprache: <strong>fest 10&nbsp;%</strong>
-      </div>
-      <div class="hint">
-        Eine vollständig lokale neuronale Silero-KI erkennt
-        Sprache im Quellvideo – auch über Musik und Raketen-Atmo – und steuert
-        die Absenkung. Sie reagiert nicht auf die später einsetzende Gemini-Stimme.
-        Sobald die englische Sprache endet, kehrt der Originalton automatisch
-        auf exakt 100&nbsp;% zurück.
-      </div>
-    </fieldset>
-
-    <button id="toggle" type="button" aria-pressed="false">Übersetzung starten</button>
+    <button id="toggle" type="button" aria-pressed="false">Start</button>
     <div id="status" role="status" aria-live="polite"></div>
 
     <script src="popup.js"></script>

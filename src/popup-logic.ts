@@ -13,9 +13,6 @@ const RESTRICTED_PREFIXES = [
 
 export function configurationError(settings: SessionSettings): string | null {
   if (!settings.geminiKey) return 'Bitte zuerst einen Gemini API-Key eintragen.';
-  if (!settings.subtitles && !settings.dubbing) {
-    return 'Bitte mindestens Untertitel oder übersetzte Tonspur aktivieren.';
-  }
   return null;
 }
 

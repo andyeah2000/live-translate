@@ -23,12 +23,16 @@ unterbrochene Antwort klingt innerhalb von 60 ms aus, statt hart abzureißen.
 Die neuronale Spracherkennung verarbeitet lückenlose 32-ms-Frames ausschließlich
 lokal im Browser. Sie hört nur den Quellstream; Geminis zeitversetzte
 Übersetzungsstimme kann das Ducking daher nicht künstlich verlängern. Ein
-physisch getrennter Dry-Bypass erlaubt außerdem, das Ducking vollständig zu
-deaktivieren. Falls das lokale Modell wider Erwarten ausfällt, bleibt die
-Übersetzung aktiv und der Originalton wird als sichere Voreinstellung sofort
-auf 100 % durchgeschaltet. Dasselbe gilt, während Gemini verbindet oder neu
-verbindet sowie bei Netz-Backpressure: Ohne verfügbare Übersetzung gibt es
-keine Absenkung.
+einziger Originalpfad führt das vollständige Quellsignal direkt zum Ausgang;
+nur sein Gain wird von der VAD gesteuert. Falls das lokale Modell wider
+Erwarten ausfällt, bleibt die Übersetzung aktiv und der Originalton wird als
+sichere Voreinstellung sofort auf 100 % durchgeschaltet. Dasselbe gilt,
+während Gemini verbindet oder neu verbindet sowie bei Netz-Backpressure.
+
+Der Gemini-Eingang ist eine feste, getestete Sprachpipeline: 80-Hz-Hochpass
+gegen Raketen- und Raumrumpeln, Kompression plus Makeup für leise Funk-Callouts,
+Sicherheits-Limiter, Anti-Aliasing und 16-kHz-Resampling. Diese Bearbeitung ist
+nur für Gemini hörbar; der Originalton bleibt klanglich unverändert.
 
 Gemini-Sitzungen werden mit Resumption-Checkpoints und Sliding-Window-
 Kompression über die normalen Verbindungsgrenzen hinaus fortgesetzt. Mehr als
@@ -69,6 +73,10 @@ Der ladbare Build liegt anschließend in `dist/`.
 5. Ein englisches Video starten, das Extension-Popup öffnen und den Gemini-Key
    eintragen.
 
+Das Popup enthält bewusst nur die zwei echten Entscheidungen: API-Key und
+Zielsprache. Übersetzungsaudio, Untertitel, Sprachoptimierung und dynamisches
+10/100-Ducking sind feste Bestandteile der einen Produktpipeline.
+
 Ein API-Key lässt sich in [Google AI Studio](https://aistudio.google.com/apikey)
 erstellen. Die technische Grundlage ist die offizielle
 [Gemini Live Translation API](https://ai.google.dev/gemini-api/docs/live-api/live-translate).
@@ -90,11 +98,10 @@ Popup
        ├─ Tab Capture
        ├─ Content Script (Untertitel-Overlay)
        └─ Offscreen AudioContext
-            ├─ Dry-Originalpfad: exakt 100 %
-            ├─ Dynamischer Originalpfad: 100 % ↔ fest 10 %
+            ├─ ein Originalpfad: weich 100 % ↔ fest 10 %
             ├─ AudioWorklet: lückenloser Roh-Audio-Capturepfad
             ├─ lokaler Worker: Resampling + Silero VAD 6.2.1 via ONNX/WASM
-            ├─ optionaler KI-Sprachfilter + Limiter
+            ├─ fester Gemini-Pfad: Hochpass → Kompressor → Limiter
             └─ Gemini Live Translate
                  ├─ 16-kHz-PCM-Uplink
                  ├─ 24-kHz-Übersetzungsaudio

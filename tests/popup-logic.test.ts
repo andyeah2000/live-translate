@@ -8,18 +8,6 @@ test('start validation requires a Gemini key', () => {
   assert.equal(configurationError({ ...DEFAULT_SETTINGS, geminiKey: 'AIza-test' }), null);
 });
 
-test('start validation requires at least one output', () => {
-  assert.match(
-    configurationError({
-      ...DEFAULT_SETTINGS,
-      geminiKey: 'AIza-test',
-      subtitles: false,
-      dubbing: false
-    }) ?? '',
-    /mindestens/
-  );
-});
-
 test('URL validation blocks privileged and store pages', () => {
   assert.equal(isTranslatableUrl('https://example.com/video'), true);
   assert.equal(isTranslatableUrl('http://localhost:3000/video'), true);

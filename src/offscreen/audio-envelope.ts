@@ -5,7 +5,6 @@
  */
 export const SOURCE_DUCK_FADE_DOWN_S = 0.22;
 export const SOURCE_DUCK_FADE_UP_S = 0.7;
-export const CONTROL_FADE_S = 0.12;
 
 /** Gemini wird pro zusammenhängendem Sprach-Turn ein- und ausgeblendet. */
 export const GEMINI_FADE_IN_S = 0.09;

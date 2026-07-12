@@ -7,7 +7,7 @@ const mock = `<script>
 globalThis.chrome = {
   storage: {
     local: {
-      async get() { return { settingsVersion: 5, geminiKey: 'test-key', dubbing: true }; },
+      async get() { return { settingsVersion: 6, geminiKey: 'test-key', targetLanguage: 'de' }; },
       async set() {},
       async remove() {}
     }

@@ -1,33 +1,9 @@
-/**
- * Audio-Weg zur KI: 'filtered' = Highpass + FIR-Anti-Aliasing; 'native' =
- * möglichst naturbelassen. Provider-seitig erforderliches Resampling bleibt
- * in beiden Modi aktiv (Gemini erwartet zwingend 16 kHz).
- */
-export type AudioMode = 'filtered' | 'native';
-
 export interface SessionSettings {
   /** Version der persistierten Einstellungen für kontrollierte Migrationen. */
-  settingsVersion: 5;
-  subtitles: boolean;
-  dubbing: boolean;
-  /** Lautstärke der übersetzten Gemini-Stimme (0–1). */
-  translationVolume: number;
-  /** Originalton über einen unverarbeiteten Unity-Pfad ausgeben (Ducking aus). */
-  fullOriginal: boolean;
+  settingsVersion: 6;
   geminiKey: string;
   /** BCP-47-Code der Zielsprache (z. B. "de"). */
   targetLanguage: string;
-  audioMode: AudioMode;
-  /** Leise Stimmen (z. B. Funk-Callouts) nur im KI-Feed anheben. */
-  calloutBoost: boolean;
-}
-
-export interface AudioSettings {
-  subtitles: boolean;
-  dubbing: boolean;
-  translationVolume: number;
-  fullOriginal: boolean;
-  calloutBoost: boolean;
 }
 
 export interface SessionState {
@@ -54,7 +30,6 @@ export type Message =
   | { type: 'start-session'; tabId: number; streamId: string; settings: SessionSettings }
   | { type: 'stop-session' }
   | { type: 'get-state' }
-  | { type: 'update-audio-settings'; settings: AudioSettings }
   | { type: 'offscreen-start'; sessionId: string; streamId: string; settings: SessionSettings }
   | { type: 'offscreen-stop' }
   | { type: 'offscreen-status'; sessionId: string; status: string }

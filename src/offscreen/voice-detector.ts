@@ -14,8 +14,6 @@ const AMBIGUOUS_NEGATIVE_SCORE = 1;
 export const DUCKED_SOURCE_GAIN = 0.1;
 
 export interface DuckingState {
-  dubbing: boolean;
-  fullOriginal: boolean;
   sourceSpeaking: boolean;
   translationReady: boolean;
 }
@@ -25,24 +23,10 @@ export interface DuckingState {
  * Sprache im Quellvideo darf das Original absenken.
  */
 export function sourceDuckGain(state: DuckingState): number {
-  if (
-    !state.dubbing ||
-    state.fullOriginal ||
-    !state.sourceSpeaking ||
-    !state.translationReady
-  ) {
+  if (!state.sourceSpeaking || !state.translationReady) {
     return 1;
   }
   return DUCKED_SOURCE_GAIN;
-}
-
-/** Exakte Pfadwahl: Full-Modus ist 100 % Dry und 0 % dynamischer Pfad. */
-export function sourcePathMix(state: Pick<DuckingState, 'dubbing' | 'fullOriginal'>): {
-  dry: number;
-  dynamic: number;
-} {
-  const useDryBypass = state.fullOriginal || !state.dubbing;
-  return useDryBypass ? { dry: 1, dynamic: 0 } : { dry: 0, dynamic: 1 };
 }
 
 /**

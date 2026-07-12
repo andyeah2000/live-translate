@@ -3,25 +3,13 @@ import test from 'node:test';
 import {
   DUCKED_SOURCE_GAIN,
   SpeechProbabilityDetector,
-  sourceDuckGain,
-  sourcePathMix
+  sourceDuckGain
 } from '../src/offscreen/voice-detector';
 
 test('no source speech always means exact 0 dB / 100% source audio', () => {
   assert.equal(
     sourceDuckGain({
-      dubbing: true,
-      fullOriginal: false,
       sourceSpeaking: false,
-      translationReady: true
-    }),
-    1
-  );
-  assert.equal(
-    sourceDuckGain({
-      dubbing: false,
-      fullOriginal: false,
-      sourceSpeaking: true,
       translationReady: true
     }),
     1
@@ -32,8 +20,6 @@ test('source speech always applies the fixed ten-percent full-mix level', () => 
   assert.equal(DUCKED_SOURCE_GAIN, 0.1);
   assert.equal(
     sourceDuckGain({
-      dubbing: true,
-      fullOriginal: false,
       sourceSpeaking: true,
       translationReady: true
     }),
@@ -44,34 +30,8 @@ test('source speech always applies the fixed ten-percent full-mix level', () => 
 test('Gemini setup and reconnect are fail-open at exact 100% source audio', () => {
   assert.equal(
     sourceDuckGain({
-      dubbing: true,
-      fullOriginal: false,
       sourceSpeaking: true,
       translationReady: false
-    }),
-    1
-  );
-});
-
-test('full-original mode uses a literal dry-only bypass path', () => {
-  assert.deepEqual(sourcePathMix({ dubbing: true, fullOriginal: true }), {
-    dry: 1,
-    dynamic: 0
-  });
-  assert.deepEqual(sourcePathMix({ dubbing: false, fullOriginal: false }), {
-    dry: 1,
-    dynamic: 0
-  });
-  assert.deepEqual(sourcePathMix({ dubbing: true, fullOriginal: false }), {
-    dry: 0,
-    dynamic: 1
-  });
-  assert.equal(
-    sourceDuckGain({
-      dubbing: true,
-      fullOriginal: true,
-      sourceSpeaking: true,
-      translationReady: true
     }),
     1
   );

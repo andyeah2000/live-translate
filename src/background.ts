@@ -15,7 +15,6 @@ const EMPTY_STATE: SessionState = {
 let sessionEpoch = 0;
 let sessionOperation: Promise<void> = Promise.resolve();
 let transcriptQueue: Promise<void> = Promise.resolve();
-let audioSettingsQueue: Promise<void> = Promise.resolve();
 
 void chrome.action.setBadgeBackgroundColor({ color: '#1a7f37' }).catch(() => {});
 
@@ -85,11 +84,6 @@ async function ensureOffscreenDocument(): Promise<void> {
   });
 }
 
-async function getSubtitlesEnabled(): Promise<boolean> {
-  const { subtitlesEnabled } = await chrome.storage.session.get('subtitlesEnabled');
-  return (subtitlesEnabled as boolean | undefined) ?? true;
-}
-
 async function startSession(
   tabId: number,
   streamId: string,
@@ -99,11 +93,8 @@ async function startSession(
   const epoch = sessionEpoch;
   const sessionId = crypto.randomUUID();
   try {
-    if (settings.subtitles) {
-      await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-    }
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
     await ensureOffscreenDocument();
-    await chrome.storage.session.set({ subtitlesEnabled: settings.subtitles });
     await setState({
       running: true,
       tabId,
@@ -161,10 +152,9 @@ async function forwardTranscript(sessionId: string, text: string, final: boolean
   ) {
     return;
   }
-  if (!(await getSubtitlesEnabled())) return;
-
-  // Storage-Zugriffe sind asynchron. Eine Sitzung kann währenddessen gestoppt
-  // oder ersetzt worden sein; dann darf kein alter Untertitel mehr in den Tab.
+  // Zwischen Zustandsprüfung und Versand kann eine Sitzung ersetzt worden
+  // sein. Nur der weiterhin identische Tab und die identische Session dürfen
+  // einen Untertitel erhalten.
   const currentState = await getState();
   if (
     !currentState.running ||
@@ -179,33 +169,6 @@ async function forwardTranscript(sessionId: string, text: string, final: boolean
   await chrome.tabs
     .sendMessage(currentState.tabId, { type: 'subtitle', text, final } satisfies Message)
     .catch(() => {});
-}
-
-async function updateAudioSettings(msg: Extract<Message, { type: 'update-audio-settings' }>): Promise<void> {
-  const state = await getState();
-  const wasEnabled = await getSubtitlesEnabled();
-  let subtitlesEnabled = msg.settings.subtitles;
-  if (subtitlesEnabled && !wasEnabled && state.running && state.tabId !== null) {
-    try {
-      await chrome.scripting.executeScript({ target: { tabId: state.tabId }, files: ['content.js'] });
-    } catch {
-      subtitlesEnabled = false;
-      const latestState = await getState();
-      if (latestState.running && latestState.sessionId === state.sessionId) {
-        await setState({
-          ...latestState,
-          status: 'Übersetzung läuft – Untertitel sind auf dieser Seite nicht verfügbar.'
-        });
-      }
-    }
-  }
-  await chrome.storage.session.set({ subtitlesEnabled });
-  const latestState = await getState();
-  if (!subtitlesEnabled && latestState.running && latestState.tabId !== null) {
-    void chrome.tabs
-      .sendMessage(latestState.tabId, { type: 'subtitle-clear' } satisfies Message)
-      .catch(() => {});
-  }
 }
 
 chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse) => {
@@ -226,12 +189,6 @@ chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse) => {
     case 'get-state':
       void getState().then(sendResponse, () => sendResponse(EMPTY_STATE));
       return true;
-    case 'update-audio-settings':
-      audioSettingsQueue = audioSettingsQueue
-        .catch(() => {})
-        .then(() => updateAudioSettings(msg))
-        .catch((err) => console.warn('[live-translate] Audio-Einstellung fehlgeschlagen:', err));
-      break;
     case 'transcript':
       transcriptQueue = transcriptQueue
         .catch(() => {})
@@ -336,20 +293,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
       }
       const observedSessionId = observedState.sessionId;
       return enqueueSessionOperation(async () => {
-        let currentState = await getState();
-        if (
-          !currentState.running ||
-          currentState.tabId !== tabId ||
-          currentState.sessionId !== observedSessionId
-        ) {
-          return;
-        }
-        if (!(await getSubtitlesEnabled())) return;
-
-        // Auch nach dem asynchronen Settings-Zugriff exakt dieselbe Sitzung
-        // verlangen. So kann ein altes Navigationsevent keine neue Sitzung
-        // injizieren oder bei einem Fehler stoppen.
-        currentState = await getState();
+        const currentState = await getState();
         if (
           !currentState.running ||
           currentState.tabId !== tabId ||
