@@ -28,21 +28,7 @@ export const DEFAULT_SETTINGS: SessionSettings = {
   translationVolume: 1
 };
 
-const OBSOLETE_SETTING_KEYS = [
-  'provider',
-  'voiceProvider',
-  'openaiKey',
-  'xaiKey',
-  'grokVoice',
-  'grokSpeed',
-  'sourceLanguage',
-  'dubbing',
-  'fullOriginal',
-  'audioMode',
-  'calloutBoost',
-  'originalVolume',
-  'germanVolume'
-] as const;
+const CANONICAL_SETTING_KEYS = new Set(Object.keys(DEFAULT_SETTINGS));
 
 function stringValue(value: unknown, fallback: string): string {
   return typeof value === 'string' ? value : fallback;
@@ -93,11 +79,12 @@ export async function loadSettings(): Promise<SessionSettings> {
   // als Altbestand erkennbar bleibt.
   const stored = await chrome.storage.local.get(null);
   const settings = sanitizeSettings(stored);
-  // Immer kanonisch zurückschreiben und Altoptionen idempotent entfernen.
-  // Damit kann auch manuell veränderter v6-Storage keine zweite Pipeline
-  // wiederbeleben oder alte Provider-Secrets behalten.
+  // Immer kanonisch zurückschreiben und ausnahmslos jeden unbekannten Schlüssel
+  // entfernen. So existiert im Storage exakt eine Gemini-Pipeline und kein
+  // historischer Konfigurations- oder Secret-Rest.
   await chrome.storage.local.set(settings);
-  await chrome.storage.local.remove([...OBSOLETE_SETTING_KEYS]);
+  const unknownKeys = Object.keys(stored).filter((key) => !CANONICAL_SETTING_KEYS.has(key));
+  if (unknownKeys.length > 0) await chrome.storage.local.remove(unknownKeys);
   return settings;
 }
 

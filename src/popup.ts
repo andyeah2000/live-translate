@@ -1,5 +1,10 @@
 import type { Message, SessionSettings, SessionState } from './messages';
-import { configurationError, isTranslatableUrl } from './popup-logic';
+import {
+  configurationError,
+  isTranslatableUrl,
+  popupMonitorPresentation,
+  popupStatusPresentation
+} from './popup-logic';
 import { loadSettings, saveSettings } from './settings';
 
 function el<T extends HTMLElement>(selector: string): T {
@@ -47,40 +52,15 @@ function renderState(): void {
   toggleButton.setAttribute('aria-pressed', String(state.running));
   geminiKeyInput.disabled = state.running;
   targetLanguageSelect.disabled = state.running;
-  setStatus(state.error ?? '', Boolean(state.error));
+  const status = popupStatusPresentation(state);
+  setStatus(status.text, status.error);
   renderMonitor();
 }
 
 function renderMonitor(): void {
-  if (state.error) {
-    monitor.textContent = 'Fehler';
-    monitor.dataset.state = 'error';
-  } else if (!state.running) {
-    monitor.textContent = 'Bereit';
-    monitor.dataset.state = 'idle';
-  } else if (!state.ducking?.ready || !state.ducking.translationReady) {
-    monitor.textContent = 'Verbindet';
-    monitor.dataset.state = 'loading';
-  } else if (state.ducking.speaking) {
-    monitor.textContent = 'Sprache · 10%';
-    monitor.dataset.state = 'active';
-  } else {
-    monitor.textContent = 'Atmo · 100%';
-    monitor.dataset.state = 'active';
-  }
-}
-
-function getStreamId(tabId: number): Promise<string> {
-  return new Promise((resolve, reject) => {
-    chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
-      const err = chrome.runtime.lastError;
-      if (err || !streamId) {
-        reject(new Error(err?.message ?? 'Tab-Audio konnte nicht angefordert werden.'));
-      } else {
-        resolve(streamId);
-      }
-    });
-  });
+  const presentation = popupMonitorPresentation(state);
+  monitor.textContent = presentation.text;
+  monitor.dataset.state = presentation.state;
 }
 
 async function start(): Promise<boolean> {
@@ -100,11 +80,9 @@ async function start(): Promise<boolean> {
     }
 
     setStatus('Starte…');
-    const streamId = await getStreamId(tab.id);
     const response = (await chrome.runtime.sendMessage({
       type: 'start-session',
       tabId: tab.id,
-      streamId,
       settings
     } satisfies Message)) as { ok: boolean; error?: string } | undefined;
     if (!response?.ok) {
@@ -132,7 +110,10 @@ async function onToggle(): Promise<void> {
   toggleButton.disabled = true;
   try {
     if (state.running) {
-      await chrome.runtime.sendMessage({ type: 'stop-session' } satisfies Message);
+      const response = (await chrome.runtime.sendMessage({
+        type: 'stop-session'
+      } satisfies Message)) as { ok: boolean; error?: string } | undefined;
+      if (!response?.ok) throw new Error(response?.error ?? 'Stop fehlgeschlagen.');
       await refreshState();
     } else if (await start()) {
       await refreshState();

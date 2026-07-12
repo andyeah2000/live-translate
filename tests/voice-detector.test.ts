@@ -44,11 +44,11 @@ test('low Silero probabilities and invalid data never activate ducking', () => {
   }
 });
 
-test('two positive neural frames within three activate source ducking', () => {
+test('two moderate positive neural frames within three activate source ducking', () => {
   const detector = new SpeechProbabilityDetector();
-  assert.equal(detector.update(0.7).speaking, false);
+  assert.equal(detector.update(0.65).speaking, false);
   assert.equal(detector.update(0.1).speaking, false);
-  assert.equal(detector.update(0.7).speaking, true);
+  assert.equal(detector.update(0.65).speaking, true);
 });
 
 test('a highly confident neural frame activates ducking immediately', () => {
@@ -56,34 +56,34 @@ test('a highly confident neural frame activates ducking immediately', () => {
   assert.equal(detector.update(0.9).speaking, true);
 });
 
-test('320ms hangover bridges word pauses and then releases deterministically', () => {
+test('384ms strong-negative hangover bridges word pauses and then releases deterministically', () => {
   const detector = new SpeechProbabilityDetector();
   detector.update(0.9);
   detector.update(0.9);
-  for (let frame = 0; frame < 9; frame++) {
+  for (let frame = 0; frame < 11; frame++) {
     assert.equal(detector.update(0.2).speaking, true, `negative frame ${frame + 1}`);
   }
   assert.equal(detector.update(0.2).speaking, false);
 });
 
-test('ambiguous Silero probabilities release after a bounded 640ms', () => {
+test('ambiguous Silero probabilities release after a bounded 736ms', () => {
   const detector = new SpeechProbabilityDetector();
   detector.update(0.9);
-  for (let frame = 0; frame < 19; frame++) {
-    assert.equal(detector.update(0.4).speaking, true, `ambiguous frame ${frame + 1}`);
+  for (let frame = 0; frame < 22; frame++) {
+    assert.equal(detector.update(0.5).speaking, true, `ambiguous frame ${frame + 1}`);
   }
-  assert.equal(detector.update(0.4).speaking, false);
+  assert.equal(detector.update(0.5).speaking, false);
 });
 
 test('a positive speech frame resets the accumulated release score', () => {
   const detector = new SpeechProbabilityDetector();
   detector.update(0.9);
-  for (let frame = 0; frame < 9; frame++) detector.update(0.4);
-  assert.equal(detector.update(0.55).speaking, true);
-  for (let frame = 0; frame < 19; frame++) {
-    assert.equal(detector.update(0.4).speaking, true);
+  for (let frame = 0; frame < 11; frame++) detector.update(0.5);
+  assert.equal(detector.update(0.56).speaking, true);
+  for (let frame = 0; frame < 22; frame++) {
+    assert.equal(detector.update(0.5).speaking, true);
   }
-  assert.equal(detector.update(0.4).speaking, false);
+  assert.equal(detector.update(0.5).speaking, false);
 });
 
 test('a natural mid-sentence pause never pumps the source gain', () => {

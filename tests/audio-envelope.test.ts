@@ -6,6 +6,7 @@ import {
   GEMINI_FADE_OUT_S,
   SOURCE_DUCK_FADE_DOWN_S,
   SOURCE_DUCK_FADE_UP_S,
+  SOURCE_FAIL_OPEN_S,
   applyCosineEdgeFades,
   cosineRamp,
   fadeOutAudioParam
@@ -15,6 +16,7 @@ test('source ducking uses a gentle asymmetric studio-style envelope', () => {
   assert.ok(SOURCE_DUCK_FADE_DOWN_S >= 0.15);
   assert.ok(SOURCE_DUCK_FADE_UP_S >= 0.5);
   assert.ok(SOURCE_DUCK_FADE_UP_S > SOURCE_DUCK_FADE_DOWN_S);
+  assert.ok(SOURCE_FAIL_OPEN_S <= 0.1);
 });
 
 test('cosine ramp is monotone, exact, and eases both endpoints', () => {
@@ -32,8 +34,8 @@ test('cosine ramp is monotone, exact, and eases both endpoints', () => {
 });
 
 test('Gemini edge fades remove one-sample jumps without touching the phrase middle', () => {
-  assert.ok(GEMINI_FADE_IN_S >= 0.06);
-  assert.ok(GEMINI_FADE_OUT_S >= 0.1);
+  assert.ok(GEMINI_FADE_IN_S >= 0.02 && GEMINI_FADE_IN_S <= 0.04);
+  assert.ok(GEMINI_FADE_OUT_S >= 0.02 && GEMINI_FADE_OUT_S <= 0.04);
   assert.ok(GEMINI_INTERRUPT_FADE_S >= 0.04);
   const samples = new Float32Array(1_000).fill(1);
   applyCosineEdgeFades(samples, 1_000, 0.1, 0.2);

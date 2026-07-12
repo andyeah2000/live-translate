@@ -3,12 +3,12 @@ export interface VoiceDecision {
   probability: number;
 }
 
-const POSITIVE_THRESHOLD = 0.55;
-const IMMEDIATE_THRESHOLD = 0.85;
-const NEGATIVE_THRESHOLD = 0.25;
+const POSITIVE_THRESHOLD = 0.56;
+const IMMEDIATE_THRESHOLD = 0.74;
+const NEGATIVE_THRESHOLD = 0.48;
 const ATTACK_WINDOW_FRAMES = 3;
 const ATTACK_POSITIVE_FRAMES = 2;
-const RELEASE_SCORE_LIMIT = 20;
+const RELEASE_SCORE_LIMIT = 23;
 const STRONG_NEGATIVE_SCORE = 2;
 const AMBIGUOUS_NEGATIVE_SCORE = 1;
 export const DUCKED_SOURCE_GAIN = 0.1;
@@ -33,7 +33,7 @@ export function sourceDuckGain(state: DuckingState): number {
  * Hysterese für Silero-v6-Wahrscheinlichkeiten (ein Frame = 32 ms).
  * Zwei positive Frames innerhalb von drei starten das Ducking. Beim Release
  * zählen sichere Nicht-Sprach-Frames doppelt und mehrdeutige Frames einfach;
- * 20 Punkte entsprechen 320–640 ms. So verbinden wir natürliche Wortpausen,
+ * 23 Punkte entsprechen 384–736 ms. So verbinden wir natürliche Wortpausen,
  * ohne bei dauerhaft mittleren Werten endlos zu ducken. Ungültige Werte gelten
  * als sichere Nicht-Sprache, damit VAD-Fehler niemals dauerhaft ducken.
  */
