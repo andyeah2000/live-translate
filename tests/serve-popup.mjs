@@ -4,10 +4,11 @@ import { extname, join } from 'node:path';
 
 const root = new URL('..', import.meta.url).pathname;
 const mock = `<script>
+globalThis.__messages = [];
 globalThis.chrome = {
   storage: {
     local: {
-      async get() { return { settingsVersion: 6, geminiKey: 'test-key', targetLanguage: 'de' }; },
+      async get() { return { settingsVersion: 7, geminiKey: 'test-key', targetLanguage: 'de', subtitles: true, translationVolume: 1 }; },
       async set() {},
       async remove() {}
     }
@@ -15,6 +16,7 @@ globalThis.chrome = {
   runtime: {
     lastError: null,
     async sendMessage(message) {
+      globalThis.__messages.push(message);
       if (message.type === 'get-state') return { running: false, tabId: null, sessionId: null, status: 'Bereit', error: null, ducking: null };
       return { ok: true };
     },
@@ -48,4 +50,7 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(4173, '127.0.0.1', () => console.log('Popup QA server: http://127.0.0.1:4173'));
+const port = Number(process.env.PORT ?? 4173);
+server.listen(port, '127.0.0.1', () =>
+  console.log(`Popup QA server: http://127.0.0.1:${port}`)
+);

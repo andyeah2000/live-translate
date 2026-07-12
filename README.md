@@ -73,9 +73,10 @@ Der ladbare Build liegt anschließend in `dist/`.
 5. Ein englisches Video starten, das Extension-Popup öffnen und den Gemini-Key
    eintragen.
 
-Das Popup enthält bewusst nur die zwei echten Entscheidungen: API-Key und
-Zielsprache. Übersetzungsaudio, Untertitel, Sprachoptimierung und dynamisches
-10/100-Ducking sind feste Bestandteile der einen Produktpipeline.
+Das Popup enthält nur vier direkte Produktkontrollen: API-Key, Zielsprache,
+Untertitel an/aus und Lautstärke der Gemini-Stimme. Sprachoptimierung,
+Übersetzungsaudio und dynamisches 10/100-Ducking bleiben feste Bestandteile
+der einen Produktpipeline.
 
 Ein API-Key lässt sich in [Google AI Studio](https://aistudio.google.com/apikey)
 erstellen. Die technische Grundlage ist die offizielle

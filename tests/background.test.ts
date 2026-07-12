@@ -40,6 +40,7 @@ let sessionGetGate:
 let subtitleSendGate: Deferred<void> | null = null;
 let clearSendGate: Deferred<void> | null = null;
 let tabMessages: Array<{ tabId: number; message: Record<string, unknown> }> = [];
+let runtimeMessages: Array<Record<string, unknown>> = [];
 let executeScriptCalls = 0;
 let executeScriptFails = false;
 
@@ -68,7 +69,10 @@ const chromeMock = {
     }
   },
   runtime: {
-    sendMessage: async () => undefined,
+    sendMessage: async (message: Record<string, unknown>) => {
+      runtimeMessages.push(message);
+      return message.type === 'offscreen-update-output' ? { ok: true } : undefined;
+    },
     onMessage: {
       addListener: (listener: typeof runtimeListener) => {
         runtimeListener = listener;
@@ -153,9 +157,43 @@ function reset(state = runningState(1, 'session-a')): void {
   subtitleSendGate = null;
   clearSendGate = null;
   tabMessages = [];
+  runtimeMessages = [];
   executeScriptCalls = 0;
   executeScriptFails = false;
 }
+
+test('output controls update subtitles and forward live Gemini volume', async () => {
+  reset();
+  emit({
+    type: 'update-output-settings',
+    settings: { subtitles: false, translationVolume: 0.55 }
+  });
+  await waitFor(
+    () => sessionStore.subtitlesEnabled === false,
+    'Untertitel-Einstellung wurde nicht gespeichert'
+  );
+  await waitFor(
+    () => runtimeMessages.some((message) => message.type === 'offscreen-update-output'),
+    'Lautstärke wurde nicht zum Audiographen weitergeleitet'
+  );
+
+  assert.equal(
+    tabMessages.some(({ message }) => message.type === 'subtitle-clear'),
+    true
+  );
+  assert.deepEqual(
+    runtimeMessages.find((message) => message.type === 'offscreen-update-output'),
+    {
+      type: 'offscreen-update-output',
+      settings: { subtitles: false, translationVolume: 0.55 }
+    }
+  );
+
+  tabMessages = [];
+  emit({ type: 'transcript', sessionId: 'session-a', text: 'unsichtbar', final: false });
+  await sessionBarrier('session-a', 'barrier-subtitles-off');
+  assert.equal(tabMessages.some(({ message }) => message.type === 'subtitle'), false);
+});
 
 test('forwardTranscript rechecks the session after an asynchronous state read', async () => {
   reset();

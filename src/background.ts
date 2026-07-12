@@ -15,6 +15,7 @@ const EMPTY_STATE: SessionState = {
 let sessionEpoch = 0;
 let sessionOperation: Promise<void> = Promise.resolve();
 let transcriptQueue: Promise<void> = Promise.resolve();
+let outputSettingsQueue: Promise<void> = Promise.resolve();
 
 void chrome.action.setBadgeBackgroundColor({ color: '#1a7f37' }).catch(() => {});
 
@@ -84,6 +85,11 @@ async function ensureOffscreenDocument(): Promise<void> {
   });
 }
 
+async function getSubtitlesEnabled(): Promise<boolean> {
+  const { subtitlesEnabled } = await chrome.storage.session.get('subtitlesEnabled');
+  return (subtitlesEnabled as boolean | undefined) ?? true;
+}
+
 async function startSession(
   tabId: number,
   streamId: string,
@@ -95,6 +101,7 @@ async function startSession(
   try {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
     await ensureOffscreenDocument();
+    await chrome.storage.session.set({ subtitlesEnabled: settings.subtitles });
     await setState({
       running: true,
       tabId,
@@ -152,6 +159,7 @@ async function forwardTranscript(sessionId: string, text: string, final: boolean
   ) {
     return;
   }
+  if (!(await getSubtitlesEnabled())) return;
   // Zwischen Zustandsprüfung und Versand kann eine Sitzung ersetzt worden
   // sein. Nur der weiterhin identische Tab und die identische Session dürfen
   // einen Untertitel erhalten.
@@ -169,6 +177,20 @@ async function forwardTranscript(sessionId: string, text: string, final: boolean
   await chrome.tabs
     .sendMessage(currentState.tabId, { type: 'subtitle', text, final } satisfies Message)
     .catch(() => {});
+}
+
+async function updateOutputSettings(
+  msg: Extract<Message, { type: 'update-output-settings' }>
+): Promise<void> {
+  await chrome.storage.session.set({ subtitlesEnabled: msg.settings.subtitles });
+  const state = await getState();
+  if (!state.running || state.tabId === null) return;
+  if (!msg.settings.subtitles) {
+    await chrome.tabs
+      .sendMessage(state.tabId, { type: 'subtitle-clear' } satisfies Message)
+      .catch(() => {});
+  }
+  await sendToOffscreen({ type: 'offscreen-update-output', settings: msg.settings });
 }
 
 chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse) => {
@@ -189,6 +211,12 @@ chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse) => {
     case 'get-state':
       void getState().then(sendResponse, () => sendResponse(EMPTY_STATE));
       return true;
+    case 'update-output-settings':
+      outputSettingsQueue = outputSettingsQueue
+        .catch(() => {})
+        .then(() => updateOutputSettings(msg))
+        .catch((err) => console.warn('[live-translate] Ausgabe-Einstellung fehlgeschlagen:', err));
+      break;
     case 'transcript':
       transcriptQueue = transcriptQueue
         .catch(() => {})

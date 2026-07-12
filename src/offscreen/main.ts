@@ -1,5 +1,6 @@
-import type { Message, SessionSettings } from '../messages';
+import type { Message, OutputSettings, SessionSettings } from '../messages';
 import {
+  CONTROL_FADE_S,
   SOURCE_DUCK_FADE_DOWN_S,
   SOURCE_DUCK_FADE_UP_S,
   rampAudioParam
@@ -27,10 +28,13 @@ interface ActiveSession {
   media: MediaStream;
   captureTrack: MediaStreamTrack;
   sourceGain: GainNode;
+  translatedGain: GainNode;
   vad: NeuralVoiceDetector;
   client: GeminiTranslator;
   tickTimer: number;
+  translationVolume: number;
   lastDuckGain: number;
+  lastTranslatedTarget: number;
   sourceSpeaking: boolean;
   resumePending: boolean;
   vadReady: boolean;
@@ -64,6 +68,9 @@ chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse) => {
   } else if (msg.type === 'offscreen-stop') {
     sendResponse({ ok: true });
     stop();
+  } else if (msg.type === 'offscreen-update-output') {
+    sendResponse({ ok: true });
+    applyOutputSettings(msg.settings);
   }
 });
 
@@ -133,15 +140,17 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       .connect(speechMakeup)
       .connect(modelLimiter);
     // Die übersetzte Spur läuft immer mit dem kalibrierten Unity-Pegel und
-    // bekommt ausschließlich einen Sicherheits-Limiter.
+    // bekommt einen live regelbaren Gain und einen Sicherheits-Limiter.
     const translatedInput = ctx.createGain();
+    const translatedGain = ctx.createGain();
+    translatedGain.gain.value = settings.translationVolume;
     const translatedLimiter = ctx.createDynamicsCompressor();
     translatedLimiter.threshold.value = -3;
     translatedLimiter.knee.value = 3;
     translatedLimiter.ratio.value = 8;
     translatedLimiter.attack.value = 0.003;
     translatedLimiter.release.value = 0.15;
-    translatedInput.connect(translatedLimiter).connect(ctx.destination);
+    translatedInput.connect(translatedGain).connect(translatedLimiter).connect(ctx.destination);
 
     const clientOptions = {
       apiKey: settings.geminiKey,
@@ -199,6 +208,7 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       media,
       captureTrack,
       sourceGain,
+      translatedGain,
       vad,
       client,
       tickTimer: setInterval(() => {
@@ -208,7 +218,9 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
           console.error('[live-translate] Tick-Fehler:', err);
         }
       }, TICK_MS) as unknown as number,
+      translationVolume: settings.translationVolume,
       lastDuckGain: Number.NaN,
+      lastTranslatedTarget: settings.translationVolume,
       sourceSpeaking: false,
       resumePending: false,
       vadReady: false,
@@ -299,12 +311,26 @@ function tick(): void {
       duckGain === 1 ? SOURCE_DUCK_FADE_UP_S : SOURCE_DUCK_FADE_DOWN_S
     );
   }
+  if (session.translationVolume !== session.lastTranslatedTarget) {
+    session.lastTranslatedTarget = session.translationVolume;
+    rampParam(session.translatedGain.gain, session.translationVolume, ctx, CONTROL_FADE_S);
+  }
 }
 
 function rampParam(param: AudioParam, target: number, ctx: AudioContext, duration: number): void {
   // Laufende S-Curve an ihrer tatsächlichen Position übernehmen. Auch bei
   // schnellem Sprecherwechsel entstehen so weder Knackser noch Pegelkanten.
   rampAudioParam(param, target, ctx.currentTime, duration);
+}
+
+function applyOutputSettings(settings: OutputSettings): void {
+  if (!session) return;
+  session.translationVolume = clamp01(settings.translationVolume, 1);
+  tick();
+}
+
+function clamp01(value: number, fallback: number): number {
+  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : fallback;
 }
 
 function withDuckingWarning(status: string): string {

@@ -1,9 +1,17 @@
 export interface SessionSettings {
   /** Version der persistierten Einstellungen für kontrollierte Migrationen. */
-  settingsVersion: 6;
+  settingsVersion: 7;
   geminiKey: string;
   /** BCP-47-Code der Zielsprache (z. B. "de"). */
   targetLanguage: string;
+  subtitles: boolean;
+  /** Lautstärke der Gemini-Stimme (0–1). */
+  translationVolume: number;
+}
+
+export interface OutputSettings {
+  subtitles: boolean;
+  translationVolume: number;
 }
 
 export interface SessionState {
@@ -30,7 +38,9 @@ export type Message =
   | { type: 'start-session'; tabId: number; streamId: string; settings: SessionSettings }
   | { type: 'stop-session' }
   | { type: 'get-state' }
+  | { type: 'update-output-settings'; settings: OutputSettings }
   | { type: 'offscreen-start'; sessionId: string; streamId: string; settings: SessionSettings }
+  | { type: 'offscreen-update-output'; settings: OutputSettings }
   | { type: 'offscreen-stop' }
   | { type: 'offscreen-status'; sessionId: string; status: string }
   | { type: 'offscreen-error'; sessionId: string; detail: string }

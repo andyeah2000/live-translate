@@ -90,7 +90,7 @@
         text-transform: uppercase;
       }
 
-      input,
+      input[type="password"],
       select {
         width: 100%;
         height: 42px;
@@ -104,20 +104,135 @@
         transition: border-color 140ms ease, background 140ms ease;
       }
 
-      input:hover,
+      input[type="password"]:hover,
       select:hover {
         border-color: #3d423a;
       }
 
-      input:focus-visible,
+      input[type="password"]:focus-visible,
       select:focus-visible {
         border-color: var(--accent);
         box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
       }
 
-      input:disabled,
+      input[type="password"]:disabled,
       select:disabled {
         opacity: 0.55;
+      }
+
+      .output {
+        margin: 2px 0 14px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 13px 14px 14px;
+        background: color-mix(in srgb, var(--panel) 86%, transparent);
+      }
+
+      .output-row,
+      .volume-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      .output-row {
+        cursor: pointer;
+      }
+
+      .output-label,
+      .volume-head {
+        color: var(--ink);
+        font-size: 12px;
+        font-weight: 650;
+      }
+
+      .switch-input {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+      }
+
+      .switch-track {
+        position: relative;
+        width: 38px;
+        height: 22px;
+        border: 1px solid #3b3f38;
+        border-radius: 999px;
+        background: #242720;
+        transition: border-color 150ms ease, background 150ms ease;
+      }
+
+      .switch-track::after {
+        position: absolute;
+        top: 3px;
+        left: 3px;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: var(--muted);
+        content: "";
+        transition: transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1), background 150ms ease;
+      }
+
+      .switch-input:checked + .switch-track {
+        border-color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 22%, #171a11);
+      }
+
+      .switch-input:checked + .switch-track::after {
+        background: var(--accent);
+        transform: translateX(16px);
+      }
+
+      .switch-input:focus-visible + .switch-track {
+        outline: 2px solid var(--accent);
+        outline-offset: 3px;
+      }
+
+      .volume {
+        margin-top: 14px;
+        padding-top: 13px;
+        border-top: 1px solid var(--line);
+      }
+
+      #translationValue {
+        color: var(--accent);
+        font-size: 11px;
+        letter-spacing: 0.06em;
+      }
+
+      input[type="range"] {
+        width: 100%;
+        height: 18px;
+        margin: 8px 0 0;
+        padding: 0;
+        appearance: none;
+        background: transparent;
+        cursor: pointer;
+      }
+
+      input[type="range"]::-webkit-slider-runnable-track {
+        height: 4px;
+        border-radius: 999px;
+        background: linear-gradient(90deg, var(--accent), #45501f);
+      }
+
+      input[type="range"]::-webkit-slider-thumb {
+        width: 16px;
+        height: 16px;
+        margin-top: -6px;
+        border: 3px solid #11130e;
+        border-radius: 50%;
+        appearance: none;
+        background: var(--accent);
+        box-shadow: 0 0 0 1px var(--accent);
+      }
+
+      input[type="range"]:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 3px;
+        border-radius: 4px;
       }
 
       #toggle {
@@ -217,6 +332,28 @@
       <span>Gemini API-Key</span>
       <input type="password" id="geminiKey" placeholder="AIza…" autocomplete="off" />
     </label>
+
+    <div class="output">
+      <label class="output-row">
+        <span class="output-label">Untertitel</span>
+        <input class="switch-input" type="checkbox" id="subtitles" />
+        <span class="switch-track" aria-hidden="true"></span>
+      </label>
+      <div class="volume">
+        <div class="volume-head">
+          <span>Gemini-Stimme</span>
+          <strong id="translationValue">100%</strong>
+        </div>
+        <input
+          type="range"
+          id="translationVolume"
+          min="0"
+          max="100"
+          step="5"
+          aria-label="Lautstärke der Gemini-Stimme"
+        />
+      </div>
+    </div>
 
     <button id="toggle" type="button" aria-pressed="false">Start</button>
     <div id="status" role="status" aria-live="polite"></div>

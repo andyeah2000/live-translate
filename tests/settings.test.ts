@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DEFAULT_SETTINGS, loadSettings, sanitizeSettings } from '../src/settings';
 
-test('sanitizeSettings keeps only the two user decisions', () => {
+test('sanitizeSettings keeps only the four user-facing values', () => {
   assert.deepEqual(sanitizeSettings(null), DEFAULT_SETTINGS);
   assert.deepEqual(
     sanitizeSettings({
-      settingsVersion: 5,
+      settingsVersion: 6,
       geminiKey: '  AIza-test\n',
       targetLanguage: 'fr',
       subtitles: false,
@@ -16,22 +16,28 @@ test('sanitizeSettings keeps only the two user decisions', () => {
       audioMode: 'native',
       calloutBoost: false
     }),
-    { settingsVersion: 6, geminiKey: 'AIza-test', targetLanguage: 'fr' }
+    {
+      settingsVersion: 7,
+      geminiKey: 'AIza-test',
+      targetLanguage: 'fr',
+      subtitles: false,
+      translationVolume: 0.2
+    }
   );
 });
 
 test('sanitizeSettings rejects corrupt values and migrates legacy language codes', () => {
   assert.deepEqual(
-    sanitizeSettings({ settingsVersion: 6, geminiKey: 42, targetLanguage: '../../invalid' }),
+    sanitizeSettings({ settingsVersion: 7, geminiKey: 42, targetLanguage: '../../invalid' }),
     DEFAULT_SETTINGS
   );
   assert.equal(sanitizeSettings({ targetLanguage: 'pt' }).targetLanguage, 'pt-BR');
   assert.equal(sanitizeSettings({ targetLanguage: 'zh' }).targetLanguage, 'zh-Hans');
 });
 
-test('v6 load removes every obsolete provider and audio option idempotently', async () => {
+test('v7 load preserves output controls and removes obsolete pipeline options', async () => {
   const stored = {
-    settingsVersion: 6,
+    settingsVersion: 7,
     geminiKey: 'legacy-key',
     targetLanguage: 'de',
     subtitles: false,
@@ -62,15 +68,15 @@ test('v6 load removes every obsolete provider and audio option idempotently', as
   try {
     const migrated = await loadSettings();
     assert.deepEqual(migrated, {
-      settingsVersion: 6,
+      settingsVersion: 7,
       geminiKey: 'legacy-key',
-      targetLanguage: 'de'
+      targetLanguage: 'de',
+      subtitles: false,
+      translationVolume: 0.64
     });
     assert.deepEqual(persisted, migrated);
     for (const key of [
-      'subtitles',
       'dubbing',
-      'translationVolume',
       'fullOriginal',
       'audioMode',
       'calloutBoost',

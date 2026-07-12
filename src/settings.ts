@@ -21,9 +21,11 @@ const TARGET_LANGUAGES = new Set([
   'ar'
 ]);
 export const DEFAULT_SETTINGS: SessionSettings = {
-  settingsVersion: 6,
+  settingsVersion: 7,
   geminiKey: '',
-  targetLanguage: 'de'
+  targetLanguage: 'de',
+  subtitles: true,
+  translationVolume: 1
 };
 
 const OBSOLETE_SETTING_KEYS = [
@@ -34,9 +36,7 @@ const OBSOLETE_SETTING_KEYS = [
   'grokVoice',
   'grokSpeed',
   'sourceLanguage',
-  'subtitles',
   'dubbing',
-  'translationVolume',
   'fullOriginal',
   'audioMode',
   'calloutBoost',
@@ -46,6 +46,16 @@ const OBSOLETE_SETTING_KEYS = [
 
 function stringValue(value: unknown, fallback: string): string {
   return typeof value === 'string' ? value : fallback;
+}
+
+function booleanValue(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function volumeValue(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(1, Math.max(0, value))
+    : fallback;
 }
 
 function languageValue(value: unknown, allowed: Set<string>, fallback: string): string {
@@ -69,6 +79,11 @@ export function sanitizeSettings(value: unknown): SessionSettings {
       candidate.targetLanguage,
       TARGET_LANGUAGES,
       DEFAULT_SETTINGS.targetLanguage
+    ),
+    subtitles: booleanValue(candidate.subtitles, DEFAULT_SETTINGS.subtitles),
+    translationVolume: volumeValue(
+      candidate.translationVolume,
+      DEFAULT_SETTINGS.translationVolume
     )
   };
 }

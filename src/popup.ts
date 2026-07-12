@@ -10,6 +10,9 @@ function el<T extends HTMLElement>(selector: string): T {
 
 const geminiKeyInput = el<HTMLInputElement>('#geminiKey');
 const targetLanguageSelect = el<HTMLSelectElement>('#targetLanguage');
+const subtitlesInput = el<HTMLInputElement>('#subtitles');
+const translationVolumeInput = el<HTMLInputElement>('#translationVolume');
+const translationValue = el<HTMLElement>('#translationValue');
 const toggleButton = el<HTMLButtonElement>('#toggle');
 const monitor = el<HTMLDivElement>('#monitor');
 const statusLine = el<HTMLDivElement>('#status');
@@ -25,9 +28,11 @@ let state: SessionState = {
 
 function collectSettings(): SessionSettings {
   return {
-    settingsVersion: 6,
+    settingsVersion: 7,
     geminiKey: geminiKeyInput.value.trim(),
-    targetLanguage: targetLanguageSelect.value
+    targetLanguage: targetLanguageSelect.value,
+    subtitles: subtitlesInput.checked,
+    translationVolume: Number(translationVolumeInput.value) / 100
   };
 }
 
@@ -144,10 +149,28 @@ function saveConfiguration(): void {
   void saveSettings(collectSettings()).catch(() => setStatus('Speichern fehlgeschlagen.', true));
 }
 
+function updateOutputSettings(): void {
+  const settings = collectSettings();
+  translationValue.textContent = `${translationVolumeInput.value}%`;
+  void saveSettings(settings).catch(() => setStatus('Speichern fehlgeschlagen.', true));
+  void chrome.runtime
+    .sendMessage({
+      type: 'update-output-settings',
+      settings: {
+        subtitles: settings.subtitles,
+        translationVolume: settings.translationVolume
+      }
+    } satisfies Message)
+    .catch(() => {});
+}
+
 async function init(): Promise<void> {
   const settings = await loadSettings();
   geminiKeyInput.value = settings.geminiKey;
   targetLanguageSelect.value = settings.targetLanguage;
+  subtitlesInput.checked = settings.subtitles;
+  translationVolumeInput.value = String(Math.round(settings.translationVolume * 100));
+  translationValue.textContent = `${translationVolumeInput.value}%`;
 
   try {
     state = ((await chrome.runtime.sendMessage({ type: 'get-state' } satisfies Message)) ??
@@ -160,6 +183,8 @@ async function init(): Promise<void> {
   toggleButton.addEventListener('click', () => void onToggle());
   geminiKeyInput.addEventListener('change', saveConfiguration);
   targetLanguageSelect.addEventListener('change', saveConfiguration);
+  subtitlesInput.addEventListener('change', updateOutputSettings);
+  translationVolumeInput.addEventListener('input', updateOutputSettings);
   chrome.runtime.onMessage.addListener((msg: Message) => {
     if (msg.type === 'session-state') {
       state = msg.state;
