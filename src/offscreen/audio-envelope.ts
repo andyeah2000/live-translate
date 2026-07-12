@@ -5,12 +5,14 @@
  */
 export const SOURCE_DUCK_FADE_DOWN_S = 0.22;
 export const SOURCE_DUCK_FADE_UP_S = 0.7;
+export const SOURCE_FAIL_OPEN_S = 0.1;
 export const CONTROL_FADE_S = 0.12;
 
 /** Gemini wird pro zusammenhängendem Sprach-Turn ein- und ausgeblendet. */
-export const GEMINI_FADE_IN_S = 0.09;
-export const GEMINI_FADE_OUT_S = 0.14;
+export const GEMINI_FADE_IN_S = 0.025;
+export const GEMINI_FADE_OUT_S = 0.03;
 export const GEMINI_INTERRUPT_FADE_S = 0.06;
+export const GEMINI_EDGE_DECLICK_S = 0.005;
 
 const DEFAULT_CURVE_POINTS = 64;
 

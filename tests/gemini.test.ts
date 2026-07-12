@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   GeminiTranslator,
+  MAX_RECONNECT_PLAYBACK_LEAD_S,
   MAX_BUFFERED_AUDIO_MS,
   MAX_BUFFERED_BYTES,
   TRANSCRIPT_SETTLE_MS,
@@ -11,11 +12,17 @@ import {
   goAwayTimeLeftMs,
   isSessionManagementSchemaError,
   nextTranscriptionPlacement,
+  rejectedSessionManagementFeature,
   shouldRestartForBackpressure,
   type GeminiTranslatorOptions,
   type TimerScheduler
 } from '../src/offscreen/gemini';
-import { base64FromInt16 } from '../src/offscreen/pcm';
+import { base64FromInt16, int16FromBase64 } from '../src/offscreen/pcm';
+import {
+  MAX_PREROLL_AUDIO_MS,
+  SEND_CHUNK_MS,
+  samplesForDuration
+} from '../src/offscreen/stream-timing';
 
 test('Gemini raw WebSocket setup supports both observed transcription schemas', () => {
   const message = createGeminiSetup('de') as {
@@ -35,7 +42,6 @@ test('Gemini raw WebSocket setup supports both observed transcription schemas', 
   });
   assert.deepEqual(message.setup.sessionResumption, {});
   assert.deepEqual(message.setup.contextWindowCompression, { slidingWindow: {} });
-
   const documented = createGeminiSetup('de', 'generation') as {
     setup: {
       outputAudioTranscription?: unknown;
@@ -63,11 +69,19 @@ test('Gemini setup resumes a safe session handle and can disable unsupported ses
   assert.deepEqual(resumed.setup.contextWindowCompression, { slidingWindow: {} });
 
   const fallback = createGeminiSetup('de', 'setup', {
-    enabled: false,
+    resumptionEnabled: false,
+    compressionEnabled: false,
     resumptionHandle: 'must-not-leak'
   }) as { setup: Record<string, unknown> };
   assert.equal(fallback.setup.sessionResumption, undefined);
   assert.equal(fallback.setup.contextWindowCompression, undefined);
+
+  const compressionOnly = createGeminiSetup('de', 'setup', {
+    resumptionEnabled: false,
+    compressionEnabled: true
+  }) as { setup: Record<string, unknown> };
+  assert.equal(compressionOnly.setup.sessionResumption, undefined);
+  assert.deepEqual(compressionOnly.setup.contextWindowCompression, { slidingWindow: {} });
 });
 
 test('Gemini code 1007 falls back instead of killing live translation', () => {
@@ -95,6 +109,14 @@ test('Gemini code 1007 falls back instead of killing live translation', () => {
     true
   );
   assert.equal(isSessionManagementSchemaError(1006, 'sessionResumption'), false);
+  assert.equal(
+    rejectedSessionManagementFeature(1007, 'Unknown name "sessionResumption"'),
+    'resumption'
+  );
+  assert.equal(
+    rejectedSessionManagementFeature(1007, 'Unknown name "contextWindowCompression"'),
+    'compression'
+  );
 });
 
 test('live backpressure threshold is small and represents audio time', () => {
@@ -186,6 +208,7 @@ test('interruption cancels pending transcript finalization exactly once', () => 
 
 interface TranslatorInternals {
   ws: WebSocket | null;
+  handoffWs: WebSocket | null;
   ready: boolean;
   connectionReady: boolean;
   reconnectAttempts: number;
@@ -193,7 +216,9 @@ interface TranslatorInternals {
   pendingSamples: number;
   nextPlayTime: number;
   resumptionHandle: string | null;
-  sessionManagementEnabled: boolean;
+  sessionResumptionEnabled: boolean;
+  contextCompressionEnabled: boolean;
+  inputEndSent: boolean;
   playingSources: Set<AudioBufferSourceNode>;
   playbackTurn: {
     gain: GainNode;
@@ -203,6 +228,13 @@ interface TranslatorInternals {
   handleClose(ws: WebSocket, event: CloseEvent): void;
   handleCapturedAudio(chunk: Float32Array): void;
   handleServerMessage(ws: WebSocket, data: string): Promise<void>;
+  maybeResolveFinishInput(): void;
+  getAudioTransportStats(): {
+    capturedSamples: number;
+    sentSamples: number;
+    droppedSamples: number;
+    pendingSamples: number;
+  };
 }
 
 interface TranslatorHarness {
@@ -214,7 +246,7 @@ interface TranslatorHarness {
 }
 
 function createTranslatorHarness(
-  ctx: AudioContext = { sampleRate: 48_000 } as AudioContext,
+  ctx: AudioContext = { sampleRate: 48_000, currentTime: 0 } as AudioContext,
   outputNode: AudioNode = {} as AudioNode
 ): TranslatorHarness {
   const statuses: string[] = [];
@@ -242,6 +274,230 @@ function createTranslatorHarness(
   };
 }
 
+function createPlaybackTestContext(): {
+  ctx: AudioContext;
+  sources: Array<AudioBufferSourceNode & { onended: (() => void) | null }>;
+} {
+  const sources: Array<AudioBufferSourceNode & { onended: (() => void) | null }> = [];
+  const createParam = () =>
+    ({
+      value: 0,
+      cancelAndHoldAtTime() {},
+      setValueCurveAtTime(curve: Float32Array) {
+        this.value = curve.at(-1) ?? this.value;
+      },
+      linearRampToValueAtTime(value: number) {
+        this.value = value;
+      },
+      setValueAtTime(value: number) {
+        this.value = value;
+      }
+    }) as unknown as AudioParam;
+  const ctx = {
+    sampleRate: 48_000,
+    currentTime: 0,
+    createBuffer: (_channels: number, length: number, sampleRate: number) => ({
+      duration: length / sampleRate,
+      copyToChannel() {}
+    }),
+    createGain: () => {
+      const node = {
+        gain: createParam(),
+        connect: () => node,
+        disconnect() {}
+      };
+      return node;
+    },
+    createBufferSource: () => {
+      const source = {
+        buffer: null,
+        onended: null,
+        connect: (target: AudioNode) => target,
+        start() {},
+        stop() {}
+      } as unknown as AudioBufferSourceNode & { onended: (() => void) | null };
+      sources.push(source);
+      return source;
+    }
+  } as unknown as AudioContext;
+  return { ctx, sources };
+}
+
+test('setup preroll is bounded and flushed in low-latency chunks after setupComplete', async () => {
+  const harness = createTranslatorHarness();
+  const { ws, sent } = createFakeSocket();
+  harness.internals.ws = ws;
+  harness.internals.connectionReady = false;
+
+  for (let index = 0; index < 20; index++) {
+    harness.internals.handleCapturedAudio(new Float32Array(2_048).fill(0.1));
+  }
+  assert.ok(
+    harness.internals.pendingSamples <= samplesForDuration(16_000, MAX_PREROLL_AUDIO_MS)
+  );
+  assert.ok(harness.internals.pendingSamples >= samplesForDuration(16_000, 400));
+
+  await harness.internals.handleServerMessage(ws, JSON.stringify({ setupComplete: {} }));
+  assert.equal(harness.internals.connectionReady, true);
+  assert.ok(sent.length >= Math.floor(MAX_PREROLL_AUDIO_MS / SEND_CHUNK_MS) - 1);
+  assert.ok(harness.internals.pendingSamples < samplesForDuration(16_000, SEND_CHUNK_MS));
+  harness.translator.stop();
+});
+
+test('finishInput sends the partial final PCM chunk before audioStreamEnd and drains cleanly', async () => {
+  const playback = createPlaybackTestContext();
+  const harness = createTranslatorHarness(playback.ctx, {} as AudioNode);
+  const { ws, sent } = createFakeSocket();
+  harness.internals.ws = ws;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
+
+  // Deutlich kleiner als ein dokumentierter 100-ms-Uplink-Chunk.
+  harness.internals.handleCapturedAudio(new Float32Array(2_400).fill(0.1));
+  assert.ok(harness.internals.pendingSamples > 0);
+  assert.ok(harness.internals.pendingSamples < samplesForDuration(16_000, SEND_CHUNK_MS));
+
+  const finished = harness.translator.finishInput(900);
+  const messages = sent.map((item) => JSON.parse(item) as {
+    realtimeInput?: { audio?: { data?: string }; audioStreamEnd?: boolean };
+  });
+  const finalAudioIndex = messages.findIndex((message) => message.realtimeInput?.audio?.data);
+  const endIndex = messages.findIndex(
+    (message) => message.realtimeInput?.audioStreamEnd === true
+  );
+  assert.ok(finalAudioIndex >= 0);
+  assert.ok(endIndex > finalAudioIndex, 'audioStreamEnd must follow the final PCM samples');
+  const finalAudio = messages[finalAudioIndex]?.realtimeInput?.audio?.data;
+  assert.ok(finalAudio);
+  assert.ok(int16FromBase64(finalAudio).length < samplesForDuration(16_000, SEND_CHUNK_MS));
+
+  await harness.internals.handleServerMessage(
+    ws,
+    JSON.stringify({ serverContent: { turnComplete: true } })
+  );
+  let settled = false;
+  void finished.then(() => {
+    settled = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(settled, false, 'an unrelated old completion must not close the final turn');
+
+  await harness.internals.handleServerMessage(
+    ws,
+    JSON.stringify({ serverContent: { generationComplete: true } })
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(settled, false, 'a bare generationComplete is not an audioStreamEnd acknowledgement');
+
+  const translatedAudio = base64FromInt16(new Int16Array(480).fill(1_200));
+  await harness.internals.handleServerMessage(
+    ws,
+    JSON.stringify({
+      serverContent: {
+        modelTurn: { parts: [{ inlineData: { data: translatedAudio } }] },
+        turnComplete: true
+      }
+    })
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(settled, false, 'post-end audio plus turnComplete still lacks generationComplete');
+
+  await harness.internals.handleServerMessage(
+    ws,
+    JSON.stringify({ serverContent: { generationComplete: true } })
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(settled, false, 'server completion must never shortcut the fixed drain window');
+  playback.sources[0]?.onended?.();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(settled, false, 'local playback drain alone must not impersonate a server ack');
+  await finished;
+  const stats = harness.translator.getAudioTransportStats();
+  assert.deepEqual(stats, {
+    capturedSamples: stats.sentSamples,
+    sentSamples: stats.sentSamples,
+    droppedSamples: 0,
+    pendingSamples: 0
+  });
+  harness.translator.stop();
+});
+
+test('an interrupted graceful finish repeats audioStreamEnd after session resumption', async () => {
+  const playback = createPlaybackTestContext();
+  const harness = createTranslatorHarness(playback.ctx, {} as AudioNode);
+  const first = createFakeSocket();
+  harness.internals.ws = first.ws;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
+
+  const finished = harness.translator.finishInput(500);
+  assert.equal(
+    first.sent.some((item) => JSON.parse(item).realtimeInput?.audioStreamEnd === true),
+    true
+  );
+  harness.internals.handleClose(
+    first.ws,
+    { code: 1006, reason: 'lost after input end' } as CloseEvent
+  );
+  assert.equal(harness.internals.inputEndSent, false);
+
+  const resumed = createFakeSocket();
+  harness.internals.ws = resumed.ws;
+  await harness.internals.handleServerMessage(
+    resumed.ws,
+    JSON.stringify({ setupComplete: {} })
+  );
+  assert.equal(
+    resumed.sent.some((item) => JSON.parse(item).realtimeInput?.audioStreamEnd === true),
+    true
+  );
+  await harness.internals.handleServerMessage(
+    resumed.ws,
+    JSON.stringify({
+      serverContent: {
+        modelTurn: {
+          parts: [{ inlineData: { data: base64FromInt16(new Int16Array(480).fill(800)) } }]
+        },
+        generationComplete: true
+      }
+    })
+  );
+  playback.sources[0]?.onended?.();
+  await finished;
+  harness.translator.stop();
+});
+
+test('graceful finish has a hard deadline even when an AudioContext source never ends', async () => {
+  const harness = createTranslatorHarness();
+  const { ws } = createFakeSocket();
+  harness.internals.ws = ws;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
+  harness.internals.playingSources.add({ stop() {} } as AudioBufferSourceNode);
+
+  const startedAt = performance.now();
+  await harness.translator.finishInput(250);
+  const elapsed = performance.now() - startedAt;
+  assert.ok(elapsed >= 450, `hard deadline fired too early after ${elapsed.toFixed(1)} ms`);
+  assert.ok(elapsed < 1_000, `hard deadline failed to bound shutdown (${elapsed.toFixed(1)} ms)`);
+  harness.translator.stop();
+});
+
+test('finishInput stops capture immediately even while Gemini is reconnecting', async () => {
+  const harness = createTranslatorHarness();
+  harness.internals.connectionReady = false;
+  const finished = harness.translator.finishInput(250);
+  harness.internals.handleCapturedAudio(new Float32Array(4_800).fill(0.2));
+  assert.deepEqual(harness.translator.getAudioTransportStats(), {
+    capturedSamples: 0,
+    sentSamples: 0,
+    droppedSamples: 0,
+    pendingSamples: 0
+  });
+  await finished;
+  harness.translator.stop();
+});
+
 test('Gemini uses one smooth envelope across all network chunks of a spoken turn', async () => {
   const gains: Array<{
     node: GainNode;
@@ -249,7 +505,11 @@ test('Gemini uses one smooth envelope across all network chunks of a spoken turn
     events: Array<{ method: string; start: number; end?: number }>;
   }> = [];
   const sources: Array<
-    AudioBufferSourceNode & { onended: (() => void) | null; connectedTo?: AudioNode }
+    AudioBufferSourceNode & {
+      onended: (() => void) | null;
+      connectedTo?: AudioNode;
+      startedAt?: number;
+    }
   > = [];
   const copied: Float32Array[] = [];
   const ctx = {
@@ -301,11 +561,14 @@ test('Gemini uses one smooth envelope across all network chunks of a spoken turn
           source.connectedTo = target;
           return target;
         },
-        start: () => {},
+        start: (at: number) => {
+          source.startedAt = at;
+        },
         stop: () => {}
       } as unknown as AudioBufferSourceNode & {
         onended: (() => void) | null;
         connectedTo?: AudioNode;
+        startedAt?: number;
       };
       sources.push(source);
       return source;
@@ -326,16 +589,18 @@ test('Gemini uses one smooth envelope across all network chunks of a spoken turn
   sources[0]?.onended?.();
   assert.equal(gains[0]?.disconnected, 0, 'a temporary chunk gap must keep the turn bus alive');
 
+  (ctx as unknown as { currentTime: number }).currentTime = 5.22;
   await harness.internals.handleServerMessage(
     ws,
     JSON.stringify({ serverContent: { modelTurn: { parts: [{ inlineData: { data: audio } }] } } })
   );
   assert.equal(gains.length, 1, 'later chunks of one phrase must reuse the same envelope');
   assert.ok((copied[1]?.[0] ?? 0) > 0, 'inner chunks must not receive another fade-in');
+  assert.ok(Math.abs((sources[1]?.startedAt ?? 0) - 5.25) < 1e-6);
 
   await harness.internals.handleServerMessage(
     ws,
-    JSON.stringify({ serverContent: { turnComplete: true } })
+    JSON.stringify({ serverContent: { generationComplete: true } })
   );
   assert.equal(harness.internals.playbackTurn, null);
   assert.equal(gains[0]?.events.some((event) => event.method === 'linear'), true);
@@ -347,16 +612,69 @@ test('Gemini uses one smooth envelope across all network chunks of a spoken turn
 function createFakeSocket(bufferedAmount = 0): {
   ws: WebSocket;
   closeCalls: Array<{ code?: number; reason?: string }>;
+  sent: string[];
 } {
   const closeCalls: Array<{ code?: number; reason?: string }> = [];
+  const sent: string[] = [];
   const ws = {
     readyState: 1,
     bufferedAmount,
     onopen: null,
-    send: () => {},
+    send: (data: string) => sent.push(data),
     close: (code?: number, reason?: string) => closeCalls.push({ code, reason })
   } as unknown as WebSocket;
-  return { ws, closeCalls };
+  return { ws, closeCalls, sent };
+}
+
+function createTemporarilyBackpressuredSocket(): {
+  ws: WebSocket;
+  sent: string[];
+  closeCalls: Array<{ code?: number; reason?: string }>;
+  release(): void;
+} {
+  const sent: string[] = [];
+  const closeCalls: Array<{ code?: number; reason?: string }> = [];
+  let bufferedAmount = 0;
+  let audioSends = 0;
+  let shouldBlock = true;
+  const ws = {
+    readyState: 1,
+    get bufferedAmount() {
+      return bufferedAmount;
+    },
+    onopen: null,
+    send(data: string) {
+      sent.push(data);
+      const parsed = JSON.parse(data) as { realtimeInput?: { audio?: unknown } };
+      if (parsed.realtimeInput?.audio !== undefined) {
+        audioSends++;
+        if (shouldBlock && audioSends >= 2) bufferedAmount = MAX_BUFFERED_BYTES;
+      }
+    },
+    close(code?: number, reason?: string) {
+      closeCalls.push({ code, reason });
+    }
+  } as unknown as WebSocket;
+  return {
+    ws,
+    sent,
+    closeCalls,
+    release() {
+      shouldBlock = false;
+      bufferedAmount = 0;
+    }
+  };
+}
+
+function countRealtimeAudio(messages: string[]): number {
+  return messages.filter((item) => {
+    try {
+      const parsed = JSON.parse(item) as { realtimeInput?: { audio?: unknown } };
+      return parsed.realtimeInput?.audio !== undefined;
+    } catch {
+      return false;
+    }
+  }).length;
 }
 
 function addQueuedPlayback(internals: TranslatorInternals): () => number {
@@ -366,7 +684,7 @@ function addQueuedPlayback(internals: TranslatorInternals): () => number {
   return () => stopCalls;
 }
 
-test('unexpected disconnect clears queued dubbing but keeps a resumable checkpoint', () => {
+test('unexpected disconnect keeps input, bounds translated playback and preserves a safe checkpoint', () => {
   const harness = createTranslatorHarness();
   const { ws } = createFakeSocket();
   const stopCalls = addQueuedPlayback(harness.internals);
@@ -379,11 +697,11 @@ test('unexpected disconnect clears queued dubbing but keeps a resumable checkpoi
 
   harness.internals.handleClose(ws, { code: 1006, reason: 'network lost' } as CloseEvent);
 
-  assert.equal(stopCalls(), 1);
-  assert.equal(harness.internals.playingSources.size, 0);
-  assert.equal(harness.internals.nextPlayTime, 0);
-  assert.equal(harness.internals.pendingChunks.length, 0);
-  assert.equal(harness.internals.pendingSamples, 0);
+  assert.equal(stopCalls(), 0);
+  assert.equal(harness.internals.playingSources.size, 1);
+  assert.equal(harness.internals.nextPlayTime, MAX_RECONNECT_PLAYBACK_LEAD_S);
+  assert.equal(harness.internals.pendingChunks.length, 1);
+  assert.equal(harness.internals.pendingSamples, 2);
   assert.equal(harness.internals.resumptionHandle, 'last-safe-handle');
   assert.equal(harness.internals.ws, null);
   assert.deepEqual(harness.readyChanges, [false]);
@@ -391,7 +709,7 @@ test('unexpected disconnect clears queued dubbing but keeps a resumable checkpoi
   harness.translator.stop();
 });
 
-test('backpressure fails open, clears stale queues, and deliberately discards resumption', () => {
+test('backpressure fails open while retaining bounded unsent input and safe context', () => {
   const harness = createTranslatorHarness();
   const { ws, closeCalls } = createFakeSocket(MAX_BUFFERED_BYTES);
   const stopCalls = addQueuedPlayback(harness.internals);
@@ -405,20 +723,22 @@ test('backpressure fails open, clears stale queues, and deliberately discards re
   harness.internals.handleCapturedAudio(new Float32Array(128));
 
   assert.deepEqual(closeCalls, [{ code: 4001, reason: 'backpressure restart' }]);
-  assert.equal(stopCalls(), 1);
-  assert.equal(harness.internals.nextPlayTime, 0);
-  assert.equal(harness.internals.pendingChunks.length, 0);
-  assert.equal(harness.internals.pendingSamples, 0);
-  assert.equal(harness.internals.resumptionHandle, null);
+  assert.equal(stopCalls(), 0);
+  assert.equal(harness.internals.nextPlayTime, MAX_RECONNECT_PLAYBACK_LEAD_S);
+  assert.ok(harness.internals.pendingChunks.length >= 1);
+  assert.ok(harness.internals.pendingSamples > 2);
+  assert.equal(harness.internals.resumptionHandle, 'stale-after-overload');
   assert.equal(harness.internals.ws, null);
   assert.deepEqual(harness.readyChanges, [false]);
   assert.ok(harness.statuses.some((status) => status.includes('Netz überlastet')));
   harness.translator.stop();
 });
 
-test('goAway immediately reconnects from the latest safe resumable handle', async () => {
+test('goAway performs a sample-complete dual-socket handoff with exact audio routing', async () => {
   const harness = createTranslatorHarness();
-  const { ws, closeCalls } = createFakeSocket();
+  const { ws, closeCalls, sent: oldSent } = createFakeSocket();
+  const { ws: candidate, closeCalls: candidateCloseCalls, sent: candidateSent } =
+    createFakeSocket();
   const stopCalls = addQueuedPlayback(harness.internals);
   harness.internals.ws = ws;
   harness.internals.ready = true;
@@ -436,21 +756,242 @@ test('goAway immediately reconnects from the latest safe resumable handle', asyn
       sessionResumptionUpdate: { resumable: false, newHandle: 'unsafe-checkpoint' }
     })
   );
-  assert.equal(harness.internals.resumptionHandle, 'checkpoint-2');
+  assert.equal(
+    harness.internals.resumptionHandle,
+    null,
+    'resumable=false must invalidate every older checkpoint'
+  );
+
+  const OriginalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = function MockWebSocket() {
+    return candidate;
+  } as unknown as typeof WebSocket;
+  try {
+    await harness.internals.handleServerMessage(
+      ws,
+      JSON.stringify({ goAway: { timeLeft: '5.2s' } })
+    );
+
+    assert.equal(harness.internals.ws, ws, 'old socket must remain active during setup');
+    assert.equal(harness.internals.handoffWs, candidate);
+    assert.deepEqual(closeCalls, []);
+    assert.equal(stopCalls(), 0);
+    assert.equal(harness.internals.nextPlayTime, 42);
+    assert.deepEqual(harness.readyChanges, [false]);
+    assert.ok(harness.statuses.some((status) => status.includes('Restzeit')));
+
+    await harness.internals.handleServerMessage(
+      ws,
+      JSON.stringify({
+        sessionResumptionUpdate: { resumable: true, newHandle: 'checkpoint-after-handoff-start' }
+      })
+    );
+    candidate.onopen?.(new Event('open'));
+    const setup = JSON.parse(candidateSent[0] ?? '{}') as {
+      setup?: { sessionResumption?: { handle?: string } };
+    };
+    assert.equal(
+      setup.setup?.sessionResumption?.handle,
+      'checkpoint-after-handoff-start',
+      'candidate setup must use the newest safe server checkpoint'
+    );
+
+    // Auch bei einem >750-ms-Setup bleibt jedes Sample in einer eindeutigen
+    // lokalen FIFO. Es geht weder zum alten noch vor setupComplete zum neuen
+    // Socket und kann deshalb nicht doppelt übersetzt werden.
+    for (let chunk = 0; chunk < 10; chunk++) {
+      harness.internals.handleCapturedAudio(new Float32Array(4_800).fill(0.1));
+    }
+    const oldAudioBeforeSwitch = countRealtimeAudio(oldSent);
+    assert.equal(oldAudioBeforeSwitch, 0);
+    assert.equal(countRealtimeAudio(candidateSent), 0);
+    assert.ok(harness.internals.pendingSamples >= samplesForDuration(16_000, 900));
+
+    await harness.internals.handleServerMessage(
+      candidate,
+      JSON.stringify({ setupComplete: {} })
+    );
+    assert.equal(harness.internals.ws, candidate);
+    assert.equal(harness.internals.handoffWs, null);
+    assert.deepEqual(closeCalls, [{ code: 1000, reason: 'goAway handoff' }]);
+    assert.equal(stopCalls(), 0, 'valid translated audio must not be cut on handoff');
+    assert.equal(harness.internals.nextPlayTime, 42);
+    const candidateAudioAfterPromotion = countRealtimeAudio(candidateSent);
+    assert.ok(candidateAudioAfterPromotion >= 10);
+    assert.deepEqual(harness.readyChanges, [false, true]);
+
+    harness.internals.handleCapturedAudio(new Float32Array(4_800).fill(0.1));
+    assert.equal(
+      countRealtimeAudio(oldSent),
+      oldAudioBeforeSwitch,
+      'old socket must receive nothing after promotion'
+    );
+    assert.ok(countRealtimeAudio(candidateSent) > candidateAudioAfterPromotion);
+    assert.deepEqual(candidateCloseCalls, []);
+    const stats = harness.internals.getAudioTransportStats();
+    assert.equal(stats.droppedSamples, 0);
+    assert.equal(
+      stats.capturedSamples,
+      stats.sentSamples + stats.pendingSamples,
+      'normal GoAway handoff must account for every captured sample'
+    );
+  } finally {
+    globalThis.WebSocket = OriginalWebSocket;
+    harness.translator.stop();
+  }
+});
+
+test('goAway starts fresh when Gemini marks the latest session state unresumable', async () => {
+  const harness = createTranslatorHarness();
+  const { ws, sent: oldSent } = createFakeSocket();
+  const { ws: candidate, sent: candidateSent } = createFakeSocket();
+  harness.internals.ws = ws;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
 
   await harness.internals.handleServerMessage(
     ws,
-    JSON.stringify({ goAway: { timeLeft: '5.2s' } })
+    JSON.stringify({
+      sessionResumptionUpdate: { resumable: true, newHandle: 'formerly-safe' }
+    })
   );
+  await harness.internals.handleServerMessage(
+    ws,
+    JSON.stringify({ sessionResumptionUpdate: { resumable: false } })
+  );
+  assert.equal(harness.internals.resumptionHandle, null);
 
-  assert.deepEqual(closeCalls, [{ code: 1000, reason: 'goAway' }]);
-  assert.equal(stopCalls(), 1);
-  assert.equal(harness.internals.nextPlayTime, 0);
-  assert.equal(harness.internals.resumptionHandle, 'checkpoint-2');
-  assert.equal(harness.internals.ws, null);
-  assert.deepEqual(harness.readyChanges, [false]);
-  assert.ok(harness.statuses.some((status) => status.includes('Restzeit')));
-  harness.translator.stop();
+  const OriginalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = function MockWebSocket() {
+    return candidate;
+  } as unknown as typeof WebSocket;
+  try {
+    await harness.internals.handleServerMessage(
+      ws,
+      JSON.stringify({ goAway: { timeLeft: '1.5s' } })
+    );
+    harness.internals.handleCapturedAudio(new Float32Array(4_800).fill(0.1));
+    assert.equal(countRealtimeAudio(oldSent), 0);
+    assert.ok(harness.internals.pendingSamples > 0);
+    candidate.onopen?.(new Event('open'));
+    const setup = JSON.parse(candidateSent[0] ?? '{}') as {
+      setup?: { sessionResumption?: { handle?: string } };
+    };
+    assert.deepEqual(
+      setup.setup?.sessionResumption,
+      {},
+      'an older token must not be reused after resumable=false'
+    );
+    await harness.internals.handleServerMessage(
+      candidate,
+      JSON.stringify({ setupComplete: {} })
+    );
+    assert.ok(
+      countRealtimeAudio(candidateSent) >= 1,
+      'fresh successor must receive every sample buffered during setup'
+    );
+    assert.equal(harness.internals.getAudioTransportStats().droppedSamples, 0);
+  } finally {
+    globalThis.WebSocket = OriginalWebSocket;
+    harness.translator.stop();
+  }
+});
+
+test('resumable=false during handoff restarts the candidate fresh without losing buffered input', async () => {
+  const harness = createTranslatorHarness();
+  const { ws: old, sent: oldSent } = createFakeSocket();
+  const first = createFakeSocket();
+  const second = createFakeSocket();
+  harness.internals.ws = old;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
+  harness.internals.resumptionHandle = 'initial-safe-handle';
+
+  const candidates = [first.ws, second.ws];
+  const OriginalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = function MockWebSocket() {
+    const candidate = candidates.shift();
+    if (!candidate) throw new Error('unexpected extra handoff candidate');
+    return candidate;
+  } as unknown as typeof WebSocket;
+  try {
+    await harness.internals.handleServerMessage(
+      old,
+      JSON.stringify({ goAway: { timeLeft: '4s' } })
+    );
+    first.ws.onopen?.(new Event('open'));
+    harness.internals.handleCapturedAudio(new Float32Array(4_800).fill(0.1));
+    await harness.internals.handleServerMessage(
+      old,
+      JSON.stringify({ sessionResumptionUpdate: { resumable: false } })
+    );
+    assert.deepEqual(first.closeCalls, [
+      { code: 1000, reason: 'handoff setup refresh' }
+    ]);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(harness.internals.handoffWs, second.ws);
+    second.ws.onopen?.(new Event('open'));
+    const setup = JSON.parse(second.sent[0] ?? '{}') as {
+      setup?: { sessionResumption?: { handle?: string } };
+    };
+    assert.deepEqual(setup.setup?.sessionResumption, {});
+    await harness.internals.handleServerMessage(
+      second.ws,
+      JSON.stringify({ setupComplete: {} })
+    );
+    assert.equal(countRealtimeAudio(oldSent), 0);
+    assert.ok(countRealtimeAudio(second.sent) >= 1);
+    assert.equal(harness.internals.getAudioTransportStats().droppedSamples, 0);
+  } finally {
+    globalThis.WebSocket = OriginalWebSocket;
+    harness.translator.stop();
+  }
+});
+
+test('handoff backlog drains through a paced pump instead of restarting for self-backpressure', async () => {
+  const harness = createTranslatorHarness();
+  const { ws: old } = createFakeSocket();
+  const candidate = createTemporarilyBackpressuredSocket();
+  harness.internals.ws = old;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
+
+  const OriginalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = function MockWebSocket() {
+    return candidate.ws;
+  } as unknown as typeof WebSocket;
+  try {
+    await harness.internals.handleServerMessage(
+      old,
+      JSON.stringify({ goAway: { timeLeft: '3s' } })
+    );
+    candidate.ws.onopen?.(new Event('open'));
+    for (let chunk = 0; chunk < 10; chunk++) {
+      harness.internals.handleCapturedAudio(new Float32Array(4_800).fill(0.1));
+    }
+    await harness.internals.handleServerMessage(
+      candidate.ws,
+      JSON.stringify({ setupComplete: {} })
+    );
+    assert.equal(harness.internals.ws, candidate.ws);
+    assert.ok(harness.internals.pendingSamples > 0);
+    assert.deepEqual(candidate.closeCalls, []);
+
+    candidate.release();
+    const deadline = Date.now() + 1_000;
+    while (harness.internals.pendingSamples >= samplesForDuration(16_000, SEND_CHUNK_MS)) {
+      if (Date.now() >= deadline) throw new Error('paced handoff drain timed out');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const stats = harness.internals.getAudioTransportStats();
+    assert.equal(stats.capturedSamples, stats.sentSamples + stats.pendingSamples);
+    assert.equal(stats.droppedSamples, 0);
+    assert.deepEqual(candidate.closeCalls, []);
+  } finally {
+    globalThis.WebSocket = OriginalWebSocket;
+    harness.translator.stop();
+  }
 });
 
 test('session-management schema rejection reconnects fresh with the fields disabled', async () => {
@@ -471,8 +1012,9 @@ test('session-management schema rejection reconnects fresh with the fields disab
     })
   );
 
-  assert.equal(harness.internals.sessionManagementEnabled, false);
-  assert.equal(harness.internals.resumptionHandle, null);
+  assert.equal(harness.internals.contextCompressionEnabled, false);
+  assert.equal(harness.internals.sessionResumptionEnabled, true);
+  assert.equal(harness.internals.resumptionHandle, 'unsupported-handle');
   assert.equal(harness.internals.ws, null);
   assert.deepEqual(closeCalls, [{ code: 1000, reason: 'setup schema fallback' }]);
   assert.deepEqual(harness.readyChanges, [false]);

@@ -35,12 +35,12 @@ export interface DuckingTelemetry {
 
 /** Nachrichten zwischen Popup, Background, Offscreen-Dokument und Content Script. */
 export type Message =
-  | { type: 'start-session'; tabId: number; streamId: string; settings: SessionSettings }
+  | { type: 'start-session'; tabId: number; settings: SessionSettings }
   | { type: 'stop-session' }
   | { type: 'get-state' }
   | { type: 'update-output-settings'; settings: OutputSettings }
   | { type: 'offscreen-start'; sessionId: string; streamId: string; settings: SessionSettings }
-  | { type: 'offscreen-update-output'; settings: OutputSettings }
+  | { type: 'offscreen-update-output'; sessionId: string; settings: OutputSettings }
   | { type: 'offscreen-stop' }
   | { type: 'offscreen-status'; sessionId: string; status: string }
   | { type: 'offscreen-error'; sessionId: string; detail: string }

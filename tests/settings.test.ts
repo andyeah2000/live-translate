@@ -10,11 +10,9 @@ test('sanitizeSettings keeps only the four user-facing values', () => {
       geminiKey: '  AIza-test\n',
       targetLanguage: 'fr',
       subtitles: false,
-      dubbing: false,
       translationVolume: 0.2,
-      fullOriginal: true,
-      audioMode: 'native',
-      calloutBoost: false
+      unknownToggle: true,
+      unknownMode: 'legacy'
     }),
     {
       settingsVersion: 7,
@@ -35,19 +33,16 @@ test('sanitizeSettings rejects corrupt values and migrates legacy language codes
   assert.equal(sanitizeSettings({ targetLanguage: 'zh' }).targetLanguage, 'zh-Hans');
 });
 
-test('v7 load preserves output controls and removes obsolete pipeline options', async () => {
+test('v7 load preserves only canonical controls and removes every unknown key', async () => {
   const stored = {
     settingsVersion: 7,
     geminiKey: 'legacy-key',
     targetLanguage: 'de',
     subtitles: false,
-    dubbing: false,
     translationVolume: 0.64,
-    fullOriginal: true,
-    audioMode: 'native',
-    calloutBoost: true,
-    openaiKey: 'old-secret',
-    xaiKey: 'old-secret'
+    legacyToggle: true,
+    legacySecretA: 'old-secret',
+    legacySecretB: 'old-secret'
   };
   let persisted: unknown;
   let removed: string[] = [];
@@ -75,14 +70,7 @@ test('v7 load preserves output controls and removes obsolete pipeline options', 
       translationVolume: 0.64
     });
     assert.deepEqual(persisted, migrated);
-    for (const key of [
-      'dubbing',
-      'fullOriginal',
-      'audioMode',
-      'calloutBoost',
-      'openaiKey',
-      'xaiKey'
-    ]) {
+    for (const key of ['legacyToggle', 'legacySecretA', 'legacySecretB']) {
       assert.ok(removed.includes(key), `${key} was not removed`);
     }
   } finally {
