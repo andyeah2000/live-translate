@@ -1,4 +1,12 @@
 import { SpeechPreprocessor, base64FromInt16, floatToInt16, int16FromBase64, int16ToFloat } from './pcm';
+import {
+  GEMINI_FADE_IN_S,
+  GEMINI_INTERRUPT_FADE_S,
+  GEMINI_FADE_OUT_S,
+  applyCosineEdgeFades,
+  fadeOutAudioParam,
+  rampAudioParam
+} from './audio-envelope';
 
 const WS_URL =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
@@ -22,6 +30,14 @@ export const TRANSCRIPT_SETTLE_MS = 350;
 // 1008 gehört bewusst NICHT dazu: Gemini beendet damit auch reguläre
 // Sitzungen nach Ablauf des Zeitlimits (goAway) – das ist reconnectbar.
 const PERMANENT_CLOSE_CODES = new Set([1002, 1003, 1007]);
+
+interface PlaybackTurn {
+  gain: GainNode;
+  sources: Set<AudioBufferSourceNode>;
+  startTime: number;
+  endTime: number;
+  closed: boolean;
+}
 
 interface GeminiServerMessage {
   setupComplete?: unknown;
@@ -241,6 +257,8 @@ export class GeminiTranslator {
   private sessionManagementEnabled = true;
   private resumptionHandle: string | null = null;
   private readonly playingSources = new Set<AudioBufferSourceNode>();
+  private readonly playbackTurns = new Set<PlaybackTurn>();
+  private playbackTurn: PlaybackTurn | null = null;
   private readonly preprocessor: SpeechPreprocessor;
   private readonly transcriptTurns: TranscriptTurnCoordinator;
   private readonly sendRate = 16000;
@@ -492,38 +510,124 @@ export class GeminiTranslator {
       // Gemini verwirft bei Barge-in seine restliche Antwort. Bereits lokal
       // eingeplante Audioblöcke müssen ebenfalls weg, sonst spricht eine alte
       // Übersetzung über den nächsten Satz hinweg.
-      this.clearPlaybackQueue();
+      this.fadeInterruptedPlayback();
       this.transcriptTurns.interrupt();
       return;
     }
-    for (const part of content.modelTurn?.parts ?? []) {
-      const audio = part.inlineData?.data;
-      if (audio) this.playTranslatedAudio(audio);
+    const audioParts = (content.modelTurn?.parts ?? [])
+      .map((part) => part.inlineData?.data)
+      .filter((audio): audio is string => typeof audio === 'string' && audio.length > 0);
+    const startsTurn = this.playbackTurn === null;
+    for (let index = 0; index < audioParts.length; index++) {
+      this.playTranslatedAudio(audioParts[index]!, {
+        fadeIn: startsTurn && index === 0,
+        fadeOut: content.turnComplete === true && index === audioParts.length - 1
+      });
     }
     const transcript = content.outputTranscription?.text;
     if (transcript) this.transcriptTurns.push(transcript);
-    if (content.turnComplete) this.transcriptTurns.complete();
+    if (content.turnComplete) {
+      this.finishPlaybackTurn();
+      this.transcriptTurns.complete();
+    }
   }
 
-  private playTranslatedAudio(base64: string): void {
+  private playTranslatedAudio(
+    base64: string,
+    edges: { fadeIn: boolean; fadeOut: boolean }
+  ): void {
     try {
       const { ctx, outputNode } = this.opts;
       const samples = int16ToFloat(int16FromBase64(base64));
       if (samples.length === 0) return;
+      applyCosineEdgeFades(
+        samples,
+        OUTPUT_SAMPLE_RATE,
+        edges.fadeIn ? GEMINI_FADE_IN_S : 0,
+        edges.fadeOut ? GEMINI_FADE_OUT_S : 0
+      );
       const buffer = ctx.createBuffer(1, samples.length, OUTPUT_SAMPLE_RATE);
       buffer.copyToChannel(samples, 0);
       const node = ctx.createBufferSource();
       node.buffer = buffer;
-      node.connect(outputNode);
-      this.playingSources.add(node);
-      node.onended = () => this.playingSources.delete(node);
       const startAt = Math.max(ctx.currentTime + 0.05, this.nextPlayTime);
+      const turn = this.playbackTurn ?? this.createPlaybackTurn(startAt, outputNode);
+      node.connect(turn.gain);
+      this.playingSources.add(node);
+      turn.sources.add(node);
+      node.onended = () => {
+        this.playingSources.delete(node);
+        turn.sources.delete(node);
+        // Zwischen zwei verspätet eintreffenden Netzwerk-Chunks kann die
+        // Source-Menge kurz leer sein. Den Turn-Bus erst nach turnComplete
+        // trennen, sonst wäre der nächste Chunk desselben Satzes stumm.
+        if (turn.closed && turn.sources.size === 0) {
+          turn.gain.disconnect();
+          this.playbackTurns.delete(turn);
+        }
+      };
       node.start(startAt);
       this.nextPlayTime = startAt + buffer.duration;
+      turn.endTime = this.nextPlayTime;
     } catch (err) {
       console.warn('[live-translate] Ungültigen Gemini-Audio-Chunk übersprungen:', err);
       // Fehlerhafte Audio-Chunks überspringen statt die Sitzung zu beenden.
     }
+  }
+
+  private createPlaybackTurn(startTime: number, outputNode: AudioNode): PlaybackTurn {
+    const gain = this.opts.ctx.createGain();
+    gain.gain.value = 0;
+    gain.connect(outputNode);
+    rampAudioParam(gain.gain, 1, startTime, GEMINI_FADE_IN_S);
+    const turn: PlaybackTurn = {
+      gain,
+      sources: new Set(),
+      startTime,
+      endTime: startTime,
+      closed: false
+    };
+    this.playbackTurn = turn;
+    this.playbackTurns.add(turn);
+    return turn;
+  }
+
+  private finishPlaybackTurn(): void {
+    const turn = this.playbackTurn;
+    if (!turn) return;
+    this.playbackTurn = null;
+    turn.closed = true;
+    const now = this.opts.ctx.currentTime;
+    const audibleDuration = Math.max(0, turn.endTime - turn.startTime);
+    const duration = Math.min(GEMINI_FADE_OUT_S, audibleDuration / 3);
+    const fadeStart = Math.max(now, turn.endTime - duration);
+    if (turn.endTime > fadeStart && duration > 0) {
+      fadeOutAudioParam(turn.gain.gain, fadeStart, turn.endTime);
+    } else {
+      turn.gain.gain.setValueAtTime(0, now);
+    }
+    if (turn.sources.size === 0) {
+      turn.gain.disconnect();
+      this.playbackTurns.delete(turn);
+    }
+  }
+
+  private fadeInterruptedPlayback(): void {
+    const now = this.opts.ctx.currentTime;
+    const stopAt = now + GEMINI_INTERRUPT_FADE_S;
+    for (const turn of this.playbackTurns) {
+      turn.closed = true;
+      fadeOutAudioParam(turn.gain.gain, now, stopAt);
+      for (const source of turn.sources) {
+        try {
+          source.stop(stopAt);
+        } catch {
+          // Bereits beendet.
+        }
+      }
+    }
+    this.playbackTurn = null;
+    this.nextPlayTime = 0;
   }
 
   private takePendingSamples(count: number): Int16Array<ArrayBuffer> {
@@ -677,6 +781,9 @@ export class GeminiTranslator {
       }
     }
     this.playingSources.clear();
+    for (const turn of this.playbackTurns) turn.gain.disconnect();
+    this.playbackTurns.clear();
+    this.playbackTurn = null;
     this.nextPlayTime = 0;
   }
 }

@@ -1,4 +1,10 @@
 import type { AudioSettings, Message, SessionSettings } from '../messages';
+import {
+  CONTROL_FADE_S,
+  SOURCE_DUCK_FADE_DOWN_S,
+  SOURCE_DUCK_FADE_UP_S,
+  rampAudioParam
+} from './audio-envelope';
 import { GeminiTranslator } from './gemini';
 import { NeuralVoiceDetector } from './neural-vad';
 import { sourceDuckGain, sourcePathMix } from './voice-detector';
@@ -11,9 +17,6 @@ import { sourceDuckGain, sourcePathMix } from './voice-detector';
 // Silero v6.2 analysiert lückenlos 32-ms-Frames lokal in einem Worker. Der Tick
 // überträgt nur den daraus abgeleiteten Zustand auf den Audio-Graphen.
 const TICK_MS = 50;
-const DUCK_ATTACK_S = 0.02;
-const DUCK_RELEASE_S = 0.2;
-const CONTROL_RAMP_S = 0.08;
 // Callout-Boost: Kompression + Ausgleich hebt leise Sprecher (Funk-Callouts)
 // im KI-Feed um ~15 dB an, während laute Sprecher gleich laut bleiben.
 // Makeup 6.8 ≈ +16,7 dB kompensiert die Absenkung bei Durchschnittspegel.
@@ -363,21 +366,21 @@ function tick(): void {
       session.sourceDynamicGain.gain,
       duckGain,
       ctx,
-      duckGain === 1 ? DUCK_RELEASE_S : DUCK_ATTACK_S
+      duckGain === 1 ? SOURCE_DUCK_FADE_UP_S : SOURCE_DUCK_FADE_DOWN_S
     );
   }
   if (translatedTarget !== session.lastTranslatedTarget) {
     session.lastTranslatedTarget = translatedTarget;
-    rampParam(session.translatedGain.gain, translatedTarget, ctx, CONTROL_RAMP_S);
+    rampParam(session.translatedGain.gain, translatedTarget, ctx, CONTROL_FADE_S);
   }
   if (calloutTarget !== session.lastCalloutTarget) {
     session.lastCalloutTarget = calloutTarget;
-    rampParam(session.modelBoosted.gain, calloutTarget, ctx, CONTROL_RAMP_S);
-    rampParam(session.modelDirect.gain, 1 - calloutTarget, ctx, CONTROL_RAMP_S);
+    rampParam(session.modelBoosted.gain, calloutTarget, ctx, CONTROL_FADE_S);
+    rampParam(session.modelDirect.gain, 1 - calloutTarget, ctx, CONTROL_FADE_S);
   }
   if (sourceMix.dry !== session.lastSourcePathTarget) {
     session.lastSourcePathTarget = sourceMix.dry;
-    rampParam(session.sourceDryGain.gain, sourceMix.dry, ctx, CONTROL_RAMP_S);
+    rampParam(session.sourceDryGain.gain, sourceMix.dry, ctx, CONTROL_FADE_S);
     // Im dynamischen Pfad ist `duckGain` bereits der Sollpegel. Beim Wechsel
     // des Modus wird nur der Pfad ein-/ausgeblendet; der nächste Tick setzt
     // danach weiterhin den korrekten Ducking-Pegel.
@@ -385,17 +388,15 @@ function tick(): void {
       session.sourceDynamicGain.gain,
       sourceMix.dynamic ? duckGain : 0,
       ctx,
-      CONTROL_RAMP_S
+      CONTROL_FADE_S
     );
   }
 }
 
 function rampParam(param: AudioParam, target: number, ctx: AudioContext, duration: number): void {
-  const now = ctx.currentTime;
-  // Laufende Rampe an ihrer tatsächlichen aktuellen Position festhalten. Das
-  // vermeidet Pegelsprünge, wenn Sprache während Attack/Release erneut startet.
-  param.cancelAndHoldAtTime(now);
-  param.linearRampToValueAtTime(target, now + duration);
+  // Laufende S-Curve an ihrer tatsächlichen Position übernehmen. Auch bei
+  // schnellem Sprecherwechsel entstehen so weder Knackser noch Pegelkanten.
+  rampAudioParam(param, target, ctx.currentTime, duration);
 }
 
 function applyAudioSettings(settings: AudioSettings): void {

@@ -10,8 +10,15 @@ ab. Es gibt keinen zweiten Sprachdienst und keinen Zwischenserver.
 Der Originalton läuft normalerweise unverarbeitet mit 100 %. Erkennt die
 vollständig lokale **Silero VAD 6.2.1** Sprache im englischen Quellvideo, wird der komplette
 Originalmix weich und unveränderlich auf **10 %** abgesenkt.
-Sobald die Quellsprache endet, kehren Musik, Raketenklang und Atmo mit einer
-kurzen, pumpfreien Ausblendung nach rund einer halben Sekunde auf 100 % zurück.
+Eine 220-ms-Raised-Cosine-Hüllkurve vermeidet den hörbaren Pegelsprung. Sobald
+die Quellsprache endet, kehren Musik, Raketenklang und Atmo mit einer langsamen
+700-ms-S-Curve pumpfrei auf 100 % zurück.
+
+Auch Geminis Übersetzungsstimme wird nicht blockweise hart geschaltet: Jeder
+zusammenhängende Sprach-Turn erhält einen 90-ms-Fade-in und 140-ms-Fade-out.
+Die inneren Netzwerk-Chunks bleiben lückenlos, damit die Stimme weder flattert
+noch zwischen einzelnen Datenpaketen leiser wird. Auch eine von Gemini
+unterbrochene Antwort klingt innerhalb von 60 ms aus, statt hart abzureißen.
 
 Die neuronale Spracherkennung verarbeitet lückenlose 32-ms-Frames ausschließlich
 lokal im Browser. Sie hört nur den Quellstream; Geminis zeitversetzte
@@ -31,7 +38,7 @@ verwirft die alte Queue, schaltet das Original auf 100 % und verbindet frisch.
 Die Dynamik wurde gegen den vollständigen 34:15-Minuten-SpaceX-Film
 **Critical Path** kalibriert. Die lokale VAD analysiert das breitbandige Signal
 ohne aggressiven Sprach-Hochpass. Der adaptive 320–640-ms-Sprach-Hangover
-verbindet kurze Wortpausen, bevor eine 200-ms-Rampe die Atmo weich auf 100 %
+verbindet kurze Wortpausen, bevor eine 700-ms-S-Curve die Atmo weich auf 100 %
 zurückführt.
 
 Im reproduzierbaren A/B-Lauf über alle 64.235 VAD-Frames sank die Zahl der

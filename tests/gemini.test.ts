@@ -15,6 +15,7 @@ import {
   type GeminiTranslatorOptions,
   type TimerScheduler
 } from '../src/offscreen/gemini';
+import { base64FromInt16 } from '../src/offscreen/pcm';
 
 test('Gemini raw WebSocket setup supports both observed transcription schemas', () => {
   const message = createGeminiSetup('de') as {
@@ -194,6 +195,11 @@ interface TranslatorInternals {
   resumptionHandle: string | null;
   sessionManagementEnabled: boolean;
   playingSources: Set<AudioBufferSourceNode>;
+  playbackTurn: {
+    gain: GainNode;
+    sources: Set<AudioBufferSourceNode>;
+    closed: boolean;
+  } | null;
   handleClose(ws: WebSocket, event: CloseEvent): void;
   handleCapturedAudio(chunk: Float32Array): void;
   handleServerMessage(ws: WebSocket, data: string): Promise<void>;
@@ -207,15 +213,18 @@ interface TranslatorHarness {
   errors: string[];
 }
 
-function createTranslatorHarness(): TranslatorHarness {
+function createTranslatorHarness(
+  ctx: AudioContext = { sampleRate: 48_000 } as AudioContext,
+  outputNode: AudioNode = {} as AudioNode
+): TranslatorHarness {
   const statuses: string[] = [];
   const readyChanges: boolean[] = [];
   const errors: string[] = [];
   const options: GeminiTranslatorOptions = {
     apiKey: 'test-key',
-    ctx: { sampleRate: 48_000 } as AudioContext,
+    ctx,
     modelSource: {} as AudioNode,
-    outputNode: {} as AudioNode,
+    outputNode,
     targetLanguage: 'de',
     onTranscript: () => {},
     onStatus: (status) => statuses.push(status),
@@ -232,6 +241,108 @@ function createTranslatorHarness(): TranslatorHarness {
     errors
   };
 }
+
+test('Gemini uses one smooth envelope across all network chunks of a spoken turn', async () => {
+  const gains: Array<{
+    node: GainNode;
+    disconnected: number;
+    events: Array<{ method: string; start: number; end?: number }>;
+  }> = [];
+  const sources: Array<
+    AudioBufferSourceNode & { onended: (() => void) | null; connectedTo?: AudioNode }
+  > = [];
+  const copied: Float32Array[] = [];
+  const ctx = {
+    currentTime: 5,
+    sampleRate: 48_000,
+    createGain: () => {
+      const events: Array<{ method: string; start: number; end?: number }> = [];
+      const param = {
+        value: 0,
+        cancelAndHoldAtTime(start: number) {
+          events.push({ method: 'hold', start });
+        },
+        setValueCurveAtTime(curve: Float32Array, start: number, duration: number) {
+          events.push({ method: 'curve', start, end: start + duration });
+          this.value = curve.at(-1) ?? this.value;
+        },
+        linearRampToValueAtTime(value: number, end: number) {
+          events.push({ method: 'linear', start: end });
+          this.value = value;
+        },
+        setValueAtTime(value: number, start: number) {
+          events.push({ method: 'set', start });
+          this.value = value;
+        }
+      } as unknown as AudioParam;
+      const record = {
+        node: null as unknown as GainNode,
+        disconnected: 0,
+        events
+      };
+      const node = {
+        gain: param,
+        connect: () => node,
+        disconnect: () => record.disconnected++
+      } as unknown as GainNode;
+      record.node = node;
+      gains.push(record);
+      return node;
+    },
+    createBuffer: (_channels: number, length: number, sampleRate: number) => ({
+      duration: length / sampleRate,
+      copyToChannel: (samples: Float32Array) => copied.push(samples.slice())
+    }),
+    createBufferSource: () => {
+      const source = {
+        buffer: null,
+        onended: null,
+        connect: (target: AudioNode) => {
+          source.connectedTo = target;
+          return target;
+        },
+        start: () => {},
+        stop: () => {}
+      } as unknown as AudioBufferSourceNode & {
+        onended: (() => void) | null;
+        connectedTo?: AudioNode;
+      };
+      sources.push(source);
+      return source;
+    }
+  } as unknown as AudioContext;
+  const harness = createTranslatorHarness(ctx, {} as AudioNode);
+  const { ws } = createFakeSocket();
+  harness.internals.ws = ws;
+  const audio = base64FromInt16(new Int16Array(4_800).fill(1_200));
+
+  await harness.internals.handleServerMessage(
+    ws,
+    JSON.stringify({ serverContent: { modelTurn: { parts: [{ inlineData: { data: audio } }] } } })
+  );
+  assert.equal(gains.length, 1);
+  assert.equal(copied[0]?.[0], 0);
+  assert.equal(gains[0]?.events.some((event) => event.method === 'curve'), true);
+  sources[0]?.onended?.();
+  assert.equal(gains[0]?.disconnected, 0, 'a temporary chunk gap must keep the turn bus alive');
+
+  await harness.internals.handleServerMessage(
+    ws,
+    JSON.stringify({ serverContent: { modelTurn: { parts: [{ inlineData: { data: audio } }] } } })
+  );
+  assert.equal(gains.length, 1, 'later chunks of one phrase must reuse the same envelope');
+  assert.ok((copied[1]?.[0] ?? 0) > 0, 'inner chunks must not receive another fade-in');
+
+  await harness.internals.handleServerMessage(
+    ws,
+    JSON.stringify({ serverContent: { turnComplete: true } })
+  );
+  assert.equal(harness.internals.playbackTurn, null);
+  assert.equal(gains[0]?.events.some((event) => event.method === 'linear'), true);
+  sources[1]?.onended?.();
+  assert.equal(gains[0]?.disconnected, 1);
+  harness.translator.stop();
+});
 
 function createFakeSocket(bufferedAmount = 0): {
   ws: WebSocket;
