@@ -4,8 +4,8 @@ const CUTOFF_HZ = 7000;
 const HIGHPASS_HZ = 80;
 
 /**
- * Aufbereitung für den 16-kHz-Weg zur KI („weniger ist mehr"):
- * 1. einpoliger Highpass gegen Bass-Rumpeln,
+ * Aufbereitung für den 16-kHz-Analyseweg („weniger ist mehr"):
+ * 1. optionaler sanfter 80-Hz-Highpass gegen Gleichanteil/Bass-Rumpeln,
  * 2. FIR-Tiefpass (Windowed Sinc, Blackman) als sauberes Anti-Aliasing,
  * 3. phasenkontinuierliches Resampling auf 16 kHz über Chunk-Grenzen hinweg.
  */

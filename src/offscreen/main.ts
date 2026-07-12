@@ -6,13 +6,13 @@ import { sourceDuckGain, sourcePathMix } from './voice-detector';
 // Dynamisches Ducking wird ausschließlich von Sprachaktivität im Quellton
 // gesteuert. Im vorgesehenen englischen Video bleiben Musik, Raketenklang und
 // Atmo bei 100 %, sobald niemand spricht. Während Sprache sinkt der komplette
-// Originalmix weich auf den eingestellten Pegel (standardmäßig 10 %).
+// Originalmix weich auf den unveränderlichen Zielpegel von 10 %.
 //
 // Silero v6.2 analysiert lückenlos 32-ms-Frames lokal in einem Worker. Der Tick
 // überträgt nur den daraus abgeleiteten Zustand auf den Audio-Graphen.
 const TICK_MS = 50;
-const DUCK_ATTACK_S = 0.025;
-const DUCK_RELEASE_S = 0.08;
+const DUCK_ATTACK_S = 0.02;
+const DUCK_RELEASE_S = 0.2;
 const CONTROL_RAMP_S = 0.08;
 // Callout-Boost: Kompression + Ausgleich hebt leise Sprecher (Funk-Callouts)
 // im KI-Feed um ~15 dB an, während laute Sprecher gleich laut bleiben.
@@ -33,7 +33,6 @@ interface ActiveSession {
   client: GeminiTranslator;
   tickTimer: number;
   dubbing: boolean;
-  originalVolume: number;
   translationVolume: number;
   fullOriginal: boolean;
   calloutBoost: boolean;
@@ -91,7 +90,6 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
   latestAudio = {
     subtitles: settings.subtitles,
     dubbing: settings.dubbing,
-    originalVolume: settings.originalVolume,
     translationVolume: settings.translationVolume,
     fullOriginal: settings.fullOriginal,
     calloutBoost: settings.calloutBoost
@@ -262,7 +260,6 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
         }
       }, TICK_MS) as unknown as number,
       dubbing: settings.dubbing,
-      originalVolume: settings.originalVolume,
       translationVolume: settings.translationVolume,
       fullOriginal: settings.fullOriginal,
       calloutBoost: settings.calloutBoost,
@@ -351,8 +348,7 @@ function tick(): void {
     dubbing: session.dubbing,
     fullOriginal: session.fullOriginal,
     sourceSpeaking: speaking,
-    translationReady: session.geminiReady,
-    backgroundVolume: session.originalVolume
+    translationReady: session.geminiReady
   });
   const sourceMix = sourcePathMix({
     dubbing: session.dubbing,
@@ -405,7 +401,6 @@ function rampParam(param: AudioParam, target: number, ctx: AudioContext, duratio
 function applyAudioSettings(settings: AudioSettings): void {
   if (!session) return;
   session.dubbing = settings.dubbing === true;
-  session.originalVolume = clamp01(settings.originalVolume, 1);
   session.translationVolume = clamp01(settings.translationVolume, 1);
   session.fullOriginal = settings.fullOriginal !== false;
   session.calloutBoost = settings.calloutBoost === true;
@@ -449,8 +444,7 @@ function publishDuckingTelemetry(sessionId: string): void {
     dubbing: session.dubbing,
     fullOriginal: session.fullOriginal,
     sourceSpeaking: session.sourceSpeaking,
-    translationReady: session.geminiReady,
-    backgroundVolume: session.originalVolume
+    translationReady: session.geminiReady
   });
   send({
     type: 'ducking-telemetry',

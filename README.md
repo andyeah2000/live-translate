@@ -9,9 +9,9 @@ ab. Es gibt keinen zweiten Sprachdienst und keinen Zwischenserver.
 
 Der Originalton läuft normalerweise unverarbeitet mit 100 %. Erkennt die
 vollständig lokale **Silero VAD 6.2.1** Sprache im englischen Quellvideo, wird der komplette
-Originalmix weich auf den eingestellten Pegel abgesenkt (Standard: 10 %).
+Originalmix weich und unveränderlich auf **10 %** abgesenkt.
 Sobald die Quellsprache endet, kehren Musik, Raketenklang und Atmo mit einer
-kurzen, pumpfreien Ausblendung (typisch unter 250 ms) auf 100 % zurück.
+kurzen, pumpfreien Ausblendung nach rund einer halben Sekunde auf 100 % zurück.
 
 Die neuronale Spracherkennung verarbeitet lückenlose 32-ms-Frames ausschließlich
 lokal im Browser. Sie hört nur den Quellstream; Geminis zeitversetzte
@@ -22,6 +22,23 @@ deaktivieren. Falls das lokale Modell wider Erwarten ausfällt, bleibt die
 auf 100 % durchgeschaltet. Dasselbe gilt, während Gemini verbindet oder neu
 verbindet sowie bei Netz-Backpressure: Ohne verfügbare Übersetzung gibt es
 keine Absenkung.
+
+Gemini-Sitzungen werden mit Resumption-Checkpoints und Sliding-Window-
+Kompression über die normalen Verbindungsgrenzen hinaus fortgesetzt. Mehr als
+750 ms WebSocket-Rückstau werden nicht später zeitversetzt abgespielt: Der Client
+verwirft die alte Queue, schaltet das Original auf 100 % und verbindet frisch.
+
+Die Dynamik wurde gegen den vollständigen 34:15-Minuten-SpaceX-Film
+**Critical Path** kalibriert. Die lokale VAD analysiert das breitbandige Signal
+ohne aggressiven Sprach-Hochpass. Der adaptive 320–640-ms-Sprach-Hangover
+verbindet kurze Wortpausen, bevor eine 200-ms-Rampe die Atmo weich auf 100 %
+zurückführt.
+
+Im reproduzierbaren A/B-Lauf über alle 64.235 VAD-Frames sank die Zahl der
+Pegelwechsel von 20,96 auf 13,43 pro Minute (-35,9 %). Gleichzeitig stieg die
+Abdeckung hochkonfidenter Whisper-Wortkerne von 90,53 % auf 92,66 %. Diese
+Whisper-Zeitstempel dienen als relative Vergleichsreferenz, nicht als behauptete
+menschliche Ground Truth.
 
 ## Voraussetzungen und Build
 
@@ -67,7 +84,7 @@ Popup
        ├─ Content Script (Untertitel-Overlay)
        └─ Offscreen AudioContext
             ├─ Dry-Originalpfad: exakt 100 %
-            ├─ Dynamischer Originalpfad: 100 % ↔ konfigurierter Pegel
+            ├─ Dynamischer Originalpfad: 100 % ↔ fest 10 %
             ├─ AudioWorklet: lückenloser Roh-Audio-Capturepfad
             ├─ lokaler Worker: Resampling + Silero VAD 6.2.1 via ONNX/WASM
             ├─ optionaler KI-Sprachfilter + Limiter

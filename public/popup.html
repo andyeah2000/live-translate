@@ -214,7 +214,7 @@
       <div class="hint">
         Ausgeschaltet (empfohlen): Musik, Raketenklang und Atmo bleiben bei
         100&nbsp;%, sobald im englischen Quellvideo niemand spricht. Nur während
-        englischer Sprache sinkt der komplette Originalmix weich auf den Pegel unten.
+        englischer Sprache sinkt der komplette Originalmix weich auf feste 10&nbsp;%.
       </div>
       <div id="duckingMonitor" data-state="idle" role="status" aria-live="polite">
         Lokale Silero-KI: bereit
@@ -223,15 +223,15 @@
         Gemini-Stimme: <strong id="translationValue"></strong>
         <input type="range" id="translationVolume" min="0" max="100" step="5" />
       </label>
-      <label>
-        Original während erkannter Sprache: <strong id="volumeValue"></strong>
-        <input type="range" id="originalVolume" min="0" max="100" step="5" />
-      </label>
+      <div class="full-original">
+        Original während erkannter Sprache: <strong>fest 10&nbsp;%</strong>
+      </div>
       <div class="hint">
-        Standard: 10&nbsp;%. Eine vollständig lokale neuronale Silero-KI erkennt
+        Eine vollständig lokale neuronale Silero-KI erkennt
         Sprache im Quellvideo – auch über Musik und Raketen-Atmo – und steuert
-        die Absenkung. Sie reagiert nicht auf die später einsetzende Gemini-Stimme. Sobald die englische
-        Sprache endet, kehrt der Originalton automatisch auf exakt 100&nbsp;% zurück.
+        die Absenkung. Sie reagiert nicht auf die später einsetzende Gemini-Stimme.
+        Sobald die englische Sprache endet, kehrt der Originalton automatisch
+        auf exakt 100&nbsp;% zurück.
       </div>
     </fieldset>
 

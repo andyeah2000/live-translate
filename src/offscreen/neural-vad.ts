@@ -1,17 +1,19 @@
 import { SpeechProbabilityDetector } from './voice-detector';
 
 const READY_TIMEOUT_MS = 20_000;
-const STALE_FAIL_OPEN_MS = 250;
+const STALE_FAIL_OPEN_SECONDS = 0.25;
+const STALE_FAIL_OPEN_MS = STALE_FAIL_OPEN_SECONDS * 1_000;
 const STALE_ERROR_MS = 3_000;
 
-export function isFreshCapture(capturedAt: number, now: number): boolean {
-  const age = now - capturedAt;
-  return Number.isFinite(age) && age >= 0 && age <= STALE_FAIL_OPEN_MS;
+export function isFreshCapture(frameEndTime: number, currentTime: number): boolean {
+  const age = currentTime - frameEndTime;
+  return Number.isFinite(age) && age >= 0 && age <= STALE_FAIL_OPEN_SECONDS;
 }
 
 type WorkerMessage =
   | { type: 'ready' }
-  | { type: 'probability'; value: number; capturedAt: number }
+  | { type: 'probability'; value: number; sequence: number; frameEndTime: number }
+  | { type: 'discontinuity'; sequence: number }
   | { type: 'error'; detail: string };
 
 export interface NeuralVoiceDetectorOptions {
@@ -30,82 +32,106 @@ export class NeuralVoiceDetector {
   private speaking = false;
   private stopped = false;
   private lastProbabilityAt = 0;
+  private lastSequence: number | null = null;
   private watchdog: number | null = null;
+  private abortStart: ((error: Error) => void) | null = null;
+  private terminalError: Error | null = null;
 
   constructor(private readonly opts: NeuralVoiceDetectorOptions) {}
 
   async start(): Promise<void> {
-    const worker = new Worker(chrome.runtime.getURL('vad-worker.js'));
-    this.worker = worker;
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const timer = window.setTimeout(() => {
-        settle(new Error('Zeitüberschreitung beim Laden der lokalen Silero-VAD.'));
-      }, READY_TIMEOUT_MS);
-      const settle = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        window.clearTimeout(timer);
-        if (error) reject(error);
-        else resolve();
-      };
+    this.assertRunning();
+    try {
+      const worker = new Worker(chrome.runtime.getURL('vad-worker.js'));
+      this.worker = worker;
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        let timer: number | null = null;
+        const settle = (error?: Error) => {
+          if (settled) return;
+          settled = true;
+          if (timer !== null) window.clearTimeout(timer);
+          this.abortStart = null;
+          if (error) reject(error);
+          else resolve();
+        };
+        this.abortStart = (error) => settle(error);
+        timer = window.setTimeout(() => {
+          settle(new Error('Zeitüberschreitung beim Laden der lokalen Silero-VAD.'));
+        }, READY_TIMEOUT_MS);
+        worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
+          const message = event.data;
+          if (message.type === 'ready') settle();
+          else if (message.type === 'error') settle(new Error(message.detail));
+        };
+        worker.onerror = (event) =>
+          settle(new Error(event.message || 'Lokale VAD ist abgestürzt.'));
+        worker.postMessage({
+          type: 'init',
+          modelUrl: chrome.runtime.getURL('vad/silero_vad_16k_op15.onnx'),
+          wasmBaseUrl: chrome.runtime.getURL('ort/'),
+          inputSampleRate: this.opts.ctx.sampleRate
+        });
+      });
+
+      this.assertRunning();
       worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
         const message = event.data;
-        if (message.type === 'ready') settle();
-        else if (message.type === 'probability') {
-          this.handleProbability(message.value, message.capturedAt);
-        } else if (message.type === 'error') settle(new Error(message.detail));
+        if (message.type === 'probability') {
+          this.handleProbability(message.value, message.sequence, message.frameEndTime);
+        } else if (message.type === 'discontinuity') {
+          this.handleDiscontinuity(message.sequence);
+        } else if (message.type === 'error') {
+          this.fail(message.detail);
+        }
       };
-      worker.onerror = (event) => settle(new Error(event.message || 'Lokale VAD ist abgestürzt.'));
-      worker.postMessage({
-        type: 'init',
-        modelUrl: chrome.runtime.getURL('vad/silero_vad_16k_op15.onnx'),
-        wasmBaseUrl: chrome.runtime.getURL('ort/'),
-        inputSampleRate: this.opts.ctx.sampleRate
-      });
-    });
-
-    if (this.stopped) return;
-    worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
-      const message = event.data;
-      if (message.type === 'probability') {
-        this.handleProbability(message.value, message.capturedAt);
-      } else if (message.type === 'error') this.fail(message.detail);
-    };
-    worker.onerror = (event) => this.fail(event.message || 'Lokale VAD ist abgestürzt.');
-    await this.opts.ctx.audioWorklet.addModule(chrome.runtime.getURL('vad-capture-worklet.js'));
-    if (this.stopped) return;
-    const worklet = new AudioWorkletNode(this.opts.ctx, 'vad-pcm-capture');
-    const silentSink = this.opts.ctx.createGain();
-    silentSink.gain.value = 0;
-    this.opts.source.connect(worklet).connect(silentSink).connect(this.opts.ctx.destination);
-    worklet.port.onmessage = (event) => {
-      const { samples, capturedAt } = event.data as {
-        samples: Float32Array<ArrayBuffer>;
-        capturedAt: number;
-      };
-      this.worker?.postMessage(
-        { type: 'audio', samples: samples.buffer, capturedAt },
-        [samples.buffer]
+      worker.onerror = (event) => this.fail(event.message || 'Lokale VAD ist abgestürzt.');
+      await this.opts.ctx.audioWorklet.addModule(
+        chrome.runtime.getURL('vad-capture-worklet.js')
       );
-    };
-    this.worklet = worklet;
-    this.silentSink = silentSink;
-    this.lastProbabilityAt = performance.now();
-    this.watchdog = window.setInterval(() => {
-      if (this.stopped) return;
-      const staleFor = performance.now() - this.lastProbabilityAt;
-      if (staleFor > STALE_FAIL_OPEN_MS) {
-        this.detector.reset();
-        this.setSpeaking(false, 0);
-      }
-      if (staleFor > STALE_ERROR_MS) this.fail('Lokale VAD liefert keine Audiodaten mehr.');
-    }, STALE_FAIL_OPEN_MS / 2);
+      // Ein Workerfehler oder stop() während addModule darf niemals als
+      // erfolgreicher Start bis zum Aufrufer durchsickern.
+      this.assertRunning();
+      const worklet = new AudioWorkletNode(this.opts.ctx, 'vad-pcm-capture');
+      const silentSink = this.opts.ctx.createGain();
+      silentSink.gain.value = 0;
+      this.opts.source.connect(worklet).connect(silentSink).connect(this.opts.ctx.destination);
+      worklet.port.onmessage = (event) => {
+        const { samples, sequence, captureEndTime } = event.data as {
+          samples: Float32Array<ArrayBuffer>;
+          sequence: number;
+          captureEndTime: number;
+        };
+        this.worker?.postMessage(
+          { type: 'audio', samples: samples.buffer, sequence, captureEndTime },
+          [samples.buffer]
+        );
+      };
+      this.worklet = worklet;
+      this.silentSink = silentSink;
+      this.lastProbabilityAt = performance.now();
+      this.watchdog = window.setInterval(() => {
+        if (this.stopped) return;
+        const staleFor = performance.now() - this.lastProbabilityAt;
+        if (staleFor > STALE_FAIL_OPEN_MS) this.resetFailOpen();
+        if (staleFor > STALE_ERROR_MS) this.fail('Lokale VAD liefert keine Audiodaten mehr.');
+      }, STALE_FAIL_OPEN_MS / 2);
+    } catch (error) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      const terminal = this.terminalError ?? normalized;
+      this.terminalError = terminal;
+      if (!this.stopped) this.stop();
+      throw terminal;
+    }
   }
 
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
+    this.terminalError ??= new Error('Lokale VAD wurde gestoppt.');
+    const abortStart = this.abortStart;
+    this.abortStart = null;
+    abortStart?.(this.terminalError);
     if (this.watchdog !== null) window.clearInterval(this.watchdog);
     this.watchdog = null;
     try {
@@ -122,20 +148,41 @@ export class NeuralVoiceDetector {
     this.silentSink = null;
     this.worker?.terminate();
     this.worker = null;
-    this.detector.reset();
-    this.setSpeaking(false, 0);
+    this.lastSequence = null;
+    this.resetFailOpen();
   }
 
-  private handleProbability(value: number, capturedAt: number): void {
+  private handleProbability(value: number, sequence: number, frameEndTime: number): void {
     if (this.stopped) return;
-    if (!isFreshCapture(capturedAt, Date.now())) {
-      this.detector.reset();
-      this.setSpeaking(false, 0);
+    if (
+      !Number.isSafeInteger(sequence) ||
+      sequence < 0 ||
+      (this.lastSequence !== null && sequence < this.lastSequence)
+    ) {
+      this.lastSequence = null;
+      this.resetFailOpen();
+      return;
+    }
+    this.lastSequence = sequence;
+    if (!isFreshCapture(frameEndTime, this.opts.ctx.currentTime)) {
+      this.resetFailOpen();
       return;
     }
     this.lastProbabilityAt = performance.now();
     const decision = this.detector.update(value);
     this.setSpeaking(decision.speaking, decision.probability);
+  }
+
+  private handleDiscontinuity(sequence: number): void {
+    if (this.stopped) return;
+    this.lastSequence = Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : null;
+    this.lastProbabilityAt = performance.now();
+    this.resetFailOpen();
+  }
+
+  private resetFailOpen(): void {
+    this.detector.reset();
+    this.setSpeaking(false, 0);
   }
 
   private setSpeaking(speaking: boolean, probability: number): void {
@@ -146,9 +193,15 @@ export class NeuralVoiceDetector {
 
   private fail(detail: string): void {
     if (this.stopped) return;
-    this.detector.reset();
-    this.setSpeaking(false, 0);
+    this.terminalError = new Error(detail);
+    this.resetFailOpen();
     this.stop();
     this.opts.onError(detail);
+  }
+
+  private assertRunning(): void {
+    if (this.stopped) {
+      throw this.terminalError ?? new Error('Lokale VAD wurde vor dem Start gestoppt.');
+    }
   }
 }

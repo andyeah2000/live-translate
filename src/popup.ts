@@ -16,8 +16,6 @@ function el<T extends HTMLElement>(selector: string): T {
 const geminiKeyInput = el<HTMLInputElement>('#geminiKey');
 const subtitlesInput = el<HTMLInputElement>('#subtitles');
 const dubbingInput = el<HTMLInputElement>('#dubbing');
-const originalVolumeInput = el<HTMLInputElement>('#originalVolume');
-const volumeValueLabel = el<HTMLElement>('#volumeValue');
 const translationVolumeInput = el<HTMLInputElement>('#translationVolume');
 const translationValueLabel = el<HTMLElement>('#translationValue');
 const fullOriginalInput = el<HTMLInputElement>('#fullOriginal');
@@ -44,10 +42,9 @@ function selectedAudioMode(): AudioMode {
 
 function collectSettings(): SessionSettings {
   return {
-    settingsVersion: 4,
+    settingsVersion: 5,
     subtitles: subtitlesInput.checked,
     dubbing: dubbingInput.checked,
-    originalVolume: Number(originalVolumeInput.value) / 100,
     translationVolume: Number(translationVolumeInput.value) / 100,
     fullOriginal: fullOriginalInput.checked,
     geminiKey: geminiKeyInput.value.trim(),
@@ -181,12 +178,10 @@ async function onToggle(): Promise<void> {
 function updateControlStates(): void {
   const dubbing = dubbingInput.checked;
   translationVolumeInput.disabled = !dubbing;
-  originalVolumeInput.disabled = !dubbing || fullOriginalInput.checked;
 }
 
 function onSettingChanged(): void {
   const settings = collectSettings();
-  volumeValueLabel.textContent = `${originalVolumeInput.value} %`;
   translationValueLabel.textContent = `${translationVolumeInput.value} %`;
   updateControlStates();
   void saveSettings(settings).catch(() => {
@@ -200,7 +195,6 @@ function onSettingChanged(): void {
       settings: {
         subtitles: settings.subtitles,
         dubbing: settings.dubbing,
-        originalVolume: settings.originalVolume,
         translationVolume: settings.translationVolume,
         fullOriginal: settings.fullOriginal,
         calloutBoost: settings.calloutBoost
@@ -214,8 +208,6 @@ async function init(): Promise<void> {
   geminiKeyInput.value = settings.geminiKey;
   subtitlesInput.checked = settings.subtitles;
   dubbingInput.checked = settings.dubbing;
-  originalVolumeInput.value = String(Math.round(settings.originalVolume * 100));
-  volumeValueLabel.textContent = `${originalVolumeInput.value} %`;
   translationVolumeInput.value = String(Math.round(settings.translationVolume * 100));
   translationValueLabel.textContent = `${translationVolumeInput.value} %`;
   fullOriginalInput.checked = settings.fullOriginal;
@@ -242,7 +234,6 @@ async function init(): Promise<void> {
     geminiKeyInput,
     subtitlesInput,
     dubbingInput,
-    originalVolumeInput,
     translationVolumeInput,
     fullOriginalInput,
     targetLanguageSelect,
@@ -251,7 +242,6 @@ async function init(): Promise<void> {
     input.addEventListener('change', onSettingChanged);
   }
   // Lautstärke schon beim Ziehen übernehmen, nicht erst beim Loslassen.
-  originalVolumeInput.addEventListener('input', onSettingChanged);
   translationVolumeInput.addEventListener('input', onSettingChanged);
 
   chrome.runtime.onMessage.addListener((msg: Message) => {

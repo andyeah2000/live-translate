@@ -7,11 +7,9 @@ export type AudioMode = 'filtered' | 'native';
 
 export interface SessionSettings {
   /** Version der persistierten Einstellungen für kontrollierte Migrationen. */
-  settingsVersion: 4;
+  settingsVersion: 5;
   subtitles: boolean;
   dubbing: boolean;
-  /** Pegel des kompletten Originals (0–1), solange Quellsprache erkannt wird. */
-  originalVolume: number;
   /** Lautstärke der übersetzten Gemini-Stimme (0–1). */
   translationVolume: number;
   /** Originalton über einen unverarbeiteten Unity-Pfad ausgeben (Ducking aus). */
@@ -27,7 +25,6 @@ export interface SessionSettings {
 export interface AudioSettings {
   subtitles: boolean;
   dubbing: boolean;
-  originalVolume: number;
   translationVolume: number;
   fullOriginal: boolean;
   calloutBoost: boolean;

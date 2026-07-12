@@ -1,18 +1,26 @@
 import * as ort from 'onnxruntime-web/wasm';
 import { SpeechPreprocessor } from './pcm';
+import {
+  hasCaptureDiscontinuity,
+  outputFrameEndTime,
+  pushBoundedFifo,
+  type CaptureStamp
+} from './vad-timing';
 
 const SAMPLE_RATE = 16_000;
 const FRAME_SAMPLES = 512;
 const CONTEXT_SAMPLES = 64;
 const STATE_SIZE = 2 * 1 * 128;
+const MAX_QUEUED_AUDIO_BLOCKS = 2;
 
 type IncomingMessage =
   | { type: 'init'; modelUrl: string; wasmBaseUrl: string; inputSampleRate: number }
-  | { type: 'audio'; samples: ArrayBuffer; capturedAt: number };
+  | { type: 'audio'; samples: ArrayBuffer; sequence: number; captureEndTime: number };
 
 type OutgoingMessage =
   | { type: 'ready' }
-  | { type: 'probability'; value: number; capturedAt: number }
+  | { type: 'probability'; value: number; sequence: number; frameEndTime: number }
+  | { type: 'discontinuity'; sequence: number }
   | { type: 'error'; detail: string };
 
 declare const self: {
@@ -30,11 +38,12 @@ let sourceSampleRate = 0;
 let frame = new Float32Array(FRAME_SAMPLES);
 let frameOffset = 0;
 let audioProcessing = false;
-let pendingAudio: {
+const audioQueue: Array<{
   samples: ArrayBuffer;
-  capturedAt: number;
-  resetBefore: boolean;
-} | null = null;
+  sequence: number;
+  captureEndTime: number;
+}> = [];
+let lastCapture: CaptureStamp | null = null;
 
 self.onmessage = (event) => {
   const message = event.data;
@@ -43,7 +52,7 @@ self.onmessage = (event) => {
       .then(() => initialize(message.modelUrl, message.wasmBaseUrl, message.inputSampleRate))
       .catch(reportError);
   } else if (message.type === 'audio') {
-    enqueueAudio(message.samples, message.capturedAt);
+    enqueueAudio(message.samples, message.sequence, message.captureEndTime);
   }
 };
 
@@ -63,16 +72,21 @@ async function initialize(
   // einmal aufwärmen und den rekurrenten Zustand danach deterministisch leeren.
   await infer(new Float32Array(FRAME_SAMPLES));
   sourceSampleRate = inputRate;
+  lastCapture = null;
   resetPipeline();
   self.postMessage({ type: 'ready' });
 }
 
-function enqueueAudio(samples: ArrayBuffer, capturedAt: number): void {
+function enqueueAudio(samples: ArrayBuffer, sequence: number, captureEndTime: number): void {
   if (failed) return;
-  // Maximal einen noch nicht begonnenen Block halten. Bei Lastspitzen gewinnt
-  // immer der neueste Ton, damit weder Speicher noch Ducking-Latenz wachsen.
-  const resetBefore = pendingAudio?.resetBefore === true || pendingAudio !== null;
-  pendingAudio = { samples, capturedAt, resetBefore };
+  // Maximal zwei wartende Blöcke. Bei Überlast bleibt die Reihenfolge der
+  // neuesten Daten erhalten; die entstehende Sequenzlücke wird beim Drain als
+  // Discontinuity erkannt und setzt Modell sowie Hauptthread fail-open zurück.
+  pushBoundedFifo(
+    audioQueue,
+    { samples, sequence, captureEndTime },
+    MAX_QUEUED_AUDIO_BLOCKS
+  );
   if (!audioProcessing) void drainAudio();
 }
 
@@ -80,21 +94,34 @@ async function drainAudio(): Promise<void> {
   if (audioProcessing || failed) return;
   audioProcessing = true;
   try {
-    while (pendingAudio && !failed) {
-      const next = pendingAudio;
-      pendingAudio = null;
-      if (next.resetBefore) resetPipeline();
-      await processAudio(next.samples, next.capturedAt);
+    while (audioQueue.length > 0 && !failed) {
+      const next = audioQueue.shift();
+      if (!next) continue;
+      const capture: CaptureStamp = {
+        sequence: next.sequence,
+        captureEndTime: next.captureEndTime,
+        sampleCount: next.samples.byteLength / Float32Array.BYTES_PER_ELEMENT
+      };
+      if (hasCaptureDiscontinuity(lastCapture, capture, sourceSampleRate)) {
+        resetPipeline();
+        self.postMessage({ type: 'discontinuity', sequence: next.sequence });
+      }
+      lastCapture = capture;
+      await processAudio(next.samples, next.sequence, next.captureEndTime);
     }
   } catch (error) {
     reportError(error);
   } finally {
     audioProcessing = false;
-    if (pendingAudio && !failed) void drainAudio();
+    if (audioQueue.length > 0 && !failed) void drainAudio();
   }
 }
 
-async function processAudio(buffer: ArrayBuffer, capturedAt: number): Promise<void> {
+async function processAudio(
+  buffer: ArrayBuffer,
+  sequence: number,
+  captureEndTime: number
+): Promise<void> {
   if (!session || !preprocessor || failed) return;
   const samples = preprocessor.process(new Float32Array(buffer));
   let offset = 0;
@@ -105,7 +132,13 @@ async function processAudio(buffer: ArrayBuffer, capturedAt: number): Promise<vo
     offset += count;
     if (frameOffset === FRAME_SAMPLES) {
       const value = await infer(frame);
-      self.postMessage({ type: 'probability', value, capturedAt });
+      const frameEndTime = outputFrameEndTime(
+        captureEndTime,
+        samples.length,
+        offset,
+        SAMPLE_RATE
+      );
+      self.postMessage({ type: 'probability', value, sequence, frameEndTime });
       frame = new Float32Array(FRAME_SAMPLES);
       frameOffset = 0;
     }
@@ -144,13 +177,15 @@ function resetModelState(): void {
 
 function resetPipeline(): void {
   resetModelState();
+  // Kein aggressiver Sprach-Bandpass: Auch tiefe Stimmen bleiben für Silero
+  // vollständig erhalten. Der hörbare Originalpfad wird ohnehin nie berührt.
   preprocessor = new SpeechPreprocessor(sourceSampleRate, { highpass: false });
 }
 
 function reportError(error: unknown): void {
   if (failed) return;
   failed = true;
-  pendingAudio = null;
+  audioQueue.length = 0;
   self.postMessage({
     type: 'error',
     detail: error instanceof Error ? error.message : String(error)

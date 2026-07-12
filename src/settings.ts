@@ -2,6 +2,7 @@ import type { SessionSettings } from './messages';
 
 const AUDIO_MODES = new Set(['filtered', 'native']);
 const TARGET_LANGUAGES = new Set([
+  'de',
   'en',
   'es',
   'fr',
@@ -21,10 +22,9 @@ const TARGET_LANGUAGES = new Set([
   'ar'
 ]);
 export const DEFAULT_SETTINGS: SessionSettings = {
-  settingsVersion: 4,
+  settingsVersion: 5,
   subtitles: true,
   dubbing: true,
-  originalVolume: 0.1,
   translationVolume: 1,
   fullOriginal: false,
   geminiKey: '',
@@ -62,17 +62,16 @@ function languageValue(value: unknown, allowed: Set<string>, fallback: string): 
 export function sanitizeSettings(value: unknown): SessionSettings {
   const candidate = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
   const isCurrentVersion = candidate.settingsVersion === DEFAULT_SETTINGS.settingsVersion;
+  const hasTranslationVolume = isCurrentVersion || candidate.settingsVersion === 4;
   return {
     settingsVersion: DEFAULT_SETTINGS.settingsVersion,
     subtitles: booleanValue(candidate.subtitles, DEFAULT_SETTINGS.subtitles),
     dubbing: booleanValue(candidate.dubbing, DEFAULT_SETTINGS.dubbing),
-    // Version 4 ersetzt das alte RMS-Gate durch lokale Silero-VAD. Alte
-    // 15-%-/Bypass-Werte würden die neue Funktion sonst unbemerkt deaktivieren;
-    // deshalb einmalig auf den gewünschten dynamischen 10-%-Modus migrieren.
-    originalVolume: isCurrentVersion
-      ? volumeValue(candidate.originalVolume, DEFAULT_SETTINGS.originalVolume)
-      : DEFAULT_SETTINGS.originalVolume,
-    translationVolume: isCurrentVersion
+    // Version 5 entfernt den frei konfigurierbaren Originalpegel. Der
+    // Produktvertrag lautet jetzt eindeutig: Stimme = 10 %, keine Stimme =
+    // exakt 100 %. So kann ein persistierter 100-%-Wert Ducking nicht mehr
+    // unbemerkt wirkungslos machen.
+    translationVolume: hasTranslationVolume
       ? volumeValue(candidate.translationVolume, DEFAULT_SETTINGS.translationVolume)
       : volumeValue(candidate.germanVolume, DEFAULT_SETTINGS.translationVolume),
     fullOriginal: isCurrentVersion
@@ -107,6 +106,7 @@ export async function loadSettings(): Promise<SessionSettings> {
       'grokVoice',
       'grokSpeed',
       'sourceLanguage',
+      'originalVolume',
       'germanVolume'
     ]);
   }

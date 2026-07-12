@@ -138,7 +138,7 @@ async function stopSession(error: string | null = null): Promise<void> {
     console.warn('[live-translate] Offscreen-Dokument konnte nicht sauber geschlossen werden:', err);
   }
   if (state.tabId !== null) {
-    void chrome.tabs
+    await chrome.tabs
       .sendMessage(state.tabId, { type: 'subtitle-clear' } satisfies Message)
       .catch(() => {});
   }
@@ -153,11 +153,31 @@ async function stopSession(error: string | null = null): Promise<void> {
 }
 
 async function forwardTranscript(sessionId: string, text: string, final: boolean): Promise<void> {
-  const state = await getState();
-  if (!state.running || state.tabId === null || state.sessionId !== sessionId) return;
+  const observedState = await getState();
+  if (
+    !observedState.running ||
+    observedState.tabId === null ||
+    observedState.sessionId !== sessionId
+  ) {
+    return;
+  }
   if (!(await getSubtitlesEnabled())) return;
-  void chrome.tabs
-    .sendMessage(state.tabId, { type: 'subtitle', text, final } satisfies Message)
+
+  // Storage-Zugriffe sind asynchron. Eine Sitzung kann währenddessen gestoppt
+  // oder ersetzt worden sein; dann darf kein alter Untertitel mehr in den Tab.
+  const currentState = await getState();
+  if (
+    !currentState.running ||
+    currentState.tabId === null ||
+    currentState.tabId !== observedState.tabId ||
+    currentState.sessionId !== sessionId
+  ) {
+    return;
+  }
+  // Das Senden wird bewusst abgewartet. Dadurch kann die serialisierte
+  // Stop-Operation `subtitle-clear` garantiert erst danach zustellen.
+  await chrome.tabs
+    .sendMessage(currentState.tabId, { type: 'subtitle', text, final } satisfies Message)
     .catch(() => {});
 }
 
@@ -215,7 +235,9 @@ chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse) => {
     case 'transcript':
       transcriptQueue = transcriptQueue
         .catch(() => {})
-        .then(() => forwardTranscript(msg.sessionId, msg.text, msg.final))
+        .then(() =>
+          enqueueSessionOperation(() => forwardTranscript(msg.sessionId, msg.text, msg.final))
+        )
         .catch((err) => console.warn('[live-translate] Untertitel-Weiterleitung fehlgeschlagen:', err));
       break;
     case 'offscreen-status':
@@ -276,10 +298,25 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   void getState()
-    .then((state) => {
-      if (state.running && state.tabId === tabId) {
-        void enqueueSessionOperation(() => stopSession()).catch(() => {});
+    .then((observedState) => {
+      if (
+        !observedState.running ||
+        observedState.tabId !== tabId ||
+        observedState.sessionId === null
+      ) {
+        return;
       }
+      const observedSessionId = observedState.sessionId;
+      void enqueueSessionOperation(async () => {
+        const currentState = await getState();
+        if (
+          currentState.running &&
+          currentState.tabId === tabId &&
+          currentState.sessionId === observedSessionId
+        ) {
+          await stopSession();
+        }
+      }).catch(() => {});
     })
     .catch(() => {});
 });
@@ -289,16 +326,50 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status !== 'complete') return;
   void getState()
-    .then(async (state) => {
-      if (!state.running || state.tabId !== tabId) return;
-      if (!(await getSubtitlesEnabled())) return;
-      try {
-        await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-      } catch {
-        await enqueueSessionOperation(() =>
-          stopSession('Die Seite hat gewechselt – bitte die Übersetzung neu starten.')
-        );
+    .then((observedState) => {
+      if (
+        !observedState.running ||
+        observedState.tabId !== tabId ||
+        observedState.sessionId === null
+      ) {
+        return;
       }
+      const observedSessionId = observedState.sessionId;
+      return enqueueSessionOperation(async () => {
+        let currentState = await getState();
+        if (
+          !currentState.running ||
+          currentState.tabId !== tabId ||
+          currentState.sessionId !== observedSessionId
+        ) {
+          return;
+        }
+        if (!(await getSubtitlesEnabled())) return;
+
+        // Auch nach dem asynchronen Settings-Zugriff exakt dieselbe Sitzung
+        // verlangen. So kann ein altes Navigationsevent keine neue Sitzung
+        // injizieren oder bei einem Fehler stoppen.
+        currentState = await getState();
+        if (
+          !currentState.running ||
+          currentState.tabId !== tabId ||
+          currentState.sessionId !== observedSessionId
+        ) {
+          return;
+        }
+        try {
+          await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+        } catch {
+          const failedState = await getState();
+          if (
+            failedState.running &&
+            failedState.tabId === tabId &&
+            failedState.sessionId === observedSessionId
+          ) {
+            await stopSession('Die Seite hat gewechselt – bitte die Übersetzung neu starten.');
+          }
+        }
+      });
     })
     .catch((err) => console.warn('[live-translate] Navigation konnte nicht verarbeitet werden:', err));
 });

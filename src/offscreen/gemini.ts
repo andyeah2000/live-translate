@@ -4,12 +4,20 @@ const WS_URL =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 const MODEL = 'models/gemini-3.5-live-translate-preview';
 const OUTPUT_SAMPLE_RATE = 24000;
+const WS_CONNECTING_STATE = 0;
+const WS_OPEN_STATE = 1;
 // Die Live-API erwartet Audio-Chunks von ~100 ms.
 const SEND_CHUNK_MS = 100;
 const MAX_RECONNECTS = 8;
 const CONNECT_TIMEOUT_MS = 15_000;
-const MAX_BUFFERED_BYTES = 1_000_000;
-const BACKPRESSURE_RECOVERY_BYTES = MAX_BUFFERED_BYTES / 2;
+const INPUT_PCM_BYTES_PER_SECOND = 16_000 * Int16Array.BYTES_PER_ELEMENT;
+const BASE64_AUDIO_BYTES_PER_SECOND = (INPUT_PCM_BYTES_PER_SECOND * 4) / 3;
+/** Maximal tolerierter lokaler WebSocket-Rückstau, bevor frisch neu verbunden wird. */
+export const MAX_BUFFERED_AUDIO_MS = 750;
+export const MAX_BUFFERED_BYTES = Math.floor(
+  (BASE64_AUDIO_BYTES_PER_SECOND * MAX_BUFFERED_AUDIO_MS) / 1_000
+);
+export const TRANSCRIPT_SETTLE_MS = 350;
 // Close-Codes, bei denen ein Reconnect sinnlos ist (Konfig-/Protokollfehler).
 // 1008 gehört bewusst NICHT dazu: Gemini beendet damit auch reguläre
 // Sitzungen nach Ablauf des Zeitlimits (goAway) – das ist reconnectbar.
@@ -17,7 +25,8 @@ const PERMANENT_CLOSE_CODES = new Set([1002, 1003, 1007]);
 
 interface GeminiServerMessage {
   setupComplete?: unknown;
-  goAway?: unknown;
+  goAway?: { timeLeft?: unknown };
+  sessionResumptionUpdate?: { newHandle?: unknown; resumable?: unknown };
   serverContent?: {
     modelTurn?: { parts?: Array<{ inlineData?: { data?: string } }> };
     outputTranscription?: { text?: string };
@@ -28,6 +37,11 @@ interface GeminiServerMessage {
 }
 
 export type TranscriptionPlacement = 'setup' | 'generation' | 'disabled';
+
+export interface GeminiSessionSetup {
+  enabled?: boolean;
+  resumptionHandle?: string | null;
+}
 
 export interface GeminiTranslatorOptions {
   apiKey: string;
@@ -42,9 +56,114 @@ export interface GeminiTranslatorOptions {
   onError(detail: string): void;
 }
 
+export interface TimerScheduler {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+const DEFAULT_TIMER_SCHEDULER: TimerScheduler = {
+  setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+  clearTimeout: (handle) => globalThis.clearTimeout(handle as number)
+};
+
+/** Schätzt nur die unvermeidbare lokale Sendelatenz; JSON-Overhead macht sie real etwas höher. */
+export function bufferedAudioDurationMs(bufferedBytes: number): number {
+  if (!Number.isFinite(bufferedBytes) || bufferedBytes <= 0) return 0;
+  return (bufferedBytes / BASE64_AUDIO_BYTES_PER_SECOND) * 1_000;
+}
+
+export function shouldRestartForBackpressure(bufferedBytes: number): boolean {
+  return Number.isFinite(bufferedBytes) && bufferedBytes >= MAX_BUFFERED_BYTES;
+}
+
+/** Protobuf-Duration kommt in JSON normalerweise als z. B. "4.25s". */
+export function goAwayTimeLeftMs(goAway: unknown): number | null {
+  if (!goAway || typeof goAway !== 'object') return null;
+  const value = (goAway as { timeLeft?: unknown }).timeLeft;
+  if (typeof value === 'string') {
+    const match = /^([0-9]+(?:\.[0-9]+)?)s$/.exec(value.trim());
+    if (!match) return null;
+    const milliseconds = Number(match[1]) * 1_000;
+    return Number.isFinite(milliseconds) ? milliseconds : null;
+  }
+  if (!value || typeof value !== 'object') return null;
+  const duration = value as { seconds?: unknown; nanos?: unknown };
+  const seconds = Number(duration.seconds ?? 0);
+  const nanos = Number(duration.nanos ?? 0);
+  if (!Number.isFinite(seconds) || !Number.isFinite(nanos) || seconds < 0 || nanos < 0) {
+    return null;
+  }
+  return seconds * 1_000 + nanos / 1_000_000;
+}
+
+/**
+ * Output-Transkripte dürfen laut Live-API nach `turnComplete` eintreffen.
+ * Deshalb wird ein Turn erst nach einer kurzen Ruhephase finalisiert; ein
+ * verspäteter Text-Chunk startet die Frist erneut.
+ */
+export class TranscriptTurnCoordinator {
+  private timer: unknown = null;
+  private completionPending = false;
+  private hasText = false;
+
+  constructor(
+    private readonly emit: (text: string, final: boolean) => void,
+    private readonly scheduler: TimerScheduler = DEFAULT_TIMER_SCHEDULER
+  ) {}
+
+  push(text: string): void {
+    if (!text) return;
+    this.hasText = true;
+    this.emit(text, false);
+    if (this.completionPending) this.armFinalization();
+  }
+
+  complete(): void {
+    this.completionPending = true;
+    this.armFinalization();
+  }
+
+  interrupt(): void {
+    this.cancelTimer();
+    this.completionPending = false;
+    this.hasText = false;
+    this.emit('', true);
+  }
+
+  finalizeNow(): void {
+    if (!this.completionPending && !this.hasText) return;
+    this.cancelTimer();
+    this.completionPending = false;
+    this.hasText = false;
+    this.emit('', true);
+  }
+
+  reset(): void {
+    this.cancelTimer();
+    this.completionPending = false;
+    this.hasText = false;
+  }
+
+  private armFinalization(): void {
+    this.cancelTimer();
+    this.timer = this.scheduler.setTimeout(() => {
+      this.timer = null;
+      this.completionPending = false;
+      this.hasText = false;
+      this.emit('', true);
+    }, TRANSCRIPT_SETTLE_MS);
+  }
+
+  private cancelTimer(): void {
+    if (this.timer !== null) this.scheduler.clearTimeout(this.timer);
+    this.timer = null;
+  }
+}
+
 export function createGeminiSetup(
   targetLanguage: string,
-  transcriptionPlacement: TranscriptionPlacement = 'setup'
+  transcriptionPlacement: TranscriptionPlacement = 'setup',
+  session: GeminiSessionSetup = {}
 ): object {
   const generationConfig: Record<string, unknown> = {
     responseModalities: ['AUDIO'],
@@ -68,6 +187,14 @@ export function createGeminiSetup(
       }
     }
   };
+  if (session.enabled !== false) {
+    setup.sessionResumption = session.resumptionHandle
+      ? { handle: session.resumptionHandle }
+      : {};
+    // Ohne Sliding-Window endet eine reine Audiositzung nach ca. 15 Minuten.
+    // Die API wählt ohne explizite Token-Grenzen modellgerechte Defaults.
+    setup.contextWindowCompression = { slidingWindow: {} };
+  }
   // Die produktive Raw-v1beta-Runtime und die aktuelle Live-Translate-Doku
   // haben dieses Feld zeitweise an unterschiedlichen Stellen verlangt. Der
   // Client beherrscht beide Schemata und kann als letzte Stufe ohne Transkript
@@ -77,6 +204,13 @@ export function createGeminiSetup(
     generationConfig.outputAudioTranscription = {};
   }
   return { setup };
+}
+
+export function isSessionManagementSchemaError(closeCode: number, reason: string): boolean {
+  return (
+    closeCode === 1007 &&
+    /session.?resumption|context.?window.?compression/i.test(reason)
+  );
 }
 
 export function nextTranscriptionPlacement(
@@ -96,7 +230,6 @@ export class GeminiTranslator {
   private silentSink: GainNode | null = null;
   private ready = false;
   private connectionReady = false;
-  private backpressured = false;
   private stopped = false;
   private reconnectAttempts = 0;
   private pendingChunks: Int16Array[] = [];
@@ -105,8 +238,11 @@ export class GeminiTranslator {
   private reconnectTimer: number | null = null;
   private connectTimer: number | null = null;
   private transcriptionPlacement: TranscriptionPlacement = 'setup';
+  private sessionManagementEnabled = true;
+  private resumptionHandle: string | null = null;
   private readonly playingSources = new Set<AudioBufferSourceNode>();
   private readonly preprocessor: SpeechPreprocessor;
+  private readonly transcriptTurns: TranscriptTurnCoordinator;
   private readonly sendRate = 16000;
 
   constructor(private readonly opts: GeminiTranslatorOptions) {
@@ -114,6 +250,7 @@ export class GeminiTranslator {
     // optionale Highpass sitzt bereits im Audio-Graphen;
     // hier folgen nur Anti-Aliasing und Resampling.
     this.preprocessor = new SpeechPreprocessor(opts.ctx.sampleRate, { highpass: false });
+    this.transcriptTurns = new TranscriptTurnCoordinator(opts.onTranscript);
   }
 
   async start(): Promise<void> {
@@ -140,6 +277,7 @@ export class GeminiTranslator {
     this.setConnectionReady(false);
     this.clearTimers();
     this.clearPlaybackQueue();
+    this.transcriptTurns.reset();
     if (this.worklet) {
       this.worklet.port.onmessage = null;
       this.worklet.disconnect();
@@ -148,11 +286,11 @@ export class GeminiTranslator {
     this.silentSink?.disconnect();
     this.silentSink = null;
     const ws = this.ws;
-    if (ws?.readyState === WebSocket.CONNECTING) {
+    if (ws?.readyState === WS_CONNECTING_STATE) {
       // close() wirft im CONNECTING-Zustand. Sobald der Handshake doch noch
       // fertig wird, sofort schließen und niemals mehr Setup-Daten senden.
       ws.onopen = () => ws.close(1000, 'client stop');
-    } else if (ws?.readyState === WebSocket.OPEN) {
+    } else if (ws?.readyState === WS_OPEN_STATE) {
       ws.close(1000, 'client stop');
     }
     this.ws = null;
@@ -161,24 +299,29 @@ export class GeminiTranslator {
   private openSocket(): void {
     if (this.stopped) return;
     this.setConnectionReady(false);
-    this.pendingChunks = [];
-    this.pendingSamples = 0;
+    this.clearInputQueue();
     this.preprocessor.reset();
+    this.clearPlaybackQueue();
     this.clearConnectTimer();
 
     const ws = new WebSocket(`${WS_URL}?key=${encodeURIComponent(this.opts.apiKey)}`);
     this.ws = ws;
-    this.connectTimer = window.setTimeout(() => {
+    this.connectTimer = globalThis.setTimeout(() => {
       if (this.ws !== ws || this.ready) return;
-      if (ws.readyState === WebSocket.CONNECTING) {
+      if (ws.readyState === WS_CONNECTING_STATE) {
         ws.onopen = () => ws.close(4000, 'setup timeout');
-      } else if (ws.readyState === WebSocket.OPEN) {
+      } else if (ws.readyState === WS_OPEN_STATE) {
         ws.close(4000, 'setup timeout');
       }
     }, CONNECT_TIMEOUT_MS);
     ws.onopen = () => {
       ws.send(
-        JSON.stringify(createGeminiSetup(this.opts.targetLanguage, this.transcriptionPlacement))
+        JSON.stringify(
+          createGeminiSetup(this.opts.targetLanguage, this.transcriptionPlacement, {
+            enabled: this.sessionManagementEnabled,
+            resumptionHandle: this.resumptionHandle
+          })
+        )
       );
     };
     ws.onmessage = (event) =>
@@ -189,8 +332,10 @@ export class GeminiTranslator {
   private handleClose(ws: WebSocket, event: CloseEvent): void {
     if (this.stopped || ws !== this.ws) return;
     this.clearConnectTimer();
-    this.setConnectionReady(false);
+    this.ws = null;
+    this.prepareForReconnect();
     const reason = `Code ${event.code}${event.reason ? `: ${event.reason}` : ''}`;
+    if (this.scheduleSessionManagementFallback(event.code, event.reason, reason)) return;
     if (this.scheduleTranscriptionFallback(event.code, event.reason, reason)) return;
     if (PERMANENT_CLOSE_CODES.has(event.code)) {
       this.fail(`Gemini hat die Verbindung abgelehnt (${reason})`);
@@ -208,7 +353,7 @@ export class GeminiTranslator {
       `[live-translate] Gemini getrennt (${reason}) – Reconnect ${this.reconnectAttempts}/${MAX_RECONNECTS} in ${delayMs / 1000}s`
     );
     this.opts.onStatus(`Verbindung unterbrochen – verbinde neu (${this.reconnectAttempts}/${MAX_RECONNECTS})…`);
-    this.reconnectTimer = window.setTimeout(() => {
+    this.reconnectTimer = globalThis.setTimeout(() => {
       this.reconnectTimer = null;
       this.openSocket();
     }, delayMs);
@@ -221,17 +366,20 @@ export class GeminiTranslator {
   }
 
   private handleCapturedAudio(chunk: Float32Array<ArrayBuffer>): void {
-    if (!this.connectionReady || this.ws?.readyState !== WebSocket.OPEN) return;
-    // Bei einem langsamen Netz keine Sprache leise stellen, die Gemini nicht
-    // erhält. Hysterese verhindert Flattern an der Puffergrenze.
-    if (this.ws.bufferedAmount > MAX_BUFFERED_BYTES) {
-      this.enterBackpressure();
+    const ws = this.ws;
+    if (!this.connectionReady || ws?.readyState !== WS_OPEN_STATE) return;
+    // Bereits wenige hundert Millisekunden Rückstau zerstören die zeitliche
+    // Zuordnung zwischen Video, Ducking und Übersetzung. Die alte Verbindung
+    // wird deshalb verworfen, statt ihren Puffer später noch abzuspielen.
+    if (shouldRestartForBackpressure(ws.bufferedAmount)) {
+      this.restartSocketImmediately(
+        ws,
+        `Netz überlastet (${Math.round(bufferedAudioDurationMs(ws.bufferedAmount))} ms Rückstau) · verbinde neu…`,
+        'backpressure restart',
+        4001,
+        false
+      );
       return;
-    }
-    if (this.backpressured) {
-      if (this.ws.bufferedAmount > BACKPRESSURE_RECOVERY_BYTES) return;
-      this.setBackpressured(false);
-      this.opts.onStatus(this.runningStatus());
     }
     const samples = this.preprocessor.process(chunk);
     if (samples.length === 0) return;
@@ -240,21 +388,38 @@ export class GeminiTranslator {
     this.pendingSamples += pcm.length;
     const chunkSize = (this.sendRate * SEND_CHUNK_MS) / 1000;
     while (this.pendingSamples >= chunkSize) {
-      if (this.ws.bufferedAmount > MAX_BUFFERED_BYTES) {
-        this.enterBackpressure();
-        break;
+      if (shouldRestartForBackpressure(ws.bufferedAmount)) {
+        this.restartSocketImmediately(
+          ws,
+          `Netz überlastet (${Math.round(bufferedAudioDurationMs(ws.bufferedAmount))} ms Rückstau) · verbinde neu…`,
+          'backpressure restart',
+          4001,
+          false
+        );
+        return;
       }
       const outgoing = this.takePendingSamples(chunkSize);
-      this.ws.send(
-        JSON.stringify({
-          realtimeInput: {
-            audio: {
-              data: base64FromInt16(outgoing),
-              mimeType: `audio/pcm;rate=${this.sendRate}`
+      try {
+        ws.send(
+          JSON.stringify({
+            realtimeInput: {
+              audio: {
+                data: base64FromInt16(outgoing),
+                mimeType: `audio/pcm;rate=${this.sendRate}`
+              }
             }
-          }
-        })
-      );
+          })
+        );
+      } catch (error) {
+        this.restartSocketImmediately(
+          ws,
+          'Audioübertragung unterbrochen · verbinde neu…',
+          'audio send failed',
+          4002
+        );
+        console.warn('[live-translate] Audio-Chunk konnte nicht gesendet werden:', error);
+        return;
+      }
     }
   }
 
@@ -274,22 +439,42 @@ export class GeminiTranslator {
     }
 
     if (msg.error?.message) {
-      if (this.scheduleTranscriptionFallback(1007, msg.error.message, msg.error.message)) {
+      if (
+        this.scheduleSessionManagementFallback(1007, msg.error.message, msg.error.message) ||
+        this.scheduleTranscriptionFallback(1007, msg.error.message, msg.error.message)
+      ) {
         // Der folgende Close-Event gehört noch zur verworfenen Verbindung und
         // darf keinen zweiten Reconnect auslösen.
         this.ws = null;
-        if (ws.readyState === WebSocket.OPEN) ws.close(1000, 'transcription schema fallback');
+        if (ws.readyState === WS_OPEN_STATE) ws.close(1000, 'setup schema fallback');
         return;
       }
       this.fail(`Gemini-Fehler: ${msg.error.message}`);
       return;
     }
+    const resumptionUpdate = msg.sessionResumptionUpdate;
+    if (
+      resumptionUpdate?.resumable === true &&
+      typeof resumptionUpdate.newHandle === 'string' &&
+      resumptionUpdate.newHandle.length > 0
+    ) {
+      // Nur ausdrücklich resumable Handles speichern. Bei einem Update mit
+      // resumable=false bleibt der letzte sichere Checkpoint verwendbar.
+      this.resumptionHandle = resumptionUpdate.newHandle;
+      return;
+    }
     if (msg.goAway !== undefined) {
-      // Server kündigt das Sitzungsende an. Er erwartet, dass WIR sauber
-      // schließen – sonst wirft er uns mit Code 1008 raus. Danach normal
-      // neu verbinden (handleClose übernimmt).
-      console.warn('[live-translate] Gemini goAway – schließe und verbinde neu.');
-      this.ws?.close(1000, 'goAway');
+      // Ein geplanter Sitzungswechsel darf nicht durch den generischen
+      // exponentiellen Backoff laufen. Der letzte ausdrücklich sichere
+      // Resumption-Checkpoint wird im neuen Setup direkt weiterverwendet.
+      const timeLeftMs = goAwayTimeLeftMs(msg.goAway);
+      const timeLeft = timeLeftMs === null ? '' : ` · ${Math.ceil(timeLeftMs / 1_000)} s Restzeit`;
+      this.restartSocketImmediately(
+        ws,
+        `Gemini wechselt die Sitzung${timeLeft} · verbinde neu…`,
+        'goAway',
+        1000
+      );
       return;
     }
     if (msg.setupComplete !== undefined) {
@@ -308,15 +493,16 @@ export class GeminiTranslator {
       // eingeplante Audioblöcke müssen ebenfalls weg, sonst spricht eine alte
       // Übersetzung über den nächsten Satz hinweg.
       this.clearPlaybackQueue();
-      this.opts.onTranscript('', true);
+      this.transcriptTurns.interrupt();
+      return;
     }
     for (const part of content.modelTurn?.parts ?? []) {
       const audio = part.inlineData?.data;
       if (audio) this.playTranslatedAudio(audio);
     }
     const transcript = content.outputTranscription?.text;
-    if (transcript) this.opts.onTranscript(transcript, false);
-    if (content.turnComplete) this.opts.onTranscript('', true);
+    if (transcript) this.transcriptTurns.push(transcript);
+    if (content.turnComplete) this.transcriptTurns.complete();
   }
 
   private playTranslatedAudio(base64: string): void {
@@ -357,7 +543,7 @@ export class GeminiTranslator {
   }
 
   private clearConnectTimer(): void {
-    if (this.connectTimer !== null) window.clearTimeout(this.connectTimer);
+    if (this.connectTimer !== null) globalThis.clearTimeout(this.connectTimer);
     this.connectTimer = null;
   }
 
@@ -369,22 +555,7 @@ export class GeminiTranslator {
 
   private setConnectionReady(ready: boolean): void {
     this.connectionReady = ready;
-    if (!ready) this.backpressured = false;
-    this.setReady(ready && !this.backpressured);
-  }
-
-  private setBackpressured(backpressured: boolean): void {
-    this.backpressured = backpressured;
-    this.setReady(this.connectionReady && !backpressured);
-  }
-
-  private enterBackpressure(): void {
-    if (this.backpressured) return;
-    this.pendingChunks = [];
-    this.pendingSamples = 0;
-    this.preprocessor.reset();
-    this.setBackpressured(true);
-    this.opts.onStatus('Netz überlastet · Original bleibt bei 100 %');
+    this.setReady(ready);
   }
 
   private runningStatus(): string {
@@ -407,7 +578,7 @@ export class GeminiTranslator {
       return false;
     }
     this.clearConnectTimer();
-    this.setConnectionReady(false);
+    this.prepareForReconnect();
     this.transcriptionPlacement = fallback;
     const status =
       fallback === 'disabled'
@@ -415,17 +586,86 @@ export class GeminiTranslator {
         : 'Gemini passt das Transkript-Protokoll an…';
     console.warn(`[live-translate] ${status} (${logReason})`);
     this.opts.onStatus(status);
-    this.reconnectTimer = window.setTimeout(() => {
+    this.reconnectTimer = globalThis.setTimeout(() => {
       this.reconnectTimer = null;
       this.openSocket();
     }, 250);
     return true;
   }
 
+  private scheduleSessionManagementFallback(
+    closeCode: number,
+    serverReason: string,
+    logReason: string
+  ): boolean {
+    if (
+      !this.sessionManagementEnabled ||
+      !isSessionManagementSchemaError(closeCode, serverReason)
+    ) {
+      return false;
+    }
+    this.clearTimers();
+    this.prepareForReconnect();
+    this.sessionManagementEnabled = false;
+    this.resumptionHandle = null;
+    const status = 'Gemini unterstützt die Sitzungsfortsetzung hier nicht · verbinde frisch neu…';
+    console.warn(`[live-translate] ${status} (${logReason})`);
+    this.opts.onStatus(status);
+    this.reconnectTimer = globalThis.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.openSocket();
+    }, 0);
+    return true;
+  }
+
   private clearTimers(): void {
     this.clearConnectTimer();
-    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
+    if (this.reconnectTimer !== null) globalThis.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+  }
+
+  private clearInputQueue(): void {
+    this.pendingChunks = [];
+    this.pendingSamples = 0;
+  }
+
+  private prepareForReconnect(): void {
+    this.setConnectionReady(false);
+    this.clearInputQueue();
+    this.preprocessor.reset();
+    this.clearPlaybackQueue();
+    this.transcriptTurns.finalizeNow();
+  }
+
+  private restartSocketImmediately(
+    ws: WebSocket,
+    status: string,
+    closeReason: string,
+    closeCode: number,
+    preserveSession = true
+  ): void {
+    if (this.stopped || ws !== this.ws) return;
+    this.clearTimers();
+    if (!preserveSession) this.resumptionHandle = null;
+    this.ws = null;
+    this.prepareForReconnect();
+    console.warn(`[live-translate] ${status}`);
+    this.opts.onStatus(status);
+    try {
+      if (ws.readyState === WS_CONNECTING_STATE) {
+        ws.onopen = () => ws.close(closeCode, closeReason);
+      } else if (ws.readyState === WS_OPEN_STATE) {
+        ws.close(closeCode, closeReason);
+      }
+    } catch (error) {
+      console.warn('[live-translate] Alte Gemini-Verbindung konnte nicht geschlossen werden:', error);
+    }
+    // Nächster Event-Loop-Takt statt generischem 2-s-Backoff. Bis
+    // setupComplete bleibt Ducking garantiert fail-open.
+    this.reconnectTimer = globalThis.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.openSocket();
+    }, 0);
   }
 
   private clearPlaybackQueue(): void {

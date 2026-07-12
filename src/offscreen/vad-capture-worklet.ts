@@ -7,6 +7,8 @@ declare function registerProcessor(
   name: string,
   processorCtor: new () => AudioWorkletProcessor
 ): void;
+declare const currentFrame: number;
+declare const sampleRate: number;
 
 const BATCH_SIZE = 2048;
 
@@ -14,6 +16,7 @@ const BATCH_SIZE = 2048;
 class VadCaptureProcessor extends AudioWorkletProcessor {
   private buffer = new Float32Array(BATCH_SIZE);
   private offset = 0;
+  private sequence = 0;
 
   process(inputs: Float32Array[][]): boolean {
     const input = inputs[0];
@@ -35,9 +38,13 @@ class VadCaptureProcessor extends AudioWorkletProcessor {
         const complete = this.buffer;
         this.buffer = new Float32Array(BATCH_SIZE);
         this.offset = 0;
-        // Im Capture-Thread stempeln: Nur so bleibt ein Block als alt
-        // erkennbar, falls die Offscreen-MessageQueue kurz blockiert.
-        this.port.postMessage({ samples: complete, capturedAt: Date.now() }, [complete.buffer]);
+        // currentFrame/sampleRate bilden die monotone AudioContext-Zeitachse.
+        // inputOffset lokalisiert das Blockende exakt innerhalb dieses Quants.
+        const captureEndTime = (currentFrame + inputOffset) / sampleRate;
+        this.port.postMessage(
+          { samples: complete, sequence: this.sequence++, captureEndTime },
+          [complete.buffer]
+        );
       }
     }
     return true;
