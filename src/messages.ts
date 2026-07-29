@@ -1,16 +1,38 @@
+/** Untertitel-Darstellung: nur Übersetzung oder Original + Übersetzung. */
+export type SubtitleMode = 'translation' | 'dual';
+
+/** VAD-Preset: satzstabil für Vorträge/Doku oder latenzarm für schnelle Dialoge. */
+export type SpeechMode = 'lecture' | 'dialog';
+
+/** Herkunft eines Transkript-Chunks: Quellsprache oder Übersetzung. */
+export type TranscriptLane = 'source' | 'target';
+
 export interface SessionSettings {
   /** Version der persistierten Einstellungen für kontrollierte Migrationen. */
-  settingsVersion: 7;
+  settingsVersion: 8;
   geminiKey: string;
   /** BCP-47-Code der Zielsprache (z. B. "de"). */
   targetLanguage: string;
   subtitles: boolean;
+  subtitleMode: SubtitleMode;
   /** Lautstärke der Gemini-Stimme (0–1). */
   translationVolume: number;
+  /** Eingaben, die bereits in der Zielsprache sind, nachsprechen statt schweigen. */
+  echoTargetLanguage: boolean;
+  speechMode: SpeechMode;
+  /** Gewünschte Gemini-Stimme; leer = automatische Modellstimme. */
+  voiceName: string;
+  /**
+   * Experiment: Gemini erhält das nur hochpassgefilterte Originalsignal statt
+   * der komprimierten Sprachpipeline. Bewusst ohne Popup-Oberfläche; per
+   * DevTools-Storage umschaltbar, Wirkung ab dem nächsten Start.
+   */
+  rawModelAudio: boolean;
 }
 
 export interface OutputSettings {
   subtitles: boolean;
+  subtitleMode: SubtitleMode;
   translationVolume: number;
 }
 
@@ -58,7 +80,7 @@ export type Message =
   | { type: 'offscreen-status'; sessionId: string; status: string }
   | { type: 'offscreen-error'; sessionId: string; detail: string }
   | { type: 'ducking-telemetry'; sessionId: string; telemetry: DuckingTelemetry }
-  | { type: 'transcript'; sessionId: string; text: string; final: boolean }
-  | { type: 'subtitle'; text: string; final: boolean }
+  | { type: 'transcript'; sessionId: string; text: string; final: boolean; lane: TranscriptLane }
+  | { type: 'subtitle'; text: string; final: boolean; lane: TranscriptLane }
   | { type: 'subtitle-clear' }
   | { type: 'session-state'; state: SessionState };

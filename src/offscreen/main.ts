@@ -1,5 +1,5 @@
 import { isTrustedSender } from '../messages';
-import type { Message, OutputSettings, SessionSettings } from '../messages';
+import type { Message, OutputSettings, SessionSettings, TranscriptLane } from '../messages';
 import {
   CONTROL_FADE_S,
   SOURCE_DUCK_FADE_DOWN_S,
@@ -15,8 +15,10 @@ import { sourceDuckGain } from './voice-detector';
 
 // Dynamisches Ducking wird ausschließlich von Sprachaktivität im Quellton
 // gesteuert. Im vorgesehenen englischen Video bleiben Musik, Raketenklang und
-// Atmo bei 100 %, sobald niemand spricht. Während Sprache sinkt der komplette
-// Originalmix weich auf den unveränderlichen Zielpegel von 10 %.
+// Atmo bei 100 %, sobald niemand spricht – die zeitversetzte Gemini-Stimme
+// spricht bewusst über den vollen Originalpegel weiter. Während Quellsprache
+// sinkt der komplette Originalmix weich auf den unveränderlichen Zielpegel
+// von 10 %.
 //
 // Silero v6.2 analysiert lückenlos 32-ms-Frames lokal in einem Worker. Der Tick
 // überträgt nur den daraus abgeleiteten Zustand auf den Audio-Graphen.
@@ -160,25 +162,33 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     modelHighpass.type = 'highpass';
     modelHighpass.frequency.value = 80;
     modelHighpass.Q.value = 0.7;
-    const speechCompressor = ctx.createDynamicsCompressor();
-    speechCompressor.threshold.value = -40;
-    speechCompressor.knee.value = 20;
-    speechCompressor.ratio.value = 3;
-    speechCompressor.attack.value = 0.005;
-    speechCompressor.release.value = 0.4;
-    const speechMakeup = ctx.createGain();
-    speechMakeup.gain.value = SPEECH_MAKEUP_GAIN;
-    const modelLimiter = ctx.createDynamicsCompressor();
-    modelLimiter.threshold.value = -3;
-    modelLimiter.knee.value = 4;
-    modelLimiter.ratio.value = 12;
-    modelLimiter.attack.value = 0.002;
-    modelLimiter.release.value = 0.12;
-    source
-      .connect(modelHighpass)
-      .connect(speechCompressor)
-      .connect(speechMakeup)
-      .connect(modelLimiter);
+    source.connect(modelHighpass);
+    let modelSource: AudioNode = modelHighpass;
+    if (!settings.rawModelAudio) {
+      const speechCompressor = ctx.createDynamicsCompressor();
+      speechCompressor.threshold.value = -40;
+      speechCompressor.knee.value = 20;
+      speechCompressor.ratio.value = 3;
+      speechCompressor.attack.value = 0.005;
+      speechCompressor.release.value = 0.4;
+      const speechMakeup = ctx.createGain();
+      speechMakeup.gain.value = SPEECH_MAKEUP_GAIN;
+      const modelLimiter = ctx.createDynamicsCompressor();
+      modelLimiter.threshold.value = -3;
+      modelLimiter.knee.value = 4;
+      modelLimiter.ratio.value = 12;
+      modelLimiter.attack.value = 0.002;
+      modelLimiter.release.value = 0.12;
+      modelHighpass
+        .connect(speechCompressor)
+        .connect(speechMakeup)
+        .connect(modelLimiter);
+      modelSource = modelLimiter;
+    }
+    // Experiment `rawModelAudio`: Gemini 3.5 überträgt Intonation, Tempo und
+    // Tonhöhe des Sprechers. Der Rohpfad (nur Hochpass) erhält diese Dynamik
+    // vollständig; der Sample-Soft-Limiter im PCM-Pfad verhindert weiterhin
+    // jede Sättigung.
     // Die übersetzte Spur läuft immer mit dem kalibrierten Unity-Pegel und
     // bekommt einen live regelbaren Gain und einen Sicherheits-Limiter.
     const translatedInput = ctx.createGain();
@@ -195,12 +205,20 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     const clientOptions = {
       apiKey: settings.geminiKey,
       ctx,
-      modelSource: modelLimiter,
+      modelSource,
       outputNode: translatedInput,
       targetLanguage: settings.targetLanguage,
-      onTranscript: (text: string, final: boolean) => {
+      setupOptions: {
+        echoTargetLanguage: settings.echoTargetLanguage,
+        speechMode: settings.speechMode,
+        voiceName: settings.voiceName || null,
+        // Das Quell-Transkript wird immer angefordert; ob es angezeigt wird,
+        // entscheidet der Untertitel-Modus live im Service Worker.
+        inputTranscriptionEnabled: true
+      },
+      onTranscript: (lane: TranscriptLane, text: string, final: boolean) => {
         if (session?.sessionId !== sessionId) return;
-        send({ type: 'transcript', sessionId, text, final });
+        send({ type: 'transcript', sessionId, text, final, lane });
       },
       onStatus: (status: string) => {
         if (session?.sessionId !== sessionId) return;

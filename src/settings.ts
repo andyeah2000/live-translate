@@ -1,4 +1,4 @@
-import type { SessionSettings } from './messages';
+import type { SessionSettings, SpeechMode, SubtitleMode } from './messages';
 
 const TARGET_LANGUAGES = new Set([
   'de',
@@ -20,12 +20,36 @@ const TARGET_LANGUAGES = new Set([
   'hi',
   'ar'
 ]);
+/**
+ * Prebuilt-Stimmen der Live API. Ob das Translate-Modell sie akzeptiert,
+ * entscheidet der Server; der Client fällt bei Ablehnung automatisch auf die
+ * Standardstimme zurück.
+ */
+export const VOICE_NAMES = new Set([
+  'Puck',
+  'Charon',
+  'Kore',
+  'Fenrir',
+  'Aoede',
+  'Leda',
+  'Orus',
+  'Zephyr'
+]);
+
+const SUBTITLE_MODES = new Set<SubtitleMode>(['translation', 'dual']);
+const SPEECH_MODES = new Set<SpeechMode>(['lecture', 'dialog']);
+
 export const DEFAULT_SETTINGS: SessionSettings = {
-  settingsVersion: 7,
+  settingsVersion: 8,
   geminiKey: '',
   targetLanguage: 'de',
   subtitles: true,
-  translationVolume: 1
+  subtitleMode: 'translation',
+  translationVolume: 1,
+  echoTargetLanguage: false,
+  speechMode: 'lecture',
+  voiceName: '',
+  rawModelAudio: false
 };
 
 const CANONICAL_SETTING_KEYS = new Set(Object.keys(DEFAULT_SETTINGS));
@@ -51,6 +75,14 @@ function languageValue(value: unknown, allowed: Set<string>, fallback: string): 
   return typeof migrated === 'string' && allowed.has(migrated) ? migrated : fallback;
 }
 
+function enumValue<T extends string>(value: unknown, allowed: Set<T>, fallback: T): T {
+  return typeof value === 'string' && allowed.has(value as T) ? (value as T) : fallback;
+}
+
+function voiceValue(value: unknown): string {
+  return typeof value === 'string' && VOICE_NAMES.has(value) ? value : '';
+}
+
 /**
  * Storage ist eine dauerhafte Versionsgrenze: alte Extension-Versionen,
  * manuelle DevTools-Änderungen oder Sync-Tools können beliebige Werte
@@ -67,10 +99,18 @@ export function sanitizeSettings(value: unknown): SessionSettings {
       DEFAULT_SETTINGS.targetLanguage
     ),
     subtitles: booleanValue(candidate.subtitles, DEFAULT_SETTINGS.subtitles),
+    subtitleMode: enumValue(candidate.subtitleMode, SUBTITLE_MODES, DEFAULT_SETTINGS.subtitleMode),
     translationVolume: volumeValue(
       candidate.translationVolume,
       DEFAULT_SETTINGS.translationVolume
-    )
+    ),
+    echoTargetLanguage: booleanValue(
+      candidate.echoTargetLanguage,
+      DEFAULT_SETTINGS.echoTargetLanguage
+    ),
+    speechMode: enumValue(candidate.speechMode, SPEECH_MODES, DEFAULT_SETTINGS.speechMode),
+    voiceName: voiceValue(candidate.voiceName),
+    rawModelAudio: booleanValue(candidate.rawModelAudio, DEFAULT_SETTINGS.rawModelAudio)
   };
 }
 

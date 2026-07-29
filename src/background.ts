@@ -1,5 +1,11 @@
 import { isTrustedSender } from './messages';
-import type { Message, SessionSettings, SessionState } from './messages';
+import type {
+  Message,
+  SessionSettings,
+  SessionState,
+  SubtitleMode,
+  TranscriptLane
+} from './messages';
 import { sanitizeSettings } from './settings';
 
 const EMPTY_STATE: SessionState = {
@@ -172,9 +178,12 @@ async function stopAndCloseOffscreenDocument(): Promise<void> {
   throw new Error(`Die Audioverarbeitung konnte nicht beendet werden${reason}`);
 }
 
-async function getSubtitlesEnabled(): Promise<boolean> {
-  const { subtitlesEnabled } = await chrome.storage.session.get('subtitlesEnabled');
-  return (subtitlesEnabled as boolean | undefined) ?? true;
+async function getSubtitleOutput(): Promise<{ enabled: boolean; mode: SubtitleMode }> {
+  const stored = await chrome.storage.session.get(['subtitlesEnabled', 'subtitleMode']);
+  return {
+    enabled: (stored.subtitlesEnabled as boolean | undefined) ?? true,
+    mode: stored.subtitleMode === 'dual' ? 'dual' : 'translation'
+  };
 }
 
 async function startSession(
@@ -187,7 +196,10 @@ async function startSession(
   try {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
     await ensureOffscreenDocument();
-    await chrome.storage.session.set({ subtitlesEnabled: settings.subtitles });
+    await chrome.storage.session.set({
+      subtitlesEnabled: settings.subtitles,
+      subtitleMode: settings.subtitleMode
+    });
     await setState({
       running: true,
       tabId,
@@ -245,7 +257,12 @@ async function stopSession(error: string | null = null): Promise<void> {
   });
 }
 
-async function forwardTranscript(sessionId: string, text: string, final: boolean): Promise<void> {
+async function forwardTranscript(
+  sessionId: string,
+  text: string,
+  final: boolean,
+  lane: TranscriptLane
+): Promise<void> {
   const observedState = await getState();
   if (
     !observedState.running ||
@@ -254,7 +271,11 @@ async function forwardTranscript(sessionId: string, text: string, final: boolean
   ) {
     return;
   }
-  if (!(await getSubtitlesEnabled())) return;
+  const output = await getSubtitleOutput();
+  if (!output.enabled) return;
+  // Das Quell-Transkript wird immer angefordert, aber nur im Dual-Modus
+  // angezeigt. So wirkt der Modus-Schalter sofort und ohne Reconnect.
+  if (lane === 'source' && output.mode !== 'dual') return;
   // Zwischen Zustandsprüfung und Versand kann eine Sitzung ersetzt worden
   // sein. Nur der weiterhin identische Tab und die identische Session dürfen
   // einen Untertitel erhalten.
@@ -270,14 +291,19 @@ async function forwardTranscript(sessionId: string, text: string, final: boolean
   // Das Senden wird bewusst abgewartet. Dadurch kann die serialisierte
   // Stop-Operation `subtitle-clear` garantiert erst danach zustellen.
   await chrome.tabs
-    .sendMessage(currentState.tabId, { type: 'subtitle', text, final } satisfies Message)
+    .sendMessage(currentState.tabId, { type: 'subtitle', text, final, lane } satisfies Message)
     .catch(() => {});
 }
 
 async function updateOutputSettings(
   msg: Extract<Message, { type: 'update-output-settings' }>
 ): Promise<void> {
-  await chrome.storage.session.set({ subtitlesEnabled: msg.settings.subtitles });
+  const previousOutput = await getSubtitleOutput();
+  const nextMode: SubtitleMode = msg.settings.subtitleMode === 'dual' ? 'dual' : 'translation';
+  await chrome.storage.session.set({
+    subtitlesEnabled: msg.settings.subtitles,
+    subtitleMode: nextMode
+  });
   const observedState = await getState();
   if (
     !observedState.running ||
@@ -286,7 +312,9 @@ async function updateOutputSettings(
   ) {
     return;
   }
-  if (!msg.settings.subtitles) {
+  // Beim Abschalten und beim Moduswechsel sauber neu beginnen, damit keine
+  // veraltete Original-Zeile aus dem vorherigen Modus stehen bleibt.
+  if (!msg.settings.subtitles || previousOutput.mode !== nextMode) {
     await chrome.tabs
       .sendMessage(observedState.tabId, { type: 'subtitle-clear' } satisfies Message)
       .catch(() => {});
@@ -338,7 +366,14 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
       transcriptQueue = transcriptQueue
         .catch(() => {})
         .then(() =>
-          enqueueSessionOperation(() => forwardTranscript(msg.sessionId, msg.text, msg.final))
+          enqueueSessionOperation(() =>
+            forwardTranscript(
+              msg.sessionId,
+              msg.text,
+              msg.final,
+              msg.lane === 'source' ? 'source' : 'target'
+            )
+          )
         )
         .catch((err) => console.warn('[live-translate] Untertitel-Weiterleitung fehlgeschlagen:', err));
       break;

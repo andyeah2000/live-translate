@@ -5,6 +5,7 @@ import {
   MAX_RECONNECT_PLAYBACK_LEAD_S,
   MAX_BUFFERED_AUDIO_MS,
   MAX_BUFFERED_BYTES,
+  SILENCE_GATE_MS,
   TRANSCRIPT_SETTLE_MS,
   TranscriptTurnCoordinator,
   bufferedAudioDurationMs,
@@ -12,11 +13,15 @@ import {
   goAwayTimeLeftMs,
   isSessionManagementSchemaError,
   nextTranscriptionPlacement,
+  rejectedInputTranscription,
   rejectedSessionManagementFeature,
+  rejectedVoiceConfig,
+  shouldAbandonTokenAuth,
   shouldRestartForBackpressure,
   type GeminiTranslatorOptions,
   type TimerScheduler
 } from '../src/offscreen/gemini';
+import type { TranscriptLane } from '../src/messages';
 import { base64FromInt16, int16FromBase64 } from '../src/offscreen/pcm';
 import {
   MAX_HANDOFF_AUDIO_MS,
@@ -213,6 +218,9 @@ interface TranslatorInternals {
   ready: boolean;
   connectionReady: boolean;
   reconnectAttempts: number;
+  tokenMintingEnabled: boolean;
+  tokenPool: Array<{ token: string; freshUntil: number }>;
+  socketAuth: WeakMap<WebSocket, 'token' | 'key'>;
   pendingChunks: Int16Array[];
   pendingSamples: number;
   nextPlayTime: number;
@@ -244,7 +252,7 @@ interface TranslatorHarness {
   statuses: string[];
   readyChanges: boolean[];
   errors: string[];
-  transcripts: Array<{ text: string; final: boolean }>;
+  transcripts: Array<{ lane: TranscriptLane; text: string; final: boolean }>;
 }
 
 function createTranslatorHarness(
@@ -254,14 +262,14 @@ function createTranslatorHarness(
   const statuses: string[] = [];
   const readyChanges: boolean[] = [];
   const errors: string[] = [];
-  const transcripts: Array<{ text: string; final: boolean }> = [];
+  const transcripts: Array<{ lane: TranscriptLane; text: string; final: boolean }> = [];
   const options: GeminiTranslatorOptions = {
     apiKey: 'test-key',
     ctx,
     modelSource: {} as AudioNode,
     outputNode,
     targetLanguage: 'de',
-    onTranscript: (text, final) => transcripts.push({ text, final }),
+    onTranscript: (lane, text, final) => transcripts.push({ lane, text, final }),
     onStatus: (status) => statuses.push(status),
     onReadyChange: (ready) => readyChanges.push(ready),
     canContinueWithoutTranscript: () => true,
@@ -681,6 +689,17 @@ function countRealtimeAudio(messages: string[]): number {
   }).length;
 }
 
+function countAudioStreamEnd(messages: string[]): number {
+  return messages.filter((item) => {
+    try {
+      const parsed = JSON.parse(item) as { realtimeInput?: { audioStreamEnd?: boolean } };
+      return parsed.realtimeInput?.audioStreamEnd === true;
+    } catch {
+      return false;
+    }
+  }).length;
+}
+
 function addQueuedPlayback(internals: TranslatorInternals): () => number {
   let stopCalls = 0;
   internals.playingSources.add({ stop: () => stopCalls++ } as AudioBufferSourceNode);
@@ -1088,6 +1107,43 @@ test('a shorter manual stop tightens an already running drain window', async () 
   harness.translator.stop();
 });
 
+test('token auth abandonment is matched precisely', () => {
+  const unregisteredCallers =
+    "Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API c";
+  assert.equal(shouldAbandonTokenAuth(true, 1008, unregisteredCallers, false), true);
+  assert.equal(shouldAbandonTokenAuth(true, 1008, unregisteredCallers, true), true);
+  assert.equal(shouldAbandonTokenAuth(true, 1008, '', false), true);
+  // Nach etabliertem Setup ist ein neutraler 1008 ein regulärer Sitzungsabbruch.
+  assert.equal(shouldAbandonTokenAuth(true, 1008, 'session timeout', true), false);
+  assert.equal(shouldAbandonTokenAuth(false, 1008, unregisteredCallers, false), false);
+  assert.equal(shouldAbandonTokenAuth(true, 1006, 'network lost', true), false);
+});
+
+test('a token socket rejected as unregistered switches to key auth without burning retries', () => {
+  const harness = createTranslatorHarness();
+  const { ws } = createFakeSocket();
+  harness.internals.ws = ws;
+  harness.internals.tokenMintingEnabled = true;
+  harness.internals.tokenPool.push({ token: 'auth_tokens/abc', freshUntil: Date.now() + 60_000 });
+  harness.internals.socketAuth.set(ws, 'token');
+
+  harness.internals.handleClose(ws, {
+    code: 1008,
+    reason:
+      "Method doesn't allow unregistered callers (callers without established identity). Please use API Key or other form of API c"
+  } as CloseEvent);
+
+  assert.equal(harness.internals.tokenMintingEnabled, false, 'token minting must be disabled');
+  assert.equal(harness.internals.tokenPool.length, 0, 'stale tokens must be discarded');
+  assert.equal(harness.internals.reconnectAttempts, 0, 'auth switch must not consume the budget');
+  assert.deepEqual(harness.errors, [], 'the session must keep running via key auth');
+  assert.ok(
+    harness.statuses.some((status) => status.includes('verbinde direkt')),
+    'the user sees the auth fallback'
+  );
+  harness.translator.stop();
+});
+
 test('repeated rejection before the first setup fails fast with a key hint', () => {
   const harness = createTranslatorHarness();
   const first = createFakeSocket();
@@ -1123,7 +1179,139 @@ test('a bundled server frame keeps its transcript alongside a resumption update'
     })
   );
   assert.equal(harness.internals.resumptionHandle, 'bundled-handle');
-  assert.deepEqual(harness.transcripts, [{ text: 'gebündelt', final: false }]);
+  assert.deepEqual(harness.transcripts, [{ lane: 'target', text: 'gebündelt', final: false }]);
+  harness.translator.stop();
+});
+
+test('setup options map echo, speech preset, voice and source transcript', () => {
+  const tuned = createGeminiSetup(
+    'de',
+    'setup',
+    {},
+    {
+      echoTargetLanguage: true,
+      speechMode: 'dialog',
+      voiceName: 'Kore',
+      inputTranscriptionEnabled: true
+    }
+  ) as {
+    setup: {
+      generationConfig: Record<string, unknown>;
+      realtimeInputConfig: { automaticActivityDetection: Record<string, unknown> };
+      inputAudioTranscription?: unknown;
+    };
+  };
+  assert.deepEqual(tuned.setup.generationConfig.translationConfig, {
+    targetLanguageCode: 'de',
+    echoTargetLanguage: true
+  });
+  assert.deepEqual(tuned.setup.generationConfig.speechConfig, {
+    voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+  });
+  const dialogVad = tuned.setup.realtimeInputConfig.automaticActivityDetection;
+  assert.equal(dialogVad.startOfSpeechSensitivity, 'START_SENSITIVITY_HIGH');
+  assert.equal(dialogVad.endOfSpeechSensitivity, 'END_SENSITIVITY_HIGH');
+  assert.equal(dialogVad.silenceDurationMs, 500);
+  assert.deepEqual(tuned.setup.inputAudioTranscription, {});
+
+  const generationPlacement = createGeminiSetup(
+    'de',
+    'generation',
+    {},
+    { inputTranscriptionEnabled: true }
+  ) as {
+    setup: { generationConfig: Record<string, unknown>; inputAudioTranscription?: unknown };
+  };
+  assert.equal(generationPlacement.setup.inputAudioTranscription, undefined);
+  assert.deepEqual(generationPlacement.setup.generationConfig.inputAudioTranscription, {});
+
+  const defaults = createGeminiSetup('de') as {
+    setup: {
+      generationConfig: Record<string, unknown>;
+      realtimeInputConfig: { automaticActivityDetection: Record<string, unknown> };
+      inputAudioTranscription?: unknown;
+    };
+  };
+  assert.equal(defaults.setup.generationConfig.speechConfig, undefined);
+  assert.equal(defaults.setup.inputAudioTranscription, undefined);
+  const lectureVad = defaults.setup.realtimeInputConfig.automaticActivityDetection;
+  assert.equal(lectureVad.endOfSpeechSensitivity, 'END_SENSITIVITY_LOW');
+  assert.equal(lectureVad.silenceDurationMs, 800);
+});
+
+test('voice and source-transcript rejections are matched precisely', () => {
+  assert.equal(
+    rejectedVoiceConfig(1007, 'Unknown name "speechConfig" at setup.generation_config'),
+    true
+  );
+  assert.equal(rejectedVoiceConfig(1007, 'Unknown name "voice_config"'), true);
+  assert.equal(rejectedVoiceConfig(1006, 'speechConfig'), false);
+  assert.equal(
+    rejectedInputTranscription(1007, 'Unknown name "inputAudioTranscription" at setup'),
+    true
+  );
+  assert.equal(
+    rejectedInputTranscription(1007, 'Unknown name "outputAudioTranscription" at setup'),
+    false
+  );
+  // Der Output-Fallback darf umgekehrt nicht auf das Input-Feld anspringen.
+  assert.equal(
+    nextTranscriptionPlacement('setup', 1007, 'Unknown name "inputAudioTranscription"'),
+    null
+  );
+});
+
+test('input transcription streams the source lane alongside the translation', async () => {
+  const harness = createTranslatorHarness();
+  const { ws } = createFakeSocket();
+  harness.internals.ws = ws;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
+
+  await harness.internals.handleServerMessage(
+    ws,
+    JSON.stringify({
+      serverContent: {
+        inputTranscription: { text: 'Liftoff of Starship' },
+        outputTranscription: { text: 'Abheben von Starship' }
+      }
+    })
+  );
+  assert.deepEqual(harness.transcripts, [
+    { lane: 'target', text: 'Abheben von Starship', final: false },
+    { lane: 'source', text: 'Liftoff of Starship', final: false }
+  ]);
+  harness.translator.stop();
+});
+
+test('digital silence pauses the uplink and resumes seamlessly with sound', () => {
+  const harness = createTranslatorHarness();
+  const { ws, sent } = createFakeSocket();
+  harness.internals.ws = ws;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
+
+  // 4.800 Samples bei 48 kHz sind 100 ms je Chunk; nach SILENCE_GATE_MS
+  // greift das Gate und meldet die Pause genau einmal.
+  const gateChunks = Math.ceil(SILENCE_GATE_MS / 100) + 2;
+  for (let chunk = 0; chunk < gateChunks; chunk++) {
+    harness.internals.handleCapturedAudio(new Float32Array(4_800));
+  }
+  const audioAfterGate = countRealtimeAudio(sent);
+  assert.ok(audioAfterGate > 0, 'the first silent second still reaches Gemini');
+  assert.equal(countAudioStreamEnd(sent), 1, 'exactly one audioStreamEnd marks the pause');
+
+  for (let chunk = 0; chunk < 5; chunk++) {
+    harness.internals.handleCapturedAudio(new Float32Array(4_800));
+  }
+  assert.equal(countRealtimeAudio(sent), audioAfterGate, 'gated silence must not be uploaded');
+  assert.equal(countAudioStreamEnd(sent), 1);
+
+  harness.internals.handleCapturedAudio(new Float32Array(4_800).fill(0.1));
+  assert.ok(
+    countRealtimeAudio(sent) > audioAfterGate,
+    'returning sound must resume the uplink immediately'
+  );
   harness.translator.stop();
 });
 

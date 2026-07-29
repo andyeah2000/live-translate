@@ -20,7 +20,9 @@ export interface DuckingState {
 
 /**
  * Exakter linearer Zielpegel für den dynamischen Originalpfad. Nur erkannte
- * Sprache im Quellvideo darf das Original absenken.
+ * Sprache im Quellvideo darf das Original absenken. Endet die Quellsprache,
+ * kehrt die volle Atmo (Raketenstart!) sofort zurück – die zeitversetzte
+ * Gemini-Stimme spricht bewusst über den vollen Originalpegel weiter.
  */
 export function sourceDuckGain(state: DuckingState): number {
   if (!state.sourceSpeaking || !state.translationReady) {

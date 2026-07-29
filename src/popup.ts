@@ -16,7 +16,11 @@ function el<T extends HTMLElement>(selector: string): T {
 
 const geminiKeyInput = el<HTMLInputElement>('#geminiKey');
 const targetLanguageSelect = el<HTMLSelectElement>('#targetLanguage');
+const speechModeSelect = el<HTMLSelectElement>('#speechMode');
+const voiceNameSelect = el<HTMLSelectElement>('#voiceName');
 const subtitlesInput = el<HTMLInputElement>('#subtitles');
+const dualSubtitlesInput = el<HTMLInputElement>('#dualSubtitles');
+const echoTargetLanguageInput = el<HTMLInputElement>('#echoTargetLanguage');
 const translationVolumeInput = el<HTMLInputElement>('#translationVolume');
 const translationValue = el<HTMLElement>('#translationValue');
 const toggleButton = el<HTMLButtonElement>('#toggle');
@@ -32,13 +36,23 @@ let state: SessionState = {
   ducking: null
 };
 
+// Zuletzt geladener Vollstand: erhält Felder ohne Popup-Oberfläche
+// (z. B. das rawModelAudio-Experiment) über jeden Speichervorgang hinweg.
+let persistedSettings: SessionSettings | null = null;
+
 function collectSettings(): SessionSettings {
   return {
-    settingsVersion: 7,
+    ...(persistedSettings ?? {}),
+    settingsVersion: 8,
     geminiKey: geminiKeyInput.value.trim(),
     targetLanguage: targetLanguageSelect.value,
     subtitles: subtitlesInput.checked,
-    translationVolume: Number(translationVolumeInput.value) / 100
+    subtitleMode: dualSubtitlesInput.checked ? 'dual' : 'translation',
+    translationVolume: Number(translationVolumeInput.value) / 100,
+    echoTargetLanguage: echoTargetLanguageInput.checked,
+    speechMode: speechModeSelect.value === 'dialog' ? 'dialog' : 'lecture',
+    voiceName: voiceNameSelect.value,
+    rawModelAudio: persistedSettings?.rawModelAudio ?? false
   };
 }
 
@@ -51,8 +65,13 @@ function renderState(): void {
   toggleButton.textContent = state.running ? 'Stop' : 'Start';
   toggleButton.classList.toggle('running', state.running);
   toggleButton.setAttribute('aria-pressed', String(state.running));
+  // Sitzungsgebundene Einstellungen wirken erst ab dem nächsten Start und
+  // sind währenddessen gesperrt; Untertitel und Lautstärke bleiben live.
   geminiKeyInput.disabled = state.running;
   targetLanguageSelect.disabled = state.running;
+  speechModeSelect.disabled = state.running;
+  voiceNameSelect.disabled = state.running;
+  echoTargetLanguageInput.disabled = state.running;
   const status = popupStatusPresentation(state);
   setStatus(status.text, status.error);
   renderMonitor();
@@ -140,6 +159,7 @@ function updateOutputSettings(): void {
       type: 'update-output-settings',
       settings: {
         subtitles: settings.subtitles,
+        subtitleMode: settings.subtitleMode,
         translationVolume: settings.translationVolume
       }
     } satisfies Message)
@@ -158,9 +178,14 @@ async function init(): Promise<void> {
   });
 
   const settings = await loadSettings();
+  persistedSettings = settings;
   geminiKeyInput.value = settings.geminiKey;
   targetLanguageSelect.value = settings.targetLanguage;
+  speechModeSelect.value = settings.speechMode;
+  voiceNameSelect.value = settings.voiceName;
   subtitlesInput.checked = settings.subtitles;
+  dualSubtitlesInput.checked = settings.subtitleMode === 'dual';
+  echoTargetLanguageInput.checked = settings.echoTargetLanguage;
   translationVolumeInput.value = String(Math.round(settings.translationVolume * 100));
   translationValue.textContent = `${translationVolumeInput.value}%`;
 
@@ -175,7 +200,11 @@ async function init(): Promise<void> {
   toggleButton.addEventListener('click', () => void onToggle());
   geminiKeyInput.addEventListener('change', saveConfiguration);
   targetLanguageSelect.addEventListener('change', saveConfiguration);
+  speechModeSelect.addEventListener('change', saveConfiguration);
+  voiceNameSelect.addEventListener('change', saveConfiguration);
+  echoTargetLanguageInput.addEventListener('change', saveConfiguration);
   subtitlesInput.addEventListener('change', updateOutputSettings);
+  dualSubtitlesInput.addEventListener('change', updateOutputSettings);
   translationVolumeInput.addEventListener('input', updateOutputSettings);
 }
 

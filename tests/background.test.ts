@@ -71,7 +71,12 @@ const chromeMock = {
   },
   storage: {
     session: {
-      get: async (key: string) => {
+      get: async (key: string | string[]) => {
+        if (Array.isArray(key)) {
+          const result: Record<string, unknown> = {};
+          for (const item of key) result[item] = sessionStore[item];
+          return result;
+        }
         if (key === 'sessionState') {
           const gate = sessionGetGate;
           if (gate) {
@@ -284,11 +289,16 @@ test('output controls update subtitles and forward live Gemini volume', async ()
 test('tab capture ID is created in the background immediately before offscreen start', async () => {
   reset(idleState());
   const settings = {
-    settingsVersion: 7,
+    settingsVersion: 8,
     geminiKey: 'AIza-test',
     targetLanguage: 'de',
     subtitles: true,
-    translationVolume: 1
+    subtitleMode: 'dual',
+    translationVolume: 1,
+    echoTargetLanguage: false,
+    speechMode: 'dialog',
+    voiceName: 'Kore',
+    rawModelAudio: false
   };
 
   assert.deepEqual(
@@ -306,6 +316,35 @@ test('tab capture ID is created in the background immediately before offscreen s
     ),
     ['offscreen:create', 'capture:12', 'runtime:offscreen-start']
   );
+});
+
+test('source-lane transcripts are only forwarded in dual subtitle mode', async () => {
+  reset();
+  emit({ type: 'transcript', sessionId: 'session-a', text: 'original', final: false, lane: 'source' });
+  await sessionBarrier('session-a', 'barrier-source-hidden');
+  assert.equal(
+    tabMessages.some(({ message }) => message.type === 'subtitle'),
+    false,
+    'without dual mode the source lane must stay hidden'
+  );
+
+  emit({
+    type: 'update-output-settings',
+    settings: { subtitles: true, subtitleMode: 'dual', translationVolume: 1 }
+  });
+  await waitFor(
+    () => sessionStore.subtitleMode === 'dual',
+    'Untertitel-Modus wurde nicht gespeichert'
+  );
+  emit({ type: 'transcript', sessionId: 'session-a', text: 'original', final: false, lane: 'source' });
+  await sessionBarrier('session-a', 'barrier-source-visible');
+  const forwarded = tabMessages.find(({ message }) => message.type === 'subtitle');
+  assert.deepEqual(forwarded?.message, {
+    type: 'subtitle',
+    text: 'original',
+    final: false,
+    lane: 'source'
+  });
 });
 
 test('subtitle disable waits for an in-flight transcript before clearing', async () => {

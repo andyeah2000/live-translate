@@ -1,3 +1,4 @@
+import type { SpeechMode, TranscriptLane } from '../messages';
 import { SpeechPreprocessor, base64FromInt16, floatToInt16, int16FromBase64, int16ToFloat } from './pcm';
 import {
   GEMINI_EDGE_DECLICK_S,
@@ -19,6 +20,12 @@ import { softLimitInPlace } from './soft-limiter';
 
 const WS_URL =
   'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+// Ephemeral Tokens gelten ausschließlich für den Constrained-Endpunkt; der
+// reguläre BidiGenerateContent kennt `access_token` nicht und antwortet mit
+// 1008 „unregistered callers".
+const WS_TOKEN_URL =
+  'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained';
+const AUTH_TOKEN_URL = 'https://generativelanguage.googleapis.com/v1beta/auth_tokens';
 const MODEL = 'models/gemini-3.5-live-translate-preview';
 const OUTPUT_SAMPLE_RATE = 24000;
 const WS_CONNECTING_STATE = 0;
@@ -43,6 +50,22 @@ export const MAX_BUFFERED_BYTES = Math.floor(
 );
 const HANDOFF_SEND_PUMP_MS = 25;
 export const TRANSCRIPT_SETTLE_MS = 350;
+// Laut Live-API-Guide soll ein >1 s pausierender Audiostrom ein
+// audioStreamEnd senden. Digitale Stille (pausiertes Video, stummer Tab)
+// wird deshalb lokal erkannt und nicht weitergestreamt: weniger Token-
+// Verbrauch, weniger halluzinierte Turns. Die Schwelle liegt bei einem
+// PCM16-LSB, damit leise echte Atmo niemals fälschlich gegatet wird.
+export const SILENCE_GATE_MS = 1_500;
+export const SILENCE_GATE_PEAK = 1 / 32_768;
+// Ephemeral Tokens: Der Langzeit-Key wandert nie in die WebSocket-URL.
+// Jeder Socket verbraucht ein Einmal-Token; der Pool wird asynchron
+// nachgefüllt. Schlägt das Token-Minting fehl, bleibt der direkte
+// Key-Query-Parameter als funktionierender Fallback erhalten.
+const TOKEN_MINT_TIMEOUT_MS = 4_000;
+const TOKEN_NEW_SESSION_WINDOW_MS = 30 * 60_000;
+const TOKEN_EXPIRE_WINDOW_MS = 45 * 60_000;
+const TOKEN_FRESH_MS = 25 * 60_000;
+const TOKEN_POOL_TARGET = 2;
 // Close-Codes, bei denen ein Reconnect sinnlos ist (Konfig-/Protokollfehler).
 // 1008 gehört bewusst NICHT dazu: Gemini beendet damit auch reguläre
 // Sitzungen nach Ablauf des Zeitlimits (goAway) – das ist reconnectbar.
@@ -68,6 +91,7 @@ interface GeminiServerMessage {
   sessionResumptionUpdate?: { newHandle?: unknown; resumable?: unknown };
   serverContent?: {
     modelTurn?: { parts?: Array<{ inlineData?: { data?: string } }> };
+    inputTranscription?: { text?: string };
     outputTranscription?: { text?: string };
     interrupted?: boolean;
     generationComplete?: boolean;
@@ -84,6 +108,28 @@ export interface GeminiSessionSetup {
   resumptionHandle?: string | null;
 }
 
+export interface GeminiSetupOptions {
+  /** Eingaben in der Zielsprache nachsprechen statt zu schweigen. */
+  echoTargetLanguage?: boolean;
+  /** VAD-Preset: 'lecture' (satzstabil) oder 'dialog' (latenzarm). */
+  speechMode?: SpeechMode;
+  /** Prebuilt-Stimme; null/undefined = automatische Modellstimme. */
+  voiceName?: string | null;
+  /** Zusätzlich das Transkript der Quellsprache anfordern. */
+  inputTranscriptionEnabled?: boolean;
+}
+
+/**
+ * VAD-Presets nach Live-API-Guide: Vorträge/Doku (SpaceX-Streams) brauchen
+ * späte Satzenden, damit Callout-Pausen keine Sätze zerteilen. Schnelle
+ * Dialoge (YouTube-Gespräche) profitieren vom dokumentierten 500-ms-Minimum
+ * und empfindlicherem Satzende – spürbar geringere Latenz.
+ */
+const SPEECH_MODE_VAD: Record<SpeechMode, { endSensitivity: string; silenceMs: number }> = {
+  lecture: { endSensitivity: 'END_SENSITIVITY_LOW', silenceMs: 800 },
+  dialog: { endSensitivity: 'END_SENSITIVITY_HIGH', silenceMs: 500 }
+};
+
 export type SessionManagementFeature = 'resumption' | 'compression';
 
 export interface GeminiTranslatorOptions {
@@ -92,7 +138,8 @@ export interface GeminiTranslatorOptions {
   modelSource: AudioNode;
   outputNode: AudioNode;
   targetLanguage: string;
-  onTranscript(text: string, final: boolean): void;
+  setupOptions?: GeminiSetupOptions;
+  onTranscript(lane: TranscriptLane, text: string, final: boolean): void;
   onStatus(status: string): void;
   onReadyChange(ready: boolean): void;
   canContinueWithoutTranscript(): boolean;
@@ -213,27 +260,37 @@ export class TranscriptTurnCoordinator {
 export function createGeminiSetup(
   targetLanguage: string,
   transcriptionPlacement: TranscriptionPlacement = 'setup',
-  session: GeminiSessionSetup = {}
+  session: GeminiSessionSetup = {},
+  options: GeminiSetupOptions = {}
 ): object {
   const generationConfig: Record<string, unknown> = {
     responseModalities: ['AUDIO'],
     translationConfig: {
       targetLanguageCode: targetLanguage,
-      echoTargetLanguage: false
+      echoTargetLanguage: options.echoTargetLanguage === true
     }
   };
+  if (typeof options.voiceName === 'string' && options.voiceName.length > 0) {
+    // Ob das Translate-Modell Prebuilt-Stimmen akzeptiert, entscheidet der
+    // Server. Bei Ablehnung verbindet der Client automatisch ohne dieses
+    // Feld neu (Schema-Fallback wie bei den übrigen optionalen Features).
+    generationConfig.speechConfig = {
+      voiceConfig: { prebuiltVoiceConfig: { voiceName: options.voiceName } }
+    };
+  }
+  const vad = SPEECH_MODE_VAD[options.speechMode ?? 'lecture'];
   const setup: Record<string, unknown> = {
     model: MODEL,
     generationConfig,
     // Gegen falsch erkannte Wörter bei Musik/Atmo im Hintergrund:
     // Sprachanfänge eifrig erkennen und mit Vorlauf senden (nichts
-    // abschneiden), Sätze nicht vorschnell beenden.
+    // abschneiden); das Satzende bestimmt das gewählte Preset.
     realtimeInputConfig: {
       automaticActivityDetection: {
         startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
         prefixPaddingMs: 300,
-        endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
-        silenceDurationMs: 800
+        endOfSpeechSensitivity: vad.endSensitivity,
+        silenceDurationMs: vad.silenceMs
       }
     }
   };
@@ -250,10 +307,15 @@ export function createGeminiSetup(
   // Die produktive Raw-v1beta-Runtime und die aktuelle Live-Translate-Doku
   // haben dieses Feld zeitweise an unterschiedlichen Stellen verlangt. Der
   // Client beherrscht beide Schemata und kann als letzte Stufe ohne Transkript
-  // weiterübersetzen.
-  if (transcriptionPlacement === 'setup') setup.outputAudioTranscription = {};
-  else if (transcriptionPlacement === 'generation') {
+  // weiterübersetzen. Das Quell-Transkript folgt derselben Platzierung.
+  if (transcriptionPlacement === 'setup') {
+    setup.outputAudioTranscription = {};
+    if (options.inputTranscriptionEnabled === true) setup.inputAudioTranscription = {};
+  } else if (transcriptionPlacement === 'generation') {
     generationConfig.outputAudioTranscription = {};
+    if (options.inputTranscriptionEnabled === true) {
+      generationConfig.inputAudioTranscription = {};
+    }
   }
   return { setup };
 }
@@ -283,6 +345,34 @@ export function nextTranscriptionPlacement(
   return null;
 }
 
+/**
+ * Ein Token-Socket, den der Server als „ohne Identität" ablehnt, darf niemals
+ * das Reconnect-Budget verbrennen: Der direkte Key ist ein zweiter,
+ * unabhängiger Anmeldeweg. Nach etabliertem Setup zählt Code 1008 dagegen als
+ * regulärer Sitzungsabbruch, sofern der Grund nicht ausdrücklich nach
+ * Anmeldung klingt (z. B. abgelaufenes Token beim Reconnect).
+ */
+export function shouldAbandonTokenAuth(
+  usedTokenAuth: boolean,
+  closeCode: number,
+  reason: string,
+  everConnected: boolean
+): boolean {
+  if (!usedTokenAuth) return false;
+  if (/unregistered|identity|credential|api.?key|auth/i.test(reason)) return true;
+  return closeCode === 1008 && !everConnected;
+}
+
+/** Lehnt der Server die gewählte Prebuilt-Stimme ab, geht es ohne sie weiter. */
+export function rejectedVoiceConfig(closeCode: number, reason: string): boolean {
+  return closeCode === 1007 && /speech.?config|voice.?config|voice.?name/i.test(reason);
+}
+
+/** Lehnt der Server das Quell-Transkript ab, bleibt die Übersetzung unberührt. */
+export function rejectedInputTranscription(closeCode: number, reason: string): boolean {
+  return closeCode === 1007 && /input.?audio.?transcription/i.test(reason);
+}
+
 export class GeminiTranslator {
   private ws: WebSocket | null = null;
   private handoffWs: WebSocket | null = null;
@@ -310,13 +400,22 @@ export class GeminiTranslator {
   private transcriptionPlacement: TranscriptionPlacement = 'setup';
   private sessionResumptionEnabled = true;
   private contextCompressionEnabled = true;
+  private voiceEnabled = true;
+  private inputTranscriptionEnabled: boolean;
   private resumptionHandle: string | null = null;
+  private silentStreakSamples = 0;
+  private inputGated = false;
+  private readonly tokenPool: Array<{ token: string; freshUntil: number }> = [];
+  private tokenMintingEnabled = false;
+  private tokenRefillActive = false;
+  private readonly socketAuth = new WeakMap<WebSocket, 'token' | 'key'>();
   private readonly playingSources = new Set<AudioBufferSourceNode>();
   private readonly sourceSchedule = new Map<AudioBufferSourceNode, ScheduledPlayback>();
   private readonly playbackTurns = new Set<PlaybackTurn>();
   private playbackTurn: PlaybackTurn | null = null;
   private readonly preprocessor: SpeechPreprocessor;
   private readonly transcriptTurns: TranscriptTurnCoordinator;
+  private readonly sourceTranscriptTurns: TranscriptTurnCoordinator;
   private readonly sendRate = 16000;
   private workletFlushResolver: (() => void) | null = null;
   private finishPromise: Promise<void> | null = null;
@@ -333,12 +432,34 @@ export class GeminiTranslator {
     // optionale Highpass sitzt bereits im Audio-Graphen;
     // hier folgen nur Anti-Aliasing und Resampling.
     this.preprocessor = new SpeechPreprocessor(opts.ctx.sampleRate, { highpass: false });
-    this.transcriptTurns = new TranscriptTurnCoordinator(opts.onTranscript);
+    this.transcriptTurns = new TranscriptTurnCoordinator((text, final) =>
+      opts.onTranscript('target', text, final)
+    );
+    this.sourceTranscriptTurns = new TranscriptTurnCoordinator((text, final) =>
+      opts.onTranscript('source', text, final)
+    );
+    this.inputTranscriptionEnabled = opts.setupOptions?.inputTranscriptionEnabled === true;
+  }
+
+  /** Aktuell wirksame Setup-Optionen inklusive server-seitig deaktivierter Features. */
+  private effectiveSetupOptions(): GeminiSetupOptions {
+    return {
+      echoTargetLanguage: this.opts.setupOptions?.echoTargetLanguage === true,
+      speechMode: this.opts.setupOptions?.speechMode ?? 'lecture',
+      voiceName: this.voiceEnabled ? (this.opts.setupOptions?.voiceName ?? null) : null,
+      inputTranscriptionEnabled: this.inputTranscriptionEnabled
+    };
   }
 
   async start(): Promise<void> {
     const { ctx, modelSource } = this.opts;
     this.opts.onStatus('Verbinde mit Gemini…');
+
+    // Erst ein Ephemeral-Token-Paar holen: Das validiert den API-Key in
+    // Sekundenbruchteilen (klare Fehlermeldung statt Reconnect-Raten) und
+    // hält den Langzeit-Key aus jeder WebSocket-URL heraus.
+    await this.initializeTokenPool();
+    if (this.stopped) return;
 
     // Netzwerk-Handshake und lokales Worklet parallel starten. Früher begann
     // die Verbindung erst nach dem Worklet-Setup und verlor dadurch unnötig
@@ -428,6 +549,7 @@ export class GeminiTranslator {
     this.clearInputQueue();
     this.clearPlaybackQueue();
     this.transcriptTurns.reset();
+    this.sourceTranscriptTurns.reset();
     if (this.worklet) {
       this.worklet.port.onmessage = null;
       this.worklet.disconnect();
@@ -458,12 +580,114 @@ export class GeminiTranslator {
     this.handoffWs = null;
   }
 
+  /**
+   * Erzeugt Einmal-Tokens über die auth_tokens-API. Fehlerpfade sind bewusst
+   * weich: Ohne Token-Infrastruktur (404, Netzfehler, Timeout) verbindet der
+   * Client wie bisher direkt mit dem Key. Nur eine eindeutige Ablehnung des
+   * Keys (400/401/403) beendet den Start sofort mit konkretem Hinweis.
+   */
+  private async mintToken(): Promise<
+    { ok: true; token: string } | { ok: false; keyRejected: boolean }
+  > {
+    const abort = new AbortController();
+    const timeoutTimer = globalThis.setTimeout(() => abort.abort(), TOKEN_MINT_TIMEOUT_MS);
+    try {
+      const now = Date.now();
+      const response = await fetch(AUTH_TOKEN_URL, {
+        method: 'POST',
+        signal: abort.signal,
+        headers: {
+          'x-goog-api-key': this.opts.apiKey,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          uses: 1,
+          newSessionExpireTime: new Date(now + TOKEN_NEW_SESSION_WINDOW_MS).toISOString(),
+          expireTime: new Date(now + TOKEN_EXPIRE_WINDOW_MS).toISOString()
+        })
+      });
+      if (response.status === 400 || response.status === 401 || response.status === 403) {
+        return { ok: false, keyRejected: true };
+      }
+      if (!response.ok) return { ok: false, keyRejected: false };
+      const payload = (await response.json()) as { name?: unknown };
+      return typeof payload.name === 'string' && payload.name.length > 0
+        ? { ok: true, token: payload.name }
+        : { ok: false, keyRejected: false };
+    } catch {
+      return { ok: false, keyRejected: false };
+    } finally {
+      globalThis.clearTimeout(timeoutTimer);
+    }
+  }
+
+  private async initializeTokenPool(): Promise<void> {
+    const minted = await this.mintToken();
+    if (this.stopped) return;
+    if (!minted.ok) {
+      if (minted.keyRejected) {
+        this.fail('Gemini hat den API-Key abgelehnt. Bitte den Key im Popup prüfen.');
+        return;
+      }
+      // Kein Token-Support erreichbar – Key-Fallback bleibt voll funktionsfähig.
+      this.tokenMintingEnabled = false;
+      return;
+    }
+    this.tokenMintingEnabled = true;
+    this.tokenPool.push({ token: minted.token, freshUntil: Date.now() + TOKEN_FRESH_MS });
+    this.refillTokenPool();
+  }
+
+  private refillTokenPool(): void {
+    if (!this.tokenMintingEnabled || this.tokenRefillActive || this.stopped) return;
+    if (this.tokenPool.length >= TOKEN_POOL_TARGET) return;
+    this.tokenRefillActive = true;
+    void this.mintToken()
+      .then((minted) => {
+        if (this.stopped) return;
+        if (minted.ok) {
+          this.tokenPool.push({ token: minted.token, freshUntil: Date.now() + TOKEN_FRESH_MS });
+        }
+      })
+      .finally(() => {
+        this.tokenRefillActive = false;
+      });
+  }
+
+  /**
+   * Synchrone Auth-Wahl für den nächsten Socket: Einmal-Token auf dem
+   * Constrained-Endpunkt wenn vorhanden, sonst der Key auf dem regulären.
+   */
+  private nextSocketAuth(): { url: string; auth: 'token' | 'key' } {
+    while (this.tokenPool.length > 0) {
+      const candidate = this.tokenPool.shift();
+      if (!candidate) break;
+      if (candidate.freshUntil > Date.now()) {
+        this.refillTokenPool();
+        return {
+          url: `${WS_TOKEN_URL}?access_token=${encodeURIComponent(candidate.token)}`,
+          auth: 'token'
+        };
+      }
+    }
+    this.refillTokenPool();
+    return { url: `${WS_URL}?key=${encodeURIComponent(this.opts.apiKey)}`, auth: 'key' };
+  }
+
+  /** Schaltet dauerhaft auf die direkte Key-Anmeldung um. */
+  private disableTokenAuth(): void {
+    this.tokenMintingEnabled = false;
+    this.tokenPool.length = 0;
+  }
+
   private openSocket(): void {
     if (this.stopped) return;
     this.setConnectionReady(false);
     this.clearConnectTimer();
 
-    const ws = new WebSocket(`${WS_URL}?key=${encodeURIComponent(this.opts.apiKey)}`);
+    const socketAuth = this.nextSocketAuth();
+    const ws = new WebSocket(socketAuth.url);
+    this.socketAuth.set(ws, socketAuth.auth);
     this.ws = ws;
     this.connectTimer = globalThis.setTimeout(() => {
       if (this.ws !== ws || this.ready) return;
@@ -478,11 +702,16 @@ export class GeminiTranslator {
     ws.onopen = () => {
       ws.send(
         JSON.stringify(
-          createGeminiSetup(this.opts.targetLanguage, this.transcriptionPlacement, {
-            resumptionEnabled: this.sessionResumptionEnabled,
-            compressionEnabled: this.contextCompressionEnabled,
-            resumptionHandle: this.resumptionHandle
-          })
+          createGeminiSetup(
+            this.opts.targetLanguage,
+            this.transcriptionPlacement,
+            {
+              resumptionEnabled: this.sessionResumptionEnabled,
+              compressionEnabled: this.contextCompressionEnabled,
+              resumptionHandle: this.resumptionHandle
+            },
+            this.effectiveSetupOptions()
+          )
         )
       );
     };
@@ -508,7 +737,9 @@ export class GeminiTranslator {
       return;
     }
     this.clearHandoffConnectTimer();
-    const candidate = new WebSocket(`${WS_URL}?key=${encodeURIComponent(this.opts.apiKey)}`);
+    const candidateAuth = this.nextSocketAuth();
+    const candidate = new WebSocket(candidateAuth.url);
+    this.socketAuth.set(candidate, candidateAuth.auth);
     this.handoffWs = candidate;
     this.handoffInputPaused = true;
     // Während der kurzen eindeutigen Sample-Grenze bleibt der Originalton
@@ -531,15 +762,20 @@ export class GeminiTranslator {
       if (this.stopped || this.handoffWs !== candidate) return;
       candidate.send(
         JSON.stringify(
-          createGeminiSetup(this.opts.targetLanguage, this.transcriptionPlacement, {
-            resumptionEnabled: this.sessionResumptionEnabled,
-            compressionEnabled: this.contextCompressionEnabled,
-            // Bis zum tatsächlichen Setup immer den jüngsten ausdrücklich
-            // sicheren Server-Checkpoint verwenden. Session Resumption setzt
-            // dieselbe serverseitige Sitzung fort; Audio doppelt zu senden
-            // würde dagegen Wörter doppelt übersetzen.
-            resumptionHandle: this.resumptionHandle
-          })
+          createGeminiSetup(
+            this.opts.targetLanguage,
+            this.transcriptionPlacement,
+            {
+              resumptionEnabled: this.sessionResumptionEnabled,
+              compressionEnabled: this.contextCompressionEnabled,
+              // Bis zum tatsächlichen Setup immer den jüngsten ausdrücklich
+              // sicheren Server-Checkpoint verwenden. Session Resumption setzt
+              // dieselbe serverseitige Sitzung fort; Audio doppelt zu senden
+              // würde dagegen Wörter doppelt übersetzen.
+              resumptionHandle: this.resumptionHandle
+            },
+            this.effectiveSetupOptions()
+          )
         )
       );
     };
@@ -567,7 +803,29 @@ export class GeminiTranslator {
       this.opts.onStatus('Gemini-Sitzungswechsel läuft…');
       return;
     }
+    if (
+      shouldAbandonTokenAuth(
+        this.socketAuth.get(ws) === 'token',
+        event.code,
+        event.reason,
+        this.everConnected
+      )
+    ) {
+      this.disableTokenAuth();
+      const status = 'Token-Anmeldung nicht verfügbar · verbinde direkt mit dem API-Key…';
+      console.warn(`[live-translate] ${status} (${reason})`);
+      this.opts.onStatus(status);
+      // Der Key ist ein anderer Anmeldeweg, kein weiterer Fehlversuch:
+      // Das Reconnect-Budget bleibt unberührt und der Wechsel erfolgt sofort.
+      this.reconnectTimer = globalThis.setTimeout(() => {
+        this.reconnectTimer = null;
+        this.openSocket();
+      }, 0);
+      return;
+    }
     if (this.scheduleSessionManagementFallback(event.code, event.reason, reason)) return;
+    if (this.scheduleVoiceFallback(event.code, event.reason, reason)) return;
+    if (this.scheduleInputTranscriptionFallback(event.code, event.reason, reason)) return;
     if (this.scheduleTranscriptionFallback(event.code, event.reason, reason)) return;
     if (PERMANENT_CLOSE_CODES.has(event.code)) {
       this.fail(`Gemini hat die Verbindung abgelehnt (${reason})`);
@@ -603,6 +861,18 @@ export class GeminiTranslator {
     if (candidate !== this.handoffWs) return;
     this.abandonHandoff(candidate);
     const reason = `Code ${event.code}${event.reason ? `: ${event.reason}` : ''}`;
+    // Ein am Token gescheiterter Kandidat wechselt für alle weiteren
+    // Verbindungen auf die direkte Key-Anmeldung.
+    if (
+      shouldAbandonTokenAuth(
+        this.socketAuth.get(candidate) === 'token',
+        event.code,
+        event.reason,
+        this.everConnected
+      )
+    ) {
+      this.disableTokenAuth();
+    }
     const active = this.ws;
     if (
       active?.readyState === WS_OPEN_STATE &&
@@ -650,6 +920,7 @@ export class GeminiTranslator {
     if (this.stopped || this.captureClosed || this.inputEndSent) return;
     const samples = this.preprocessor.process(chunk);
     if (samples.length === 0) return;
+    if (this.updateSilenceGate(samples)) return;
     // Der Web-Audio-Kompressor ist absichtlich musikalisch und kein echter
     // Peak-Limiter. Diese transparente Sample-Kennlinie verhindert deshalb
     // nachweisbar PCM16-Sättigung, ohne normale Sprachpegel anzutasten.
@@ -684,6 +955,49 @@ export class GeminiTranslator {
       return;
     }
     this.flushPendingAudio(ws);
+  }
+
+  /**
+   * Erkennt digitale Stille (pausiertes Video, stummer Tab) und pausiert den
+   * Uplink nach `SILENCE_GATE_MS`. Die erste Stillesekunde wird noch normal
+   * gesendet, damit Geminis VAD das Satzende sauber hört; danach signalisiert
+   * ein `audioStreamEnd` die Pause. Kehrt Ton zurück, läuft der Strom nahtlos
+   * weiter. Gibt true zurück, wenn der Chunk verworfen werden soll.
+   */
+  private updateSilenceGate(samples: Float32Array): boolean {
+    let peak = 0;
+    for (let index = 0; index < samples.length; index++) {
+      const magnitude = Math.abs(samples[index] ?? 0);
+      if (magnitude > peak) peak = magnitude;
+    }
+    if (peak > SILENCE_GATE_PEAK) {
+      this.silentStreakSamples = 0;
+      this.inputGated = false;
+      return false;
+    }
+    this.silentStreakSamples += samples.length;
+    const gateSamples = samplesForDuration(this.sendRate, SILENCE_GATE_MS);
+    if (this.silentStreakSamples < gateSamples) return false;
+    if (!this.inputGated) {
+      this.inputGated = true;
+      this.signalSilenceGate();
+    }
+    return true;
+  }
+
+  /** Best-effort: Rest-PCM leeren und die Pause an Gemini melden. */
+  private signalSilenceGate(): void {
+    if (this.handoffInputPaused || this.handoffWs !== null) return;
+    const ws = this.ws;
+    if (!this.connectionReady || ws?.readyState !== WS_OPEN_STATE) return;
+    this.flushPendingAudio(ws, true);
+    if (this.pendingSamples > 0 || this.ws !== ws || ws.readyState !== WS_OPEN_STATE) return;
+    try {
+      ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+    } catch (error) {
+      // Ein Sendefehler landet ohnehin im normalen Reconnect-Pfad.
+      console.warn('[live-translate] Stille-Pause konnte nicht gemeldet werden:', error);
+    }
   }
 
   private flushPendingAudio(ws: WebSocket, includePartial = false): void {
@@ -770,6 +1084,25 @@ export class GeminiTranslator {
           this.retryHandoffWithUpdatedSetup(ws, 'Gemini passt den Sitzungswechsel an…');
           return;
         }
+        if (this.voiceEnabled && rejectedVoiceConfig(1007, msg.error.message)) {
+          this.voiceEnabled = false;
+          this.retryHandoffWithUpdatedSetup(
+            ws,
+            'Gewählte Stimme hier nicht verfügbar · Standardstimme…'
+          );
+          return;
+        }
+        if (
+          this.inputTranscriptionEnabled &&
+          rejectedInputTranscription(1007, msg.error.message)
+        ) {
+          this.inputTranscriptionEnabled = false;
+          this.retryHandoffWithUpdatedSetup(
+            ws,
+            'Gemini verbindet ohne Original-Transkript neu…'
+          );
+          return;
+        }
         if (
           transcriptFallback &&
           (transcriptFallback !== 'disabled' || this.opts.canContinueWithoutTranscript())
@@ -788,6 +1121,8 @@ export class GeminiTranslator {
       }
       if (
         this.scheduleSessionManagementFallback(1007, msg.error.message, msg.error.message) ||
+        this.scheduleVoiceFallback(1007, msg.error.message, msg.error.message) ||
+        this.scheduleInputTranscriptionFallback(1007, msg.error.message, msg.error.message) ||
         this.scheduleTranscriptionFallback(1007, msg.error.message, msg.error.message)
       ) {
         // Der folgende Close-Event gehört noch zur verworfenen Verbindung und
@@ -878,6 +1213,7 @@ export class GeminiTranslator {
       // Übersetzung über den nächsten Satz hinweg.
       this.fadeInterruptedPlayback();
       this.transcriptTurns.interrupt();
+      this.sourceTranscriptTurns.interrupt();
       return;
     }
     const audioParts = (content.modelTurn?.parts ?? [])
@@ -894,12 +1230,15 @@ export class GeminiTranslator {
     }
     const transcript = content.outputTranscription?.text;
     if (transcript) this.transcriptTurns.push(transcript);
+    const sourceTranscript = content.inputTranscription?.text;
+    if (sourceTranscript) this.sourceTranscriptTurns.push(sourceTranscript);
     if (content.generationComplete) {
       this.finishPlaybackTurn();
     }
     if (content.turnComplete) {
       this.finishPlaybackTurn();
       this.transcriptTurns.complete();
+      this.sourceTranscriptTurns.complete();
     }
     this.maybeResolveFinishInput();
   }
@@ -1331,6 +1670,49 @@ export class GeminiTranslator {
     return true;
   }
 
+  private scheduleVoiceFallback(
+    closeCode: number,
+    serverReason: string,
+    logReason: string
+  ): boolean {
+    if (!this.voiceEnabled || !rejectedVoiceConfig(closeCode, serverReason)) return false;
+    this.voiceEnabled = false;
+    this.clearConnectTimer();
+    this.prepareForReconnect();
+    const status = 'Gewählte Stimme hier nicht verfügbar · Standardstimme…';
+    console.warn(`[live-translate] ${status} (${logReason})`);
+    this.opts.onStatus(status);
+    this.reconnectTimer = globalThis.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.openSocket();
+    }, 250);
+    return true;
+  }
+
+  private scheduleInputTranscriptionFallback(
+    closeCode: number,
+    serverReason: string,
+    logReason: string
+  ): boolean {
+    if (
+      !this.inputTranscriptionEnabled ||
+      !rejectedInputTranscription(closeCode, serverReason)
+    ) {
+      return false;
+    }
+    this.inputTranscriptionEnabled = false;
+    this.clearConnectTimer();
+    this.prepareForReconnect();
+    const status = 'Gemini verbindet ohne Original-Transkript neu…';
+    console.warn(`[live-translate] ${status} (${logReason})`);
+    this.opts.onStatus(status);
+    this.reconnectTimer = globalThis.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.openSocket();
+    }, 250);
+    return true;
+  }
+
   private scheduleSessionManagementFallback(
     closeCode: number,
     serverReason: string,
@@ -1395,6 +1777,7 @@ export class GeminiTranslator {
     // kein halbes Wort hart abschneiden.
     this.trimReconnectPlaybackLead();
     this.transcriptTurns.finalizeNow();
+    this.sourceTranscriptTurns.finalizeNow();
   }
 
   private trimReconnectPlaybackLead(): void {

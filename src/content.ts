@@ -1,4 +1,4 @@
-import type { Message } from './messages';
+import type { Message, TranscriptLane } from './messages';
 import { placeSubtitleHost, subtitleOverlayTarget } from './subtitle-placement';
 
 const flagged = window as unknown as { __liveTranslateLoaded?: boolean };
@@ -17,6 +17,9 @@ function setup(): void {
   let currentLineEl: HTMLDivElement | null = null;
   let previousText = '';
   let currentText = '';
+  // Dual-Modus: Das Original läuft als eigene Zeile über der Übersetzung mit.
+  let sourceText = '';
+  let lastSourceUpdate = 0;
   let lastUpdate = 0;
   let hideTimer: number | undefined;
   let nativeVideo: HTMLVideoElement | null = null;
@@ -67,7 +70,7 @@ function setup(): void {
       nativeTrack.mode = 'showing';
     }
     clearNativeCue();
-    const text = [previousText, currentText].filter(Boolean).join('\n').trim();
+    const text = [sourceText || previousText, currentText].filter(Boolean).join('\n').trim();
     if (!text) return true;
     const now = Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : 0;
     const cue = new VTTCue(Math.max(0, now - 0.1), now + HIDE_AFTER_MS / 1_000, escapeVttText(text));
@@ -140,7 +143,9 @@ function setup(): void {
     }
     clearNativeTrack();
     ensureOverlay();
-    if (previousLineEl) previousLineEl.textContent = previousText;
+    // Im Dual-Modus zeigt die obere Zeile das live mitlaufende Original;
+    // sonst wie gehabt den zuletzt abgeschlossenen Übersetzungssatz.
+    if (previousLineEl) previousLineEl.textContent = sourceText || previousText;
     if (currentLineEl) currentLineEl.textContent = currentText;
     if (host) host.style.opacity = '1';
   }
@@ -157,6 +162,7 @@ function setup(): void {
       if (host) host.style.opacity = '0';
       clearNativeCue();
       finalizeSegment();
+      sourceText = '';
     }, HIDE_AFTER_MS);
   }
 
@@ -173,7 +179,30 @@ function setup(): void {
     }
   }
 
-  function appendSubtitle(text: string, final: boolean): void {
+  // Das Original behält nur das frischeste Zeilenende – ältere Wörter laufen
+  // an einer Wortgrenze hinaus, damit die Zeile mit dem Sprecher Schritt hält.
+  function trimOverlongSource(): void {
+    if (sourceText.length <= MAX_LINE_LENGTH) return;
+    const cutFrom = sourceText.length - MAX_LINE_LENGTH;
+    const boundary = sourceText.indexOf(' ', cutFrom);
+    sourceText = sourceText.slice(boundary > -1 ? boundary + 1 : cutFrom).trimStart();
+  }
+
+  function appendSourceSubtitle(text: string): void {
+    const now = Date.now();
+    if (sourceText && now - lastSourceUpdate > SEGMENT_GAP_MS) sourceText = '';
+    lastSourceUpdate = now;
+    sourceText += text;
+    trimOverlongSource();
+    render();
+    scheduleHide();
+  }
+
+  function appendSubtitle(text: string, final: boolean, lane: TranscriptLane): void {
+    if (lane === 'source') {
+      appendSourceSubtitle(text);
+      return;
+    }
     const now = Date.now();
     if (currentText && now - lastUpdate > SEGMENT_GAP_MS) finalizeSegment();
     lastUpdate = now;
@@ -192,12 +221,14 @@ function setup(): void {
     currentLineEl = null;
     previousText = '';
     currentText = '';
+    sourceText = '';
     clearNativeTrack();
   }
 
   const onMessage = (msg: Message) => {
-    if (msg.type === 'subtitle') appendSubtitle(msg.text, msg.final);
-    else if (msg.type === 'subtitle-clear') clear();
+    if (msg.type === 'subtitle') {
+      appendSubtitle(msg.text, msg.final, msg.lane === 'source' ? 'source' : 'target');
+    } else if (msg.type === 'subtitle-clear') clear();
   };
   chrome.runtime.onMessage.addListener(onMessage);
 

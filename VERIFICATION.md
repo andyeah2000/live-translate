@@ -16,7 +16,16 @@ Actions führt denselben Befehl bei Pushes und Pull Requests mit Node.js 24 aus.
 
 Die Tests decken unter anderem ab:
 
-- exakt 10 % Quellpegel während Sprache und exakt 100 % außerhalb;
+- exakt 10 % Quellpegel während Sprache und exakt 100 % außerhalb – die
+  Gemini-Stimme läuft bewusst über den vollen Originalpegel weiter;
+- Stille-Gating: genau ein `audioStreamEnd` je Pause, kein Upload gegateter
+  Stille und nahtlose Fortsetzung beim ersten Ton;
+- die VAD-Presets, `echoTargetLanguage`, `speechConfig`-Stimme und das
+  Quell-Transkript im Setup beider Schema-Platzierungen;
+- präzise Schema-Fallbacks für abgelehnte Stimme und abgelehntes
+  Quell-Transkript, ohne den Output-Fallback fehlzutriggern;
+- Weiterleitung der Quell-Transkriptspur ausschließlich im Dual-Modus;
+- Begrenzung und Verwerfung der neuen Sitzungsoptionen im Settings-Sanitizer;
 - fail-open bei VAD-, Gemini- und Netzfehlern;
 - 20-ms-Capture und modellspezifische 100-ms-Gemini-Chunks;
 - Setup-Preroll mit expliziter Sample-Bilanz;
@@ -100,6 +109,22 @@ geladen. Verifiziert wurden `document.fullscreenElement === VIDEO`, ein
 programmatischer Subtitle-`TextTrack` im Modus `showing` und der erwartete
 laufende `VTTCue`. Damit bleiben Untertitel auch im nativen Vollbild des
 SpaceX-Players verfügbar.
+
+## Nicht automatisiert verifiziert
+
+- Das Ephemeral-Token-Minting (`auth_tokens`) läuft nur gegen die echte API;
+  Tokens verbinden über den `BidiGenerateContentConstrained`-Endpunkt. Lokal
+  getestet sind der Key-Fallback-Pfad und die Selbstheilung: Lehnt der Server
+  einen Token-Socket als „unregistered caller" ab (Code 1008), wechselt der
+  Client sofort und ohne Verbrauch des Reconnect-Budgets dauerhaft auf die
+  direkte Key-Anmeldung. Ein abgelehnter Key meldet sich beim Start sofort,
+  ein nicht erreichbarer Token-Endpunkt fällt still auf den Key zurück.
+- Ob `gemini-3.5-live-translate-preview` Prebuilt-Stimmen akzeptiert, ist in
+  der Doku nicht festgelegt; der Client sendet das Feld nur auf Wunsch und
+  verbindet bei Ablehnung automatisch ohne Stimme neu.
+- Das Experiment `rawModelAudio` ist bewusst unkalibriert: Es existiert, um
+  den Prosodie-Erhalt von Gemini 3.5 gegen die komprimierte Sprachpipeline
+  hörbar zu vergleichen, und ist deshalb kein Default.
 
 ## Ehrliche Grenze
 
