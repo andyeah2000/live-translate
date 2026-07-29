@@ -19,6 +19,7 @@ import {
 } from '../src/offscreen/gemini';
 import { base64FromInt16, int16FromBase64 } from '../src/offscreen/pcm';
 import {
+  MAX_HANDOFF_AUDIO_MS,
   MAX_PREROLL_AUDIO_MS,
   SEND_CHUNK_MS,
   samplesForDuration
@@ -243,6 +244,7 @@ interface TranslatorHarness {
   statuses: string[];
   readyChanges: boolean[];
   errors: string[];
+  transcripts: Array<{ text: string; final: boolean }>;
 }
 
 function createTranslatorHarness(
@@ -252,13 +254,14 @@ function createTranslatorHarness(
   const statuses: string[] = [];
   const readyChanges: boolean[] = [];
   const errors: string[] = [];
+  const transcripts: Array<{ text: string; final: boolean }> = [];
   const options: GeminiTranslatorOptions = {
     apiKey: 'test-key',
     ctx,
     modelSource: {} as AudioNode,
     outputNode,
     targetLanguage: 'de',
-    onTranscript: () => {},
+    onTranscript: (text, final) => transcripts.push({ text, final }),
     onStatus: (status) => statuses.push(status),
     onReadyChange: (ready) => readyChanges.push(ready),
     canContinueWithoutTranscript: () => true,
@@ -270,7 +273,8 @@ function createTranslatorHarness(
     internals: translator as unknown as TranslatorInternals,
     statuses,
     readyChanges,
-    errors
+    errors,
+    transcripts
   };
 }
 
@@ -992,6 +996,135 @@ test('handoff backlog drains through a paced pump instead of restarting for self
     globalThis.WebSocket = OriginalWebSocket;
     harness.translator.stop();
   }
+});
+
+test('a stalled handoff bounds the paused FIFO to the freshest audio', async () => {
+  const harness = createTranslatorHarness();
+  const { ws: old, sent: oldSent } = createFakeSocket();
+  const { ws: candidate } = createFakeSocket();
+  harness.internals.ws = old;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
+
+  const OriginalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = function MockWebSocket() {
+    return candidate;
+  } as unknown as typeof WebSocket;
+  try {
+    await harness.internals.handleServerMessage(
+      old,
+      JSON.stringify({ goAway: { timeLeft: '10s' } })
+    );
+    // 4.800 Samples bei 48 kHz sind 100 ms Eingangsaudio je Chunk; 130 Chunks
+    // überschreiten die Handoff-Obergrenze deutlich.
+    for (let chunk = 0; chunk < 130; chunk++) {
+      harness.internals.handleCapturedAudio(new Float32Array(4_800).fill(0.1));
+    }
+    const maxSamples = samplesForDuration(16_000, MAX_HANDOFF_AUDIO_MS);
+    assert.ok(harness.internals.pendingSamples <= maxSamples);
+    assert.ok(
+      harness.internals.pendingSamples > maxSamples - samplesForDuration(16_000, 200),
+      'the freshest audio up to the bound must be retained'
+    );
+    assert.ok(harness.internals.getAudioTransportStats().droppedSamples > 0);
+    assert.equal(countRealtimeAudio(oldSent), 0);
+  } finally {
+    globalThis.WebSocket = OriginalWebSocket;
+    harness.translator.stop();
+  }
+});
+
+test('a failed handoff attempt resumes the uplink on the still-open active socket', async () => {
+  const harness = createTranslatorHarness();
+  const { ws: old, sent: oldSent } = createFakeSocket();
+  const { ws: candidate } = createFakeSocket();
+  harness.internals.ws = old;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
+
+  const OriginalWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = function MockWebSocket() {
+    return candidate;
+  } as unknown as typeof WebSocket;
+  try {
+    await harness.internals.handleServerMessage(
+      old,
+      JSON.stringify({ goAway: { timeLeft: '5s' } })
+    );
+    for (let chunk = 0; chunk < 10; chunk++) {
+      harness.internals.handleCapturedAudio(new Float32Array(4_800).fill(0.1));
+    }
+    assert.equal(countRealtimeAudio(oldSent), 0, 'audio must wait while the candidate connects');
+
+    harness.internals.handleClose(
+      candidate,
+      { code: 1006, reason: 'candidate lost' } as CloseEvent
+    );
+    assert.equal(harness.internals.handoffWs, null);
+    assert.ok(
+      countRealtimeAudio(oldSent) >= 10,
+      'buffered audio must continue on the active socket between handoff attempts'
+    );
+    const stats = harness.internals.getAudioTransportStats();
+    assert.equal(stats.droppedSamples, 0);
+    assert.equal(stats.capturedSamples, stats.sentSamples + stats.pendingSamples);
+  } finally {
+    globalThis.WebSocket = OriginalWebSocket;
+    harness.translator.stop();
+  }
+});
+
+test('a shorter manual stop tightens an already running drain window', async () => {
+  const harness = createTranslatorHarness();
+  harness.internals.connectionReady = false;
+  const longFinish = harness.translator.finishInput(60_000);
+  const startedAt = performance.now();
+  const shortFinish = harness.translator.finishInput(250);
+  assert.equal(shortFinish, longFinish, 'both callers must share one drain');
+  await shortFinish;
+  const elapsed = performance.now() - startedAt;
+  assert.ok(elapsed >= 200, `drain must still respect the shorter window (${elapsed.toFixed(1)} ms)`);
+  assert.ok(elapsed < 2_000, `drain kept the longer window (${elapsed.toFixed(1)} ms)`);
+  harness.translator.stop();
+});
+
+test('repeated rejection before the first setup fails fast with a key hint', () => {
+  const harness = createTranslatorHarness();
+  const first = createFakeSocket();
+  harness.internals.ws = first.ws;
+  harness.internals.handleClose(first.ws, { code: 1006, reason: 'HTTP 403' } as CloseEvent);
+  assert.deepEqual(harness.errors, []);
+
+  const second = createFakeSocket();
+  harness.internals.ws = second.ws;
+  harness.internals.handleClose(second.ws, { code: 1006, reason: 'HTTP 403' } as CloseEvent);
+  assert.deepEqual(harness.errors, []);
+
+  const third = createFakeSocket();
+  harness.internals.ws = third.ws;
+  harness.internals.handleClose(third.ws, { code: 1006, reason: 'HTTP 403' } as CloseEvent);
+  assert.equal(harness.errors.length, 1);
+  assert.match(harness.errors[0] ?? '', /API-Key/);
+  harness.translator.stop();
+});
+
+test('a bundled server frame keeps its transcript alongside a resumption update', async () => {
+  const harness = createTranslatorHarness();
+  const { ws } = createFakeSocket();
+  harness.internals.ws = ws;
+  harness.internals.ready = true;
+  harness.internals.connectionReady = true;
+
+  await harness.internals.handleServerMessage(
+    ws,
+    JSON.stringify({
+      sessionResumptionUpdate: { resumable: true, newHandle: 'bundled-handle' },
+      serverContent: { outputTranscription: { text: 'gebündelt' } }
+    })
+  );
+  assert.equal(harness.internals.resumptionHandle, 'bundled-handle');
+  assert.deepEqual(harness.transcripts, [{ text: 'gebündelt', final: false }]);
+  harness.translator.stop();
 });
 
 test('session-management schema rejection reconnects fresh with the fields disabled', async () => {

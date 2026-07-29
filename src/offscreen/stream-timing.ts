@@ -8,6 +8,15 @@ export const SEND_CHUNK_MS = 100;
  */
 export const MAX_PREROLL_AUDIO_MS = 500;
 
+/**
+ * Obergrenze für Audio, das während eines Gemini-Sitzungswechsels lokal
+ * wartet. Ein normaler Handover bleibt weit darunter und verliert nichts.
+ * Erst ein pathologisch hängender Wechsel verwirft die ältesten Samples,
+ * damit der Nachfolger nicht minutenlang veraltetes Audio nachspielt und die
+ * Übersetzung dauerhaft hinter dem Video herläuft.
+ */
+export const MAX_HANDOFF_AUDIO_MS = 10_000;
+
 export function samplesForDuration(sampleRate: number, durationMs: number): number {
   if (!Number.isFinite(sampleRate) || sampleRate <= 0) return 0;
   return Math.max(1, Math.round((sampleRate * durationMs) / 1_000));

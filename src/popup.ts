@@ -1,3 +1,4 @@
+import { isTrustedSender } from './messages';
 import type { Message, SessionSettings, SessionState } from './messages';
 import {
   configurationError,
@@ -146,6 +147,16 @@ function updateOutputSettings(): void {
 }
 
 async function init(): Promise<void> {
+  // Vor dem ersten await registrieren: Ein session-state-Broadcast während
+  // des Ladens ginge sonst verloren und das Popup zeigte veralteten Status.
+  chrome.runtime.onMessage.addListener((msg: Message, sender) => {
+    if (!isTrustedSender(sender)) return;
+    if (msg.type === 'session-state') {
+      state = msg.state;
+      renderState();
+    }
+  });
+
   const settings = await loadSettings();
   geminiKeyInput.value = settings.geminiKey;
   targetLanguageSelect.value = settings.targetLanguage;
@@ -166,12 +177,6 @@ async function init(): Promise<void> {
   targetLanguageSelect.addEventListener('change', saveConfiguration);
   subtitlesInput.addEventListener('change', updateOutputSettings);
   translationVolumeInput.addEventListener('input', updateOutputSettings);
-  chrome.runtime.onMessage.addListener((msg: Message) => {
-    if (msg.type === 'session-state') {
-      state = msg.state;
-      renderState();
-    }
-  });
 }
 
 void init().catch((err) => {

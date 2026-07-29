@@ -42,9 +42,15 @@ alte spielt bereits empfangene Ausgabe zu Ende, während neues Eingabeaudio ab
 einer eindeutigen Sample-Grenze lokal wartet. Nach `setupComplete` leert ein
 Backpressure-gesteuerter Sendepump die FIFO exakt einmal in den neuen Socket.
 Damit funktionieren sowohl normale Resumption als auch ein von Gemini
-erzwungener frischer Wechsel ohne Audioverlust oder Doppelversand. Initiales
+erzwungener frischer Wechsel ohne Audioverlust oder Doppelversand. Hängt ein
+Kandidat, begrenzt eine 10-s-Obergrenze die wartende FIFO auf das frischeste
+Audio; zwischen zwei Handover-Versuchen läuft der Uplink auf dem noch offenen
+alten Socket weiter. Initiales
 Setup und kurze ungeplante Netzunterbrechungen besitzen einen begrenzten
-500-ms-Preroll. Eine Sample-Bilanz weist `captured`, `sent`, `pending` und
+500-ms-Preroll. Wird schon das allererste Setup wiederholt abgelehnt – etwa
+bei ungültigem API-Key –, endet der Start nach zwei schnellen Versuchen mit
+einem konkreten Hinweis statt im minutenlangen Backoff. Eine Sample-Bilanz
+weist `captured`, `sent`, `pending` und
 unvermeidbar `dropped` getrennt aus.
 
 Beim Stream-Ende werden Worklet-Restblock und partieller PCM-Chunk vor
@@ -109,6 +115,9 @@ Browserprofils gespeichert und direkt an
 `generativelanguage.googleapis.com` gesendet. Er wird nie in das Repository,
 Untertitel oder Logs geschrieben. Beim Laden werden alle nicht zur aktuellen
 Gemini-Konfiguration gehörenden Storage-Schlüssel automatisch entfernt.
+Privilegierte Runtime-Nachrichten (Start, Stop, Transkripte, Status)
+akzeptieren Service Worker, Popup und Offscreen-Dokument nur von
+Extension-eigenen Absendern, nie aus dem Renderer einer Webseite.
 
 ## Architektur
 

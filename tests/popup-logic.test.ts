@@ -35,6 +35,10 @@ test('URL validation blocks privileged and store pages', () => {
   assert.equal(isTranslatableUrl('https://example.com/video'), true);
   assert.equal(isTranslatableUrl('http://localhost:3000/video'), true);
   assert.equal(isTranslatableUrl('chrome://extensions'), false);
+  assert.equal(isTranslatableUrl('chrome-untrusted://media-app'), false);
+  assert.equal(isTranslatableUrl('chrome-search://local-ntp/local-ntp.html'), false);
+  assert.equal(isTranslatableUrl('data:text/html,<video></video>'), false);
+  assert.equal(isTranslatableUrl('blob:https://example.com/2f7a0b'), false);
   assert.equal(isTranslatableUrl('https://chromewebstore.google.com/detail/example'), false);
   assert.equal(isTranslatableUrl(undefined), false);
 });

@@ -22,6 +22,15 @@ Die Tests decken unter anderem ab:
 - Setup-Preroll mit expliziter Sample-Bilanz;
 - Dual-Socket-GoAway-Handover mit eindeutiger Sample-Grenze, gepufferter FIFO
   und gepulstem Backpressure-Drain ohne Doppelversand;
+- eine Obergrenze der Handoff-FIFO bei hängendem Kandidaten und den
+  fortgesetzten Uplink auf dem alten Socket zwischen Handover-Versuchen;
+- ein verkürzbares Drain-Fenster, wenn ein kürzerer Stop einen bereits
+  laufenden Drain überholt;
+- schnellen Abbruch mit API-Key-Hinweis, wenn schon das erste Setup
+  wiederholt abgelehnt wird;
+- gebündelte Server-Frames, deren Transkript-/Audiofelder neben Statusfeldern
+  erhalten bleiben;
+- Verwerfen privilegierter Runtime-Nachrichten von Webseiten-Absendern;
 - Verwerfen alter Resumption-Tokens nach `resumable: false`;
 - getrennte Fallbacks für Transkript, Resumption und Kontextkompression;
 - Rest-PCM vor `audioStreamEnd` und einen festen, nicht als Server-Ack

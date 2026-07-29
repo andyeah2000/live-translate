@@ -22,6 +22,10 @@ function setup(): void {
   let nativeVideo: HTMLVideoElement | null = null;
   let nativeTrack: TextTrack | null = null;
   let nativeCue: VTTCue | null = null;
+  // addTextTrack kann Tracks nie wieder entfernen. Einmal angelegte Tracks
+  // werden deshalb pro Video wiederverwendet, statt bei jedem Vollbildwechsel
+  // einen weiteren toten Eintrag in der nativen Untertitelliste zu hinterlassen.
+  const nativeTracks = new WeakMap<HTMLVideoElement, TextTrack>();
 
   function fullscreenVideo(): HTMLVideoElement | null {
     const fullscreen = document.fullscreenElement;
@@ -46,19 +50,27 @@ function setup(): void {
     nativeVideo = null;
   }
 
+  // VTTCue interpretiert "<" als Beginn von Cue-Markup. Transkripttext soll
+  // dagegen immer wörtlich erscheinen.
+  function escapeVttText(text: string): string {
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  }
+
   function renderNativeSubtitle(video: HTMLVideoElement): boolean {
     if (typeof VTTCue !== 'function') return false;
     if (nativeVideo !== video || !nativeTrack) {
       clearNativeTrack();
       nativeVideo = video;
-      nativeTrack = video.addTextTrack('subtitles', 'Live Translation', 'und');
+      const existingTrack = nativeTracks.get(video);
+      nativeTrack = existingTrack ?? video.addTextTrack('subtitles', 'Live Translation', 'und');
+      nativeTracks.set(video, nativeTrack);
       nativeTrack.mode = 'showing';
     }
     clearNativeCue();
     const text = [previousText, currentText].filter(Boolean).join('\n').trim();
     if (!text) return true;
     const now = Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : 0;
-    const cue = new VTTCue(Math.max(0, now - 0.1), now + HIDE_AFTER_MS / 1_000, text);
+    const cue = new VTTCue(Math.max(0, now - 0.1), now + HIDE_AFTER_MS / 1_000, escapeVttText(text));
     cue.line = -3;
     cue.align = 'center';
     nativeTrack.addCue(cue);
@@ -68,7 +80,6 @@ function setup(): void {
 
   function ensureOverlay(): void {
     if (!host?.isConnected) {
-      host = null;
       previousLineEl = null;
       currentLineEl = null;
       host = document.createElement('div');
@@ -149,12 +160,26 @@ function setup(): void {
     }, HIDE_AFTER_MS);
   }
 
+  // Hält die aktuelle Zeile auch bei einem einzelnen langen Transkript-Chunk
+  // begrenzt: Der Anfang wandert an einer Wortgrenze in die vorherige Zeile,
+  // der Rest läuft als aktuelle Zeile weiter.
+  function rotateOverlongLine(): void {
+    while (currentText.length > MAX_LINE_LENGTH) {
+      const boundary = currentText.lastIndexOf(' ', MAX_LINE_LENGTH);
+      const cut = boundary > 0 ? boundary : MAX_LINE_LENGTH;
+      const head = currentText.slice(0, cut).trim();
+      if (head) previousText = head;
+      currentText = currentText.slice(cut).trimStart();
+    }
+  }
+
   function appendSubtitle(text: string, final: boolean): void {
     const now = Date.now();
     if (currentText && now - lastUpdate > SEGMENT_GAP_MS) finalizeSegment();
     lastUpdate = now;
     currentText += text;
-    if (final || currentText.length > MAX_LINE_LENGTH) finalizeSegment();
+    rotateOverlongLine();
+    if (final) finalizeSegment();
     render();
     scheduleHide();
   }

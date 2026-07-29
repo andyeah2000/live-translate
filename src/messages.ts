@@ -33,6 +33,19 @@ export interface DuckingTelemetry {
   translationReady: boolean;
 }
 
+/**
+ * Nur Extension-eigene Kontexte (Popup, Service Worker, Offscreen-Dokument)
+ * dürfen privilegierte Nachrichten senden. Das Content Script läuft im
+ * Renderer beliebiger Webseiten und sendet nie – ein kompromittierter
+ * Renderer könnte aber in seinem Namen Nachrichten fälschen. Deshalb wird der
+ * Absender geprüft, bevor eine Nachricht Zustand verändern darf.
+ */
+export function isTrustedSender(sender: chrome.runtime.MessageSender): boolean {
+  const extensionBase = chrome.runtime.getURL('');
+  if (sender.url?.startsWith(extensionBase) === true) return true;
+  return sender.origin !== undefined && `${sender.origin}/` === extensionBase;
+}
+
 /** Nachrichten zwischen Popup, Background, Offscreen-Dokument und Content Script. */
 export type Message =
   | { type: 'start-session'; tabId: number; settings: SessionSettings }

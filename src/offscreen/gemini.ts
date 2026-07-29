@@ -9,6 +9,7 @@ import {
   rampAudioParam
 } from './audio-envelope';
 import {
+  MAX_HANDOFF_AUDIO_MS,
   MAX_PREROLL_AUDIO_MS,
   SEND_CHUNK_MS,
   reconnectDelayMs,
@@ -23,6 +24,10 @@ const OUTPUT_SAMPLE_RATE = 24000;
 const WS_CONNECTING_STATE = 0;
 const WS_OPEN_STATE = 1;
 const MAX_RECONNECTS = 8;
+// Vor dem allerersten setupComplete ist eine wiederholte Ablehnung fast immer
+// ein Konfigurationsfehler (ungültiger API-Key, gesperrtes Netz). Dann schnell
+// mit klarer Meldung scheitern statt minutenlang generisch neu zu verbinden.
+const MAX_FIRST_CONNECT_ATTEMPTS = 2;
 const CONNECT_TIMEOUT_MS = 15_000;
 const WORKLET_FLUSH_TIMEOUT_MS = 250;
 const FINISH_INPUT_TIMEOUT_MS = 8_000;
@@ -285,6 +290,7 @@ export class GeminiTranslator {
   private silentSink: GainNode | null = null;
   private ready = false;
   private connectionReady = false;
+  private everConnected = false;
   private stopped = false;
   private reconnectAttempts = 0;
   private pendingChunks: Int16Array[] = [];
@@ -317,6 +323,7 @@ export class GeminiTranslator {
   private finishResolver: (() => void) | null = null;
   private finishTimer: number | null = null;
   private finishForceTimer: number | null = null;
+  private finishDeadlineAt = 0;
   private finishTimedOut = false;
   private captureClosed = false;
   private inputEndSent = false;
@@ -366,14 +373,27 @@ export class GeminiTranslator {
    */
   finishInput(timeoutMs = FINISH_INPUT_TIMEOUT_MS): Promise<void> {
     if (this.stopped) return Promise.resolve();
-    if (this.finishPromise) return this.finishPromise;
     const boundedTimeoutMs = Math.max(
       MIN_FINISH_INPUT_TIMEOUT_MS,
       Number.isFinite(timeoutMs) ? timeoutMs : FINISH_INPUT_TIMEOUT_MS
     );
+    if (this.finishPromise) {
+      // Ein bereits laufender Drain (z. B. nach einem Capture-Ende) darf einen
+      // ausdrücklich kürzeren Stop nicht auf sein längeres Fenster strecken.
+      this.shortenFinishWindow(boundedTimeoutMs);
+      return this.finishPromise;
+    }
     this.finishPromise = new Promise<void>((resolve) => {
       this.finishResolver = resolve;
     });
+    this.armFinishTimers(boundedTimeoutMs);
+    void this.beginFinishInput();
+    return this.finishPromise;
+  }
+
+  private armFinishTimers(boundedTimeoutMs: number): void {
+    this.finishDeadlineAt = Date.now() + boundedTimeoutMs;
+    if (this.finishTimer !== null) globalThis.clearTimeout(this.finishTimer);
     this.finishTimer = globalThis.setTimeout(() => {
       this.finishTimer = null;
       this.finishTimedOut = true;
@@ -385,12 +405,19 @@ export class GeminiTranslator {
     // Eine defekte/abgebrochene Servergeneration darf Stop niemals unendlich
     // blockieren. Diese zweite Grenze ist der explizite Notausgang; im
     // Normalfall löst der erste Timer oder das letzte onended deutlich vorher.
+    if (this.finishForceTimer !== null) globalThis.clearTimeout(this.finishForceTimer);
     this.finishForceTimer = globalThis.setTimeout(
       () => this.resolveFinishInput(),
       boundedTimeoutMs * 2
     );
-    void this.beginFinishInput();
-    return this.finishPromise;
+  }
+
+  private shortenFinishWindow(boundedTimeoutMs: number): void {
+    // Nach Ablauf des ersten Fensters läuft nur noch der Playback-Drain mit
+    // hartem Notausgang; dieses Stadium wird nicht mehr neu aufgezogen.
+    if (this.finishTimedOut) return;
+    if (Date.now() + boundedTimeoutMs >= this.finishDeadlineAt) return;
+    this.armFinishTimers(boundedTimeoutMs);
   }
 
   stop(): void {
@@ -546,8 +573,16 @@ export class GeminiTranslator {
       this.fail(`Gemini hat die Verbindung abgelehnt (${reason})`);
       return;
     }
-    if (this.reconnectAttempts >= MAX_RECONNECTS) {
-      this.fail(`Gemini-Verbindung verloren (${reason})`);
+    // Ein ungültiger API-Key scheitert als generisches 1006 im Handshake. Vor
+    // dem ersten erfolgreichen Setup gilt deshalb ein kleines Budget mit
+    // konkretem Hinweis statt des vollen Minuten-Backoffs.
+    const attemptLimit = this.everConnected ? MAX_RECONNECTS : MAX_FIRST_CONNECT_ATTEMPTS;
+    if (this.reconnectAttempts >= attemptLimit) {
+      this.fail(
+        this.everConnected
+          ? `Gemini-Verbindung verloren (${reason})`
+          : `Gemini lehnt die Verbindung wiederholt ab (${reason}). Bitte API-Key und Netzwerk prüfen.`
+      );
       return;
     }
     this.reconnectAttempts++;
@@ -555,9 +590,9 @@ export class GeminiTranslator {
     // zu schnelle Versuche werden mit 1006 abgelehnt.
     const delayMs = reconnectDelayMs(this.reconnectAttempts);
     console.warn(
-      `[live-translate] Gemini getrennt (${reason}) – Reconnect ${this.reconnectAttempts}/${MAX_RECONNECTS} in ${delayMs / 1000}s`
+      `[live-translate] Gemini getrennt (${reason}) – Reconnect ${this.reconnectAttempts}/${attemptLimit} in ${delayMs / 1000}s`
     );
-    this.opts.onStatus(`Verbindung unterbrochen – verbinde neu (${this.reconnectAttempts}/${MAX_RECONNECTS})…`);
+    this.opts.onStatus(`Verbindung unterbrochen – verbinde neu (${this.reconnectAttempts}/${attemptLimit})…`);
     this.reconnectTimer = globalThis.setTimeout(() => {
       this.reconnectTimer = null;
       this.openSocket();
@@ -579,6 +614,10 @@ export class GeminiTranslator {
       console.warn(
         `[live-translate] Gemini-Handover fehlgeschlagen (${reason}) – neuer Versuch in ${delayMs} ms`
       );
+      // Zwischen zwei Handover-Versuchen läuft der noch offene alte Socket
+      // weiter: Aufgestautes Audio geht sofort dorthin, statt bis zum nächsten
+      // Kandidaten ungebremst zu wachsen. Der nächste Versuch pausiert erneut.
+      this.resumeInputOnActiveSocket(active);
       this.opts.onStatus('Gemini bereitet den nächsten Sitzungswechsel erneut vor…');
       this.handoffRetryTimer = globalThis.setTimeout(() => {
         this.handoffRetryTimer = null;
@@ -623,7 +662,13 @@ export class GeminiTranslator {
     if (this.handoffInputPaused) {
       // Nicht an den alten Socket senden: dieselbe FIFO wird nach
       // setupComplete vom Kandidaten geleert. Das ist eine eindeutige
-      // Sample-Grenze ohne Verlust oder Doppelversand.
+      // Sample-Grenze ohne Verlust oder Doppelversand. Damit ein hängender
+      // Kandidat keinen unbegrenzten, später komplett nachgespielten Rückstau
+      // aufbaut, behält eine großzügige Obergrenze nur das frischeste Audio.
+      const maxHandoffSamples = samplesForDuration(this.sendRate, MAX_HANDOFF_AUDIO_MS);
+      if (this.pendingSamples > maxHandoffSamples) {
+        this.dropPendingSamples(this.pendingSamples - maxHandoffSamples);
+      }
       return;
     }
 
@@ -754,6 +799,9 @@ export class GeminiTranslator {
       this.fail(`Gemini-Fehler: ${msg.error.message}`);
       return;
     }
+    // Ein Server-Frame kann Status- und Inhaltsfelder bündeln. Die
+    // Statusverarbeitung fällt deshalb bis zum serverContent durch, statt
+    // gebündelte Audio-/Transkriptdaten stillschweigend zu verwerfen.
     const resumptionUpdate = msg.sessionResumptionUpdate;
     if (
       resumptionUpdate?.resumable === true &&
@@ -762,9 +810,7 @@ export class GeminiTranslator {
     ) {
       // Nur ausdrücklich resumable Handles speichern.
       this.resumptionHandle = resumptionUpdate.newHandle;
-      return;
-    }
-    if (resumptionUpdate?.resumable === false) {
+    } else if (resumptionUpdate?.resumable === false) {
       // Laut Live-API darf in diesem Zustand auch ein älterer Token nicht
       // weiterverwendet werden: Er könnte hinter der aktuellen Generierung
       // liegen und damit Ausgabe verlieren. Der nächste Socket startet frisch,
@@ -776,7 +822,6 @@ export class GeminiTranslator {
           'Gemini startet den Sitzungswechsel ohne veralteten Checkpoint neu…'
         );
       }
-      return;
     }
     if (msg.goAway !== undefined) {
       // Ein geplanter Sitzungswechsel darf nicht durch den generischen
@@ -796,31 +841,30 @@ export class GeminiTranslator {
       }
       this.opts.onStatus(`Gemini wechselt die Sitzung${timeLeft} · Übersetzung läuft weiter…`);
       this.openHandoffSocket();
-      return;
     }
     if (msg.setupComplete !== undefined) {
+      this.everConnected = true;
       if (ws === this.handoffWs) {
         this.promoteHandoff(ws);
-        return;
+      } else {
+        this.connectionReady = true;
+        if (this.handoffInputPaused) {
+          this.handoffInputPaused = false;
+          this.handoffDrainActive = this.pendingSamples > 0;
+        }
+        this.setReady(!this.handoffDrainActive);
+        this.clearConnectTimer();
+        // Eine flappende Verbindung darf ihr gesamtes Retry-Budget nicht durch
+        // jedes kurzlebige setupComplete sofort zurückbekommen.
+        this.armStableConnectionReset();
+        this.opts.onStatus(
+          this.handoffDrainActive
+            ? 'Gemini-Sitzung verbunden · Audio wird aufgeholt…'
+            : this.runningStatus()
+        );
+        this.flushPendingAudio(ws, this.captureClosed);
+        this.trySendInputEnd();
       }
-      this.connectionReady = true;
-      if (this.handoffInputPaused) {
-        this.handoffInputPaused = false;
-        this.handoffDrainActive = this.pendingSamples > 0;
-      }
-      this.setReady(!this.handoffDrainActive);
-      this.clearConnectTimer();
-      // Eine flappende Verbindung darf ihr gesamtes Retry-Budget nicht durch
-      // jedes kurzlebige setupComplete sofort zurückbekommen.
-      this.armStableConnectionReset();
-      this.opts.onStatus(
-        this.handoffDrainActive
-          ? 'Gemini-Sitzung verbunden · Audio wird aufgeholt…'
-          : this.runningStatus()
-      );
-      this.flushPendingAudio(ws, this.captureClosed);
-      this.trySendInputEnd();
-      return;
     }
 
     // Vor setupComplete darf ein Kandidat keine zweite Ausgabequelle werden.
@@ -1104,6 +1148,7 @@ export class GeminiTranslator {
     this.finishTimer = null;
     if (this.finishForceTimer !== null) globalThis.clearTimeout(this.finishForceTimer);
     this.finishForceTimer = null;
+    this.finishDeadlineAt = 0;
     this.finishTimedOut = false;
     const resolve = this.finishResolver;
     this.finishResolver = null;
@@ -1164,6 +1209,20 @@ export class GeminiTranslator {
     if (this.handoffWs !== candidate) return;
     this.clearHandoffConnectTimer();
     this.handoffWs = null;
+  }
+
+  /**
+   * Setzt den Uplink nach einem gescheiterten Handover-Versuch auf dem noch
+   * offenen aktiven Socket fort. Die FIFO-Disziplin bleibt erhalten: Jedes
+   * Sample geht weiterhin genau einmal an genau einen Socket.
+   */
+  private resumeInputOnActiveSocket(ws: WebSocket): void {
+    if (!this.handoffInputPaused) return;
+    this.handoffInputPaused = false;
+    this.handoffDrainActive = this.pendingSamples > 0;
+    this.setReady(!this.handoffDrainActive);
+    this.flushPendingAudio(ws, this.captureClosed);
+    this.trySendInputEnd();
   }
 
   private retryHandoffWithUpdatedSetup(candidate: WebSocket, status: string): void {

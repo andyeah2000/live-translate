@@ -3,10 +3,17 @@ import type { SessionSettings, SessionState } from './messages';
 const RESTRICTED_PREFIXES = [
   'chrome://',
   'chrome-extension://',
+  'chrome-untrusted://',
+  'chrome-search://',
   'edge://',
+  'brave://',
+  'opera://',
+  'vivaldi://',
   'about:',
   'devtools://',
   'view-source:',
+  'data:',
+  'blob:',
   'https://chromewebstore.google.com',
   'https://chrome.google.com/webstore'
 ];

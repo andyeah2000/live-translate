@@ -1,3 +1,4 @@
+import { isTrustedSender } from './messages';
 import type { Message, SessionSettings, SessionState } from './messages';
 import { sanitizeSettings } from './settings';
 
@@ -308,7 +309,10 @@ async function updateOutputSettings(
   });
 }
 
-chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
+  // Steuer- und Statusnachrichten nur aus Extension-eigenen Kontexten
+  // akzeptieren, niemals aus dem Renderer-Prozess einer Webseite.
+  if (!isTrustedSender(sender)) return undefined;
   switch (msg.type) {
     case 'start-session':
       void enqueueSessionOperation(() =>

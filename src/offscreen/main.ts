@@ -1,3 +1,4 @@
+import { isTrustedSender } from '../messages';
 import type { Message, OutputSettings, SessionSettings } from '../messages';
 import {
   CONTROL_FADE_S,
@@ -21,6 +22,8 @@ import { sourceDuckGain } from './voice-detector';
 // überträgt nur den daraus abgeleiteten Zustand auf den Audio-Graphen.
 const TICK_MS = 50;
 const MANUAL_STOP_DRAIN_MS = 1_500;
+// Ein resume() ohne Antwort darf die Sitzung nicht stumm weiterlaufen lassen.
+const RESUME_TIMEOUT_MS = 5_000;
 // Der einzige Gemini-Eingang ist immer sprachoptimiert: Rumpelfilter,
 // Kompression für leise Callouts und abschließender Limiter. Dieser Pfad ist
 // vom hörbaren Original vollständig getrennt.
@@ -67,7 +70,10 @@ window.addEventListener('unhandledrejection', (event) => {
   console.error('[live-translate] Unbehandelte Promise-Ablehnung:', event.reason);
 });
 
-chrome.runtime.onMessage.addListener((msg: Message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
+  // Start/Stop steuern Tab-Capture und API-Key-Nutzung; solche Nachrichten
+  // kommen ausschließlich aus Extension-eigenen Kontexten.
+  if (!isTrustedSender(sender)) return undefined;
   if (msg.type === 'offscreen-start') {
     sendResponse({ ok: true });
     // sendToOffscreen darf nach einem verlorenen Ack dieselbe Nachricht erneut
@@ -224,9 +230,6 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
         session.sourceSpeaking = speaking;
         session.vadProbability = probability;
         session.lastDuckGain = Number.NaN;
-        console.debug(
-          `[live-translate] Silero-Ducking ${speaking ? 'AN' : 'AUS'} (p=${probability.toFixed(3)})`
-        );
         tick();
         publishDuckingTelemetry(sessionId);
       },
@@ -326,15 +329,16 @@ function tick(): void {
   if (!session) return;
   const { ctx } = session;
   // Selbstheilung mit sichtbarem Fehler statt stumm geschluckter Resume-Probleme.
+  // Auch ein resume(), das weder auflöst noch ablehnt, endet über den Timeout
+  // in einem sichtbaren Fehler statt in einer dauerhaft stummen Sitzung.
   if (ctx.state === 'suspended' && !session.resumePending) {
     session.resumePending = true;
     const sessionId = session.sessionId;
-    void ctx
-      .resume()
+    void resumeWithTimeout(ctx, RESUME_TIMEOUT_MS)
       .then(() => {
         if (session?.sessionId === sessionId) session.resumePending = false;
       })
-      .catch((error) => {
+      .catch((error: unknown) => {
         if (session?.sessionId !== sessionId) return;
         stop();
         send({
@@ -371,6 +375,25 @@ function tick(): void {
     session.lastTranslatedTarget = session.translationVolume;
     rampParam(session.translatedGain.gain, session.translationVolume, ctx, CONTROL_FADE_S);
   }
+}
+
+function resumeWithTimeout(ctx: AudioContext, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Die Audio-Engine reagiert nicht (Status: ${ctx.state}).`)),
+      timeoutMs
+    );
+    ctx.resume().then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    );
+  });
 }
 
 function rampParam(param: AudioParam, target: number, ctx: AudioContext, duration: number): void {

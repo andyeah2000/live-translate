@@ -175,13 +175,23 @@ const chromeMock = {
 (globalThis as { chrome?: unknown }).chrome = chromeMock;
 await import('../src/background');
 
+// Extension-eigener Absender (Popup/Offscreen/Service Worker) für den
+// Sender-Check des Service Workers.
+const trustedSender = { origin: 'chrome-extension://test' };
+// Ein (kompromittiertes) Content-Script-Umfeld einer beliebigen Webseite.
+const webPageSender = {
+  origin: 'https://attacker.example',
+  url: 'https://attacker.example/video',
+  tab: { id: 1 }
+};
+
 function emit(message: Record<string, unknown>): void {
-  runtimeListener(message, {}, () => undefined);
+  runtimeListener(message, trustedSender, () => undefined);
 }
 
 function request(message: Record<string, unknown>): Promise<unknown> {
   return new Promise((resolve) => {
-    runtimeListener(message, {}, resolve);
+    runtimeListener(message, trustedSender, resolve);
   });
 }
 
@@ -217,6 +227,25 @@ function reset(state = runningState(1, 'session-a')): void {
   captureStreamId = 'background-stream';
   capturedTabs = [];
 }
+
+test('privileged messages from web-page senders are ignored entirely', async () => {
+  reset();
+  let responded: unknown = 'no-response';
+  const handled = runtimeListener(
+    { type: 'stop-session' },
+    webPageSender,
+    (value) => {
+      responded = value;
+    }
+  );
+  runtimeListener({ type: 'transcript', sessionId: 'session-a', text: 'forged', final: false }, webPageSender, () => undefined);
+  await sessionBarrier('session-a', 'barrier-untrusted-sender');
+
+  assert.equal(handled, undefined, 'untrusted senders must not keep a response channel open');
+  assert.equal(responded, 'no-response');
+  assert.equal((sessionStore.sessionState as { running: boolean }).running, true);
+  assert.equal(tabMessages.some(({ message }) => message.type === 'subtitle'), false);
+});
 
 test('output controls update subtitles and forward live Gemini volume', async () => {
   reset();
