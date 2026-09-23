@@ -243,7 +243,15 @@ test('privileged messages from web-page senders are ignored entirely', async () 
       responded = value;
     }
   );
-  runtimeListener({ type: 'transcript', sessionId: 'session-a', text: 'forged', final: false }, webPageSender, () => undefined);
+  runtimeListener(
+    {
+      type: 'transcript',
+      sessionId: 'session-a',
+      event: { kind: 'chunk', lane: 'target', text: 'forged' }
+    },
+    webPageSender,
+    () => undefined
+  );
   await sessionBarrier('session-a', 'barrier-untrusted-sender');
 
   assert.equal(handled, undefined, 'untrusted senders must not keep a response channel open');
@@ -252,7 +260,7 @@ test('privileged messages from web-page senders are ignored entirely', async () 
   assert.equal(tabMessages.some(({ message }) => message.type === 'subtitle'), false);
 });
 
-test('output controls update subtitles and forward live Gemini volume', async () => {
+test('output controls update subtitles and forward live translation volume', async () => {
   reset();
   emit({
     type: 'update-output-settings',
@@ -281,24 +289,65 @@ test('output controls update subtitles and forward live Gemini volume', async ()
   );
 
   tabMessages = [];
-  emit({ type: 'transcript', sessionId: 'session-a', text: 'unsichtbar', final: false });
+  emit({
+    type: 'transcript',
+    sessionId: 'session-a',
+    event: { kind: 'chunk', lane: 'target', text: 'unsichtbar' }
+  });
   await sessionBarrier('session-a', 'barrier-subtitles-off');
   assert.equal(tabMessages.some(({ message }) => message.type === 'subtitle'), false);
+});
+
+test('voice change restarts the existing source tab with the selected voice', async () => {
+  reset(runningState(42, 'old-voice'));
+  offscreenDocument = true;
+  const result = await request({ type: 'change-voice', settings: { liveVoice: 'stone' } });
+  assert.deepEqual(result, { ok: true });
+  const started = runtimeMessages.find(message => message.type === 'offscreen-start');
+  assert.equal((started?.settings as { liveVoice: string }).liveVoice, 'stone');
+  assert.equal((sessionStore.sessionState as { tabId: number }).tabId, 42);
+  assert.ok(lifecycleEvents.includes('runtime:offscreen-stop'));
+  assert.ok(lifecycleEvents.indexOf('runtime:offscreen-stop') < lifecycleEvents.indexOf('runtime:offscreen-start'));
+});
+
+test('voice change while stopped does not start a session', async () => {
+  reset(idleState());
+  assert.deepEqual(await request({ type: 'change-voice', settings: { liveVoice: 'stone' } }), { ok: true });
+  assert.equal(runtimeMessages.some(message => message.type === 'offscreen-start'), false);
+});
+
+test('queued voice selections collapse to the latest voice', async () => {
+  reset(runningState(42, 'old-voice'));
+  await Promise.all([
+    request({ type: 'change-voice', settings: { liveVoice: 'stone' } }),
+    request({ type: 'change-voice', settings: { liveVoice: 'marin' } }),
+    request({ type: 'change-voice', settings: { liveVoice: 'meridian' } })
+  ]);
+  const starts = runtimeMessages.filter(message => message.type === 'offscreen-start');
+  assert.equal(starts.length, 1);
+  assert.equal((starts[0]?.settings as { liveVoice: string }).liveVoice, 'meridian');
+});
+
+test('stop cancels pending voice restarts', async () => {
+  reset(runningState(42, 'old-voice'));
+  await Promise.all([
+    request({ type: 'change-voice', settings: { liveVoice: 'stone' } }),
+    request({ type: 'stop-session' })
+  ]);
+  assert.equal(runtimeMessages.some(message => message.type === 'offscreen-start'), false);
+  assert.equal((sessionStore.sessionState as { running: boolean }).running, false);
 });
 
 test('tab capture ID is created in the background immediately before offscreen start', async () => {
   reset(idleState());
   const settings = {
-    settingsVersion: 8,
-    geminiKey: 'AIza-test',
-    targetLanguage: 'de',
+    settingsVersion: 11,
+    liveServerUrl: 'http://127.0.0.1:8787',
+    liveServerToken: 'test-token',
+    liveVoice: 'marin',
     subtitles: true,
     subtitleMode: 'dual',
     translationVolume: 1,
-    echoTargetLanguage: false,
-    speechMode: 'dialog',
-    voiceName: 'Kore',
-    rawModelAudio: false
   };
 
   assert.deepEqual(
@@ -320,7 +369,11 @@ test('tab capture ID is created in the background immediately before offscreen s
 
 test('source-lane transcripts are only forwarded in dual subtitle mode', async () => {
   reset();
-  emit({ type: 'transcript', sessionId: 'session-a', text: 'original', final: false, lane: 'source' });
+  emit({
+    type: 'transcript',
+    sessionId: 'session-a',
+    event: { kind: 'chunk', lane: 'source', text: 'original' }
+  });
   await sessionBarrier('session-a', 'barrier-source-hidden');
   assert.equal(
     tabMessages.some(({ message }) => message.type === 'subtitle'),
@@ -336,14 +389,16 @@ test('source-lane transcripts are only forwarded in dual subtitle mode', async (
     () => sessionStore.subtitleMode === 'dual',
     'Untertitel-Modus wurde nicht gespeichert'
   );
-  emit({ type: 'transcript', sessionId: 'session-a', text: 'original', final: false, lane: 'source' });
+  emit({
+    type: 'transcript',
+    sessionId: 'session-a',
+    event: { kind: 'chunk', lane: 'source', text: 'original' }
+  });
   await sessionBarrier('session-a', 'barrier-source-visible');
   const forwarded = tabMessages.find(({ message }) => message.type === 'subtitle');
   assert.deepEqual(forwarded?.message, {
     type: 'subtitle',
-    text: 'original',
-    final: false,
-    lane: 'source'
+    event: { kind: 'chunk', lane: 'source', text: 'original' }
   });
 });
 
@@ -351,7 +406,11 @@ test('subtitle disable waits for an in-flight transcript before clearing', async
   reset();
   const releaseSubtitle = deferred<void>();
   subtitleSendGate = releaseSubtitle;
-  emit({ type: 'transcript', sessionId: 'session-a', text: 'noch sichtbar', final: false });
+  emit({
+    type: 'transcript',
+    sessionId: 'session-a',
+    event: { kind: 'chunk', lane: 'target', text: 'noch sichtbar' }
+  });
   await waitFor(
     () => tabMessages.some(({ message }) => message.type === 'subtitle'),
     'Untertitelversand startete nicht'
@@ -464,7 +523,11 @@ test('forwardTranscript rechecks the session after an asynchronous state read', 
   };
   sessionGetGate = gate;
 
-  emit({ type: 'transcript', sessionId: 'session-a', text: 'alt', final: false });
+  emit({
+    type: 'transcript',
+    sessionId: 'session-a',
+    event: { kind: 'chunk', lane: 'target', text: 'alt' }
+  });
   await waitFor(() => gate.started, 'Sitzungszustand wurde nicht gelesen');
   sessionStore.sessionState = runningState(1, 'session-b');
   release.resolve(undefined);
@@ -480,7 +543,11 @@ test('subtitle delivery and stop clearing are strictly ordered', async () => {
   subtitleSendGate = releaseSubtitle;
   clearSendGate = releaseClear;
 
-  emit({ type: 'transcript', sessionId: 'session-a', text: 'geordnet', final: false });
+  emit({
+    type: 'transcript',
+    sessionId: 'session-a',
+    event: { kind: 'chunk', lane: 'target', text: 'geordnet' }
+  });
   await waitFor(
     () => tabMessages.some(({ message }) => message.type === 'subtitle'),
     'Untertitelversand startete nicht'
@@ -504,7 +571,7 @@ test('subtitle delivery and stop clearing are strictly ordered', async () => {
   assert.deepEqual(await stopRequest, { ok: true });
   assert.deepEqual(
     tabMessages.map(({ message }) => message.type),
-    ['subtitle', 'subtitle-clear']
+    ['subtitle', 'media-input-stop', 'subtitle-clear']
   );
 });
 
@@ -512,7 +579,11 @@ test('a stale tab removal cannot stop a replacement session', async () => {
   reset();
   const releaseSubtitle = deferred<void>();
   subtitleSendGate = releaseSubtitle;
-  emit({ type: 'transcript', sessionId: 'session-a', text: 'blocker', final: false });
+  emit({
+    type: 'transcript',
+    sessionId: 'session-a',
+    event: { kind: 'chunk', lane: 'target', text: 'blocker' }
+  });
   await waitFor(
     () => tabMessages.some(({ message }) => message.type === 'subtitle'),
     'Session-Queue wurde nicht blockiert'
@@ -577,7 +648,11 @@ test('a stale completed-navigation event cannot touch a replacement session', as
   reset();
   const releaseSubtitle = deferred<void>();
   subtitleSendGate = releaseSubtitle;
-  emit({ type: 'transcript', sessionId: 'session-a', text: 'blocker', final: false });
+  emit({
+    type: 'transcript',
+    sessionId: 'session-a',
+    event: { kind: 'chunk', lane: 'target', text: 'blocker' }
+  });
   await waitFor(
     () => tabMessages.some(({ message }) => message.type === 'subtitle'),
     'Session-Queue wurde nicht blockiert'

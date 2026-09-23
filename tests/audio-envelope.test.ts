@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  GEMINI_FADE_IN_S,
-  GEMINI_INTERRUPT_FADE_S,
-  GEMINI_FADE_OUT_S,
+  TARGET_FADE_IN_S,
+  TARGET_INTERRUPT_FADE_S,
+  TARGET_FADE_OUT_S,
   SOURCE_DUCK_FADE_DOWN_S,
   SOURCE_DUCK_FADE_UP_S,
   SOURCE_FAIL_OPEN_S,
   applyCosineEdgeFades,
   cosineRamp,
-  fadeOutAudioParam
+  fadeOutAudioParam,
+  rampAudioParam
 } from '../src/offscreen/audio-envelope';
 
 test('source ducking uses a gentle asymmetric studio-style envelope', () => {
@@ -33,10 +34,10 @@ test('cosine ramp is monotone, exact, and eases both endpoints', () => {
   assert.ok(lastStep < middleStep / 10);
 });
 
-test('Gemini edge fades remove one-sample jumps without touching the phrase middle', () => {
-  assert.ok(GEMINI_FADE_IN_S >= 0.02 && GEMINI_FADE_IN_S <= 0.04);
-  assert.ok(GEMINI_FADE_OUT_S >= 0.02 && GEMINI_FADE_OUT_S <= 0.04);
-  assert.ok(GEMINI_INTERRUPT_FADE_S >= 0.04);
+test('Target-voice edge fades remove one-sample jumps without touching the phrase middle', () => {
+  assert.ok(TARGET_FADE_IN_S >= 0.02 && TARGET_FADE_IN_S <= 0.04);
+  assert.ok(TARGET_FADE_OUT_S >= 0.02 && TARGET_FADE_OUT_S <= 0.04);
+  assert.ok(TARGET_INTERRUPT_FADE_S >= 0.04);
   const samples = new Float32Array(1_000).fill(1);
   applyCosineEdgeFades(samples, 1_000, 0.1, 0.2);
 
@@ -50,7 +51,7 @@ test('Gemini edge fades remove one-sample jumps without touching the phrase midd
   }
 });
 
-test('future Gemini fade-out ramps from the held scheduled value', () => {
+test('future target-voice fade-out ramps from the held scheduled value', () => {
   const calls: Array<{ method: string; time: number; value?: number }> = [];
   const param = {
     cancelAndHoldAtTime: (time: number) => calls.push({ method: 'hold', time }),
@@ -63,4 +64,18 @@ test('future Gemini fade-out ramps from the held scheduled value', () => {
     { method: 'hold', time: 10.5 },
     { method: 'linear', time: 10.64, value: 0 }
   ]);
+});
+
+test('rapid mix retargeting never schedules overlapping value curves', () => {
+  const calls: string[] = [];
+  const param = {
+    value: 1,
+    cancelAndHoldAtTime() { calls.push('hold'); },
+    linearRampToValueAtTime() { calls.push('ramp'); },
+    setValueAtTime() { calls.push('set'); },
+    setValueCurveAtTime() { throw new Error('overlap'); }
+  } as unknown as AudioParam;
+  rampAudioParam(param, .28, 1, .22);
+  rampAudioParam(param, .6, 1.025, .22);
+  assert.deepEqual(calls, ['hold', 'ramp', 'hold', 'ramp']);
 });

@@ -18,7 +18,6 @@ const options = {
     popup: 'src/popup.ts',
     content: 'src/content.ts',
     offscreen: 'src/offscreen/main.ts',
-    worklet: 'src/offscreen/worklet.ts',
     'vad-worker': 'src/offscreen/vad-worker.ts',
     'vad-capture-worklet': 'src/offscreen/vad-capture-worklet.ts'
   },

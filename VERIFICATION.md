@@ -10,47 +10,56 @@ npm ci
 npm run check
 ```
 
-`npm run check` umfasst striktes TypeScript, alle Unit-/Integrationsprüfungen,
-den vollständigen MV3-Build und `npm audit --audit-level=moderate`. GitHub
+`npm run check` umfasst striktes TypeScript inklusive unbenutzter Symbole,
+TypeScript-ESLint, alle Unit-/Integrationsprüfungen mit mindestens 90 % Lines,
+75 % Branches und 80 % Functions, den vollständigen MV3-Build und
+`npm audit --audit-level=moderate`. GitHub
 Actions führt denselben Befehl bei Pushes und Pull Requests mit Node.js 24 aus.
 
 Die Tests decken unter anderem ab:
 
 - exakt 10 % Quellpegel während Sprache und exakt 100 % außerhalb – die
-  Gemini-Stimme läuft bewusst über den vollen Originalpegel weiter;
-- Stille-Gating: genau ein `audioStreamEnd` je Pause, kein Upload gegateter
-  Stille und nahtlose Fortsetzung beim ersten Ton;
-- die VAD-Presets, `echoTargetLanguage`, `speechConfig`-Stimme und das
-  Quell-Transkript im Setup beider Schema-Platzierungen;
-- präzise Schema-Fallbacks für abgelehnte Stimme und abgelehntes
-  Quell-Transkript, ohne den Output-Fallback fehlzutriggern;
+  Zielstimme läuft bewusst über den vollen Originalpegel weiter;
+- getrennte Source-/Target-Untertitel bei Partial, Complete, Late Chunk,
+  Interrupt, neuem Turn und der gemeinsamen Overlay-/Fullscreen-Darstellung;
+- GPT-Live-Protokoll: Session-Antwort-Parser (`session.id` + `transport.sdp`),
+  Event-Parser (`session.started`, `session.closed`, `error`,
+  `session.input_transcript.delta`, `session.output_transcript.delta`),
+  unveränderte Delta-Texte mit `start_ms`/`end_ms`, Endpoint-Builder und
+  Ignorieren unbekannter Events;
+- Server-Validierung: SDP-Pflicht und unveränderliches Handoff-JSON mit
+  Deutsch/`marin`, Responses-Delegation und Websuche;
+- Begrenzung und Verwerfung von Server-URL, Token, Stimme und Ausgabeoptionen;
+  wirkungslose Sprach-, Keyterm- und Echo-Einstellungen werden entfernt;
+- das Entfernen der abgelösten Provider-Keys (`grokKey`, `geminiKey`,
+  `deeplKey`, …) aus `chrome.storage.local`;
 - Weiterleitung der Quell-Transkriptspur ausschließlich im Dual-Modus;
-- Begrenzung und Verwerfung der neuen Sitzungsoptionen im Settings-Sanitizer;
-- fail-open bei VAD-, Gemini- und Netzfehlern;
-- 20-ms-Capture und modellspezifische 100-ms-Gemini-Chunks;
-- Setup-Preroll mit expliziter Sample-Bilanz;
-- Dual-Socket-GoAway-Handover mit eindeutiger Sample-Grenze, gepufferter FIFO
-  und gepulstem Backpressure-Drain ohne Doppelversand;
-- eine Obergrenze der Handoff-FIFO bei hängendem Kandidaten und den
-  fortgesetzten Uplink auf dem alten Socket zwischen Handover-Versuchen;
-- ein verkürzbares Drain-Fenster, wenn ein kürzerer Stop einen bereits
-  laufenden Drain überholt;
-- schnellen Abbruch mit API-Key-Hinweis, wenn schon das erste Setup
-  wiederholt abgelehnt wird;
-- gebündelte Server-Frames, deren Transkript-/Audiofelder neben Statusfeldern
-  erhalten bleiben;
+- AudioContext-Wiederaufnahme mit harter Zeitgrenze und verifiziertem
+  `running`-Endzustand statt endloser Resume-Schleife;
 - Verwerfen privilegierter Runtime-Nachrichten von Webseiten-Absendern;
-- Verwerfen alter Resumption-Tokens nach `resumable: false`;
-- getrennte Fallbacks für Transkript, Resumption und Kontextkompression;
-- Rest-PCM vor `audioStreamEnd` und einen festen, nicht als Server-Ack
-  missverstandenen Drain-Zeitraum beim Beenden;
-- Turn-Hüllkurven, Interruption und `generationComplete`;
 - idempotenten one-shot Tab-Capture-Start;
 - geordneten Stop, Session-Races und stale Output-Updates;
+- `session.close`-Finalisierung: Audio/Transport bleiben bis `session.closed`
+  erhalten; Timeout oder Disconnect werden ausdrücklich als unvollständig
+  gemeldet;
 - den Chrome-116-Offscreen-Fallback über `runtime.getContexts`;
 - harte `tabCapture`-Abbrüche mit Tab-/Session-Recheck;
 - Untertitel-Reparenting Body → Fullscreen-Container → Body;
 - lokale Silero-Modellintegrität und MV3-CSP.
+
+Coverage misst die importierten, testbaren Logikmodule einschließlich
+`live-protocol.ts`, `subtitle-state.ts`, `audio-context-state.ts` und
+`server/live-session.mjs`-Logik (über tsx-kompatible Pfade, wo importierbar).
+Ausgenommen sind die Browser-/Geräteadapter `content.ts`, `popup.ts`,
+`offscreen/main.ts`, `offscreen/live.ts` (WebRTC-Transport), die
+AudioWorklet-Dateien, `vad-worker.ts` und der rein DOM-basierte
+Popup-/Offscreen-Bootstrap; diese werden durch Build, statischen Audit und
+die Chrome-Abnahme geprüft.
+
+Der WebRTC-Transport (`live.ts`) besteht bewusst nur aus Verbindungsaufbau,
+Remote-Track-Anbindung und Event-Weiterleitung – jede Entscheidung liegt in
+den getesteten reinen Modulen. Abgenommen ist er erst mit dem Chrome-Lauf
+gegen die echte API.
 
 ## Vollvideo-Audit: SpaceX Critical Path
 
@@ -70,26 +79,20 @@ Referenz: [SpaceX – Critical Path](https://www.spacex.com/content/starship/cri
 
 Die Bereiche stammen aus zwei AAC-Encodings derselben offiziellen HLS-Spur.
 Geprüft wurden 3.853 hochkonfidente Wortkerne aus einer bereinigten
-Whisper-Large-v3-Turbo-Zeitreferenz. Eine zweite, unabhängige Transkriptmaske
-und sechs chronologische Abschnitte je Encoding bestätigten die Richtung; der
-Core-Recall stieg in allen zwölf Fold-Auswertungen um 0,133–0,509 Prozentpunkte.
-Whisper ist dabei keine menschliche Ground Truth. Fehlende VAD-Treffer bedeuten keinen Gemini-Verlust:
-Silero steuert nur den Original-Gain; der Gemini-Uplink wird nie durch VAD
-gegatet.
+Whisper-Large-v3-Turbo-Zeitreferenz. Whisper ist dabei keine menschliche
+Ground Truth. Fehlende VAD-Treffer bedeuten keinen Übersetzungsverlust:
+Silero steuert nur den Original-Gain; der WebRTC-Uplink läuft unabhängig.
 
 ## PCM-Sättigung
 
 Ein echter Chrome-`OfflineAudioContext`-Render des vollständigen Films bewies,
 dass `DynamicsCompressorNode` kein Brickwall-Limiter ist.
 
-| Gemini-Eingang | Peak nach 16 kHz | saturierte Samples | Sprachkern-RMS |
+| Modelleingang | Peak nach 16 kHz | saturierte Samples | Sprachkern-RMS |
 |---|---:|---:|---:|
 | früher, Makeup 6,8 | 1,442328 | 77.865 / 0,236752 % | −9,912 dBFS |
 | Makeup 4,0 | 1,247468 | 4.708 / 0,014315 % | −11,686 dBFS |
 | aktuell, Makeup 6,8 + Soft-Knee | 0,979714 | **0** | −9,957 dBFS |
-
-Der aktuelle Limiter entfernt damit die Sättigung bei nur 0,045 dB Differenz
-im Sprachkern.
 
 ## Ausgangsmix
 
@@ -110,26 +113,26 @@ programmatischer Subtitle-`TextTrack` im Modus `showing` und der erwartete
 laufende `VTTCue`. Damit bleiben Untertitel auch im nativen Vollbild des
 SpaceX-Players verfügbar.
 
-## Nicht automatisiert verifiziert
+## GPT-Live-Abnahme (manuell)
 
-- Das Ephemeral-Token-Minting (`auth_tokens`) läuft nur gegen die echte API;
-  Tokens verbinden über den `BidiGenerateContentConstrained`-Endpunkt. Lokal
-  getestet sind der Key-Fallback-Pfad und die Selbstheilung: Lehnt der Server
-  einen Token-Socket als „unregistered caller" ab (Code 1008), wechselt der
-  Client sofort und ohne Verbrauch des Reconnect-Budgets dauerhaft auf die
-  direkte Key-Anmeldung. Ein abgelehnter Key meldet sich beim Start sofort,
-  ein nicht erreichbarer Token-Endpunkt fällt still auf den Key zurück.
-- Ob `gemini-3.5-live-translate-preview` Prebuilt-Stimmen akzeptiert, ist in
-  der Doku nicht festgelegt; der Client sendet das Feld nur auf Wunsch und
-  verbindet bei Ablehnung automatisch ohne Stimme neu.
-- Das Experiment `rawModelAudio` ist bewusst unkalibriert: Es existiert, um
-  den Prosodie-Erhalt von Gemini 3.5 gegen die komprimierte Sprachpipeline
-  hörbar zu vergleichen, und ist deshalb kein Default.
+- `tests/probe-auth.mjs` prüft ohne Kontingent: Origin-Check, Token-Check,
+  Validierung (Erwartung 401/401/403/400).
+- Der frühere Smoke-Test wurde entfernt: HTTP 502 belegt keinen gültigen
+  OpenAI-Key und ersetzt keine erfolgreiche WebRTC-Sitzung.
+- Echter End-to-End-Lauf nur im Browser mit Mikrofon/Tab-Audio:
+  `session.started` abwarten, sprechen, `session.output_transcript.delta`
+  und Remote-Audio prüfen, mit `session.close` beenden und `session.closed`
+  mit finaler Usage abwarten.
+- Protokollnamen und Ablauf entsprechen der offiziellen OpenAI-Doku
+  (WebRTC + Managing sessions, Stand 2026): `POST /v1/live/sessions` mit
+  `session` + `transport: { type: "webrtc", sdp }`, Datenkanal `oai-events`,
+  kein `session.start` nach HTTP-Start, kein `audio.format` bei WebRTC.
 
 ## Ehrliche Grenze
 
 Transport, Clipping, Pegellogik und Lifecycle sind lokal deterministisch
-prüfbar. Die semantische Übersetzungsgenauigkeit und die serverseitige Latenz
-von `gemini-3.5-live-translate-preview` benötigen dagegen wiederholte echte
-Gemini-Läufe mit einer manuell geprüften englisch–Zielsprache-Referenz. Eine
-Behauptung „jedes Wort garantiert perfekt“ wäre ohne diese Ground Truth falsch.
+prüfbar. Die semantische Übersetzungsgenauigkeit und die tatsächliche
+Ende-zu-Ende-Latenz von GPT-Live benötigen wiederholte echte Läufe mit einer
+manuell geprüften englisch–Zielsprache-Referenz. Eine Behauptung „jedes Wort
+garantiert perfekt“ wäre ohne diese Ground Truth falsch. Die Abnahme im
+laufenden Video mit gemessener Ende-zu-Ende-Latenz steht aus.

@@ -4,9 +4,10 @@ import type {
   SessionSettings,
   SessionState,
   SubtitleMode,
-  TranscriptLane
+  TranscriptEvent
 } from './messages';
 import { sanitizeSettings } from './settings';
+import { validAudioSdp } from './local-audio-bridge';
 
 const EMPTY_STATE: SessionState = {
   running: false,
@@ -22,9 +23,11 @@ const EMPTY_STATE: SessionState = {
 let sessionEpoch = 0;
 let sessionOperation: Promise<void> = Promise.resolve();
 let transcriptQueue: Promise<void> = Promise.resolve();
+let voiceChangeRevision = 0;
 
 const OFFSCREEN_CLOSE_ATTEMPTS = 3;
 const OFFSCREEN_CLOSE_RETRY_MS = 50;
+let lastFinalizationError: string | null = null;
 
 void chrome.action.setBadgeBackgroundColor({ color: '#1a7f37' }).catch(() => {});
 
@@ -75,8 +78,11 @@ function broadcast(msg: Message): void {
 async function sendToOffscreen(msg: Message): Promise<void> {
   for (let attempt = 0; attempt < 20; attempt++) {
     try {
-      const response = (await chrome.runtime.sendMessage(msg)) as { ok?: boolean } | undefined;
-      if (response?.ok) return;
+      const response = (await chrome.runtime.sendMessage(msg)) as { ok?: boolean; finalizationError?: string | null } | undefined;
+      if (response?.ok) {
+        if (msg.type === 'offscreen-stop' && response.finalizationError) lastFinalizationError = response.finalizationError;
+        return;
+      }
     } catch {
       // Offscreen-Dokument (noch) nicht erreichbar.
     }
@@ -151,7 +157,7 @@ async function stopAndCloseOffscreenDocument(): Promise<void> {
 
   let lastError: unknown = null;
   try {
-    // Zuerst Audio, Capture, Worker und WebSocket im lebenden Dokument stoppen.
+    // Zuerst Audio, Capture, Worker und WebRTC im lebenden Dokument stoppen.
     // closeDocument bleibt danach die zweite, unabhängige Sicherheitsgrenze.
     await sendToOffscreen({ type: 'offscreen-stop' });
   } catch (error) {
@@ -159,6 +165,7 @@ async function stopAndCloseOffscreenDocument(): Promise<void> {
     // schließen; erfolgreich verifiziertes Schließen ist ebenfalls ein
     // vollständiger Stop.
     lastError = error;
+    lastFinalizationError = 'Audioverarbeitung nicht erreichbar: unvollständige Finalisierung.';
   }
 
   for (let attempt = 0; attempt < OFFSCREEN_CLOSE_ATTEMPTS; attempt++) {
@@ -195,6 +202,8 @@ async function startSession(
   const sessionId = crypto.randomUUID();
   try {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    const inputOffer = await chrome.tabs.sendMessage(tabId, { type: 'media-input-offer', sessionId })
+      .catch(() => null) as { sdp?: unknown } | null;
     await ensureOffscreenDocument();
     await chrome.storage.session.set({
       subtitlesEnabled: settings.subtitles,
@@ -219,18 +228,23 @@ async function startSession(
     // existiert und alle anderen asynchronen Startschritte abgeschlossen sind.
     // Chrome 116+ garantiert genau den Service-Worker→Offscreen-Transfer.
     const streamId = await getTabCaptureStreamId(tabId);
-    await sendToOffscreen({ type: 'offscreen-start', sessionId, streamId, settings });
+    await sendToOffscreen({ type: 'offscreen-start', sessionId, streamId, settings,
+      inputOffer: validAudioSdp(inputOffer?.sdp) ? inputOffer.sdp : undefined });
     return { ok: true };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     // Nur aufräumen, wenn nicht inzwischen bewusst gestoppt/neu gestartet wurde.
-    if (epoch === sessionEpoch) await stopSession(detail);
+    if (epoch === sessionEpoch) {
+      await chrome.tabs.sendMessage(tabId, { type: 'media-input-stop' }).catch(() => {});
+      await stopSession(detail);
+    }
     return { ok: false, error: detail };
   }
 }
 
 async function stopSession(error: string | null = null): Promise<void> {
   sessionEpoch++;
+  lastFinalizationError = null;
   const state = await getState();
   try {
     await stopAndCloseOffscreenDocument();
@@ -243,10 +257,12 @@ async function stopSession(error: string | null = null): Promise<void> {
     throw err;
   }
   if (state.tabId !== null) {
+    await chrome.tabs.sendMessage(state.tabId, { type: 'media-input-stop' }).catch(() => {});
     await chrome.tabs
       .sendMessage(state.tabId, { type: 'subtitle-clear' } satisfies Message)
       .catch(() => {});
   }
+  error ??= lastFinalizationError;
   await setState({
     running: false,
     tabId: null,
@@ -259,9 +275,7 @@ async function stopSession(error: string | null = null): Promise<void> {
 
 async function forwardTranscript(
   sessionId: string,
-  text: string,
-  final: boolean,
-  lane: TranscriptLane
+  event: TranscriptEvent
 ): Promise<void> {
   const observedState = await getState();
   if (
@@ -273,9 +287,8 @@ async function forwardTranscript(
   }
   const output = await getSubtitleOutput();
   if (!output.enabled) return;
-  // Das Quell-Transkript wird immer angefordert, aber nur im Dual-Modus
-  // angezeigt. So wirkt der Modus-Schalter sofort und ohne Reconnect.
-  if (lane === 'source' && output.mode !== 'dual') return;
+  // Both transcript lanes arrive continuously; visibility can change live.
+  if (event.lane === 'source' && output.mode !== 'dual') return;
   // Zwischen Zustandsprüfung und Versand kann eine Sitzung ersetzt worden
   // sein. Nur der weiterhin identische Tab und die identische Session dürfen
   // einen Untertitel erhalten.
@@ -291,7 +304,7 @@ async function forwardTranscript(
   // Das Senden wird bewusst abgewartet. Dadurch kann die serialisierte
   // Stop-Operation `subtitle-clear` garantiert erst danach zustellen.
   await chrome.tabs
-    .sendMessage(currentState.tabId, { type: 'subtitle', text, final, lane } satisfies Message)
+    .sendMessage(currentState.tabId, { type: 'subtitle', event } satisfies Message)
     .catch(() => {});
 }
 
@@ -342,14 +355,36 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
   // akzeptieren, niemals aus dem Renderer-Prozess einer Webseite.
   if (!isTrustedSender(sender)) return undefined;
   switch (msg.type) {
+    case 'offscreen-input-answer':
+      void getState().then(async state => {
+        if (state.running && state.sessionId === msg.sessionId && state.tabId !== null && validAudioSdp(msg.sdp)) {
+          await chrome.tabs.sendMessage(state.tabId, { type: 'media-input-answer', sessionId: msg.sessionId, sdp: msg.sdp });
+        }
+      }).catch(() => {});
+      break;
     case 'start-session':
+      voiceChangeRevision++;
       void enqueueSessionOperation(() =>
         startSession(msg.tabId, sanitizeSettings(msg.settings))
       ).then(sendResponse, (err) =>
         sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) })
       );
       return true;
+    case 'change-voice': {
+      const revision = ++voiceChangeRevision;
+      void enqueueSessionOperation(async () => {
+        if (revision !== voiceChangeRevision) return { ok: true };
+        const current = await getState();
+        if (revision !== voiceChangeRevision) return { ok: true };
+        if (!current.running || current.tabId === null) return { ok: true };
+        return startSession(current.tabId, sanitizeSettings(msg.settings));
+      }).then(sendResponse, (err) =>
+        sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) })
+      );
+      return true;
+    }
     case 'stop-session':
+      voiceChangeRevision++;
       void enqueueSessionOperation(() => stopSession()).then(
         () => sendResponse({ ok: true }),
         (err) => sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) })
@@ -369,9 +404,7 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
           enqueueSessionOperation(() =>
             forwardTranscript(
               msg.sessionId,
-              msg.text,
-              msg.final,
-              msg.lane === 'source' ? 'source' : 'target'
+              msg.event
             )
           )
         )
@@ -420,7 +453,8 @@ function parseDuckingTelemetry(value: unknown): SessionState['ducking'] {
         ? Math.min(1, Math.max(0, candidate.probability))
         : 0,
     error: typeof candidate.error === 'string' ? candidate.error : null,
-    translationReady: candidate.translationReady === true
+    translationReady: candidate.translationReady === true,
+    inputIndependent: candidate.inputIndependent === true
   };
 }
 

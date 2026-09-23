@@ -1,12 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Live Translate",
-  "version": "1.4.0",
-  "description": "Übersetzt englische Videos und Livestreams live mit Gemini – inklusive intelligenter Originalton-Absenkung.",
+  "version": "2.0.0",
+  "description": "Übersetzt englische Videos live über GPT-Live nach Deutsch.",
   "permissions": ["tabCapture", "offscreen", "storage", "activeTab", "scripting"],
-  "host_permissions": [
-    "https://generativelanguage.googleapis.com/*"
-  ],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "optional_host_permissions": ["https://*/*"],
   "minimum_chrome_version": "116",
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; object-src 'self'"

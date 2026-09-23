@@ -107,37 +107,3 @@ export class SpeechPreprocessor {
     return produced === count ? out : out.slice(0, produced);
   }
 }
-
-export function floatToInt16(input: Float32Array): Int16Array<ArrayBuffer> {
-  const out = new Int16Array(input.length);
-  for (let i = 0; i < input.length; i++) {
-    const sample = Math.max(-1, Math.min(1, input[i] ?? 0));
-    out[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-  }
-  return out;
-}
-
-export function int16ToFloat(input: Int16Array): Float32Array<ArrayBuffer> {
-  const out = new Float32Array(input.length);
-  for (let i = 0; i < input.length; i++) out[i] = (input[i] ?? 0) / 0x8000;
-  return out;
-}
-
-export function base64FromInt16(samples: Int16Array): string {
-  const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
-  let binary = '';
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
-}
-
-export function int16FromBase64(data: string): Int16Array<ArrayBuffer> {
-  const binary = atob(data);
-  // Auf gerade Bytezahl kürzen – ein halbes PCM16-Sample ist nicht dekodierbar.
-  const usable = binary.length - (binary.length % 2);
-  const bytes = new Uint8Array(usable);
-  for (let i = 0; i < usable; i++) bytes[i] = binary.charCodeAt(i);
-  return new Int16Array(bytes.buffer);
-}

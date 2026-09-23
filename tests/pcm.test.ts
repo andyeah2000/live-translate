@@ -1,22 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {
-  SpeechPreprocessor,
-  base64FromInt16,
-  floatToInt16,
-  int16FromBase64,
-  int16ToFloat
-} from '../src/offscreen/pcm';
-
-test('PCM16 conversion clamps input and round-trips bytes', () => {
-  const pcm = floatToInt16(new Float32Array([-2, -1, -0.5, 0, 0.5, 1, 2]));
-  assert.deepEqual(Array.from(pcm), [-32768, -32768, -16384, 0, 16383, 32767, 32767]);
-  assert.deepEqual(Array.from(int16FromBase64(base64FromInt16(pcm))), Array.from(pcm));
-
-  const floats = int16ToFloat(pcm);
-  assert.equal(floats[0], -1);
-  assert.ok((floats[5] ?? 0) < 1 && (floats[5] ?? 0) > 0.999);
-});
+import { SpeechPreprocessor } from '../src/offscreen/pcm';
 
 test('resampling is continuous across arbitrary chunk boundaries', () => {
   const input = Float32Array.from(

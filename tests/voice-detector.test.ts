@@ -1,41 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {
-  DUCKED_SOURCE_GAIN,
-  SpeechProbabilityDetector,
-  sourceDuckGain
-} from '../src/offscreen/voice-detector';
-
-test('no source speech always means exact 0 dB / 100% source audio', () => {
-  assert.equal(
-    sourceDuckGain({
-      sourceSpeaking: false,
-      translationReady: true
-    }),
-    1
-  );
-});
-
-test('source speech always applies the fixed ten-percent full-mix level', () => {
-  assert.equal(DUCKED_SOURCE_GAIN, 0.1);
-  assert.equal(
-    sourceDuckGain({
-      sourceSpeaking: true,
-      translationReady: true
-    }),
-    0.1
-  );
-});
-
-test('Gemini setup and reconnect are fail-open at exact 100% source audio', () => {
-  assert.equal(
-    sourceDuckGain({
-      sourceSpeaking: true,
-      translationReady: false
-    }),
-    1
-  );
-});
+import { SpeechProbabilityDetector } from '../src/offscreen/voice-detector';
 
 test('low Silero probabilities and invalid data never activate ducking', () => {
   const detector = new SpeechProbabilityDetector();

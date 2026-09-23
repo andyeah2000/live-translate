@@ -1,5 +1,5 @@
 import { isTrustedSender } from '../messages';
-import type { Message, OutputSettings, SessionSettings, TranscriptLane } from '../messages';
+import type { Message, OutputSettings, SessionSettings, TranscriptEvent } from '../messages';
 import {
   CONTROL_FADE_S,
   SOURCE_DUCK_FADE_DOWN_S,
@@ -7,57 +7,60 @@ import {
   SOURCE_FAIL_OPEN_S,
   rampAudioParam
 } from './audio-envelope';
-import { GeminiTranslator } from './gemini';
+import { resumeAudioContextWithTimeout } from './audio-context-state';
+import { GptLiveTranslator } from './live';
 import { NeuralVoiceDetector } from './neural-vad';
 import { belongsToActiveSession, shouldStartOffscreenSession } from './session-routing';
 import { createSoftLimiterCurve } from './soft-limiter';
-import { sourceDuckGain } from './voice-detector';
+import { dubbingSourceGain } from './dubbing-mix';
+import { gatherLocalDescription, validAudioSdp } from '../local-audio-bridge';
 
-// Dynamisches Ducking wird ausschließlich von Sprachaktivität im Quellton
-// gesteuert. Im vorgesehenen englischen Video bleiben Musik, Raketenklang und
-// Atmo bei 100 %, sobald niemand spricht – die zeitversetzte Gemini-Stimme
-// spricht bewusst über den vollen Originalpegel weiter. Während Quellsprache
-// sinkt der komplette Originalmix weich auf den unveränderlichen Zielpegel
-// von 10 %.
-//
-// Silero v6.2 analysiert lückenlos 32-ms-Frames lokal in einem Worker. Der Tick
-// überträgt nur den daraus abgeleiteten Zustand auf den Audio-Graphen.
-const TICK_MS = 50;
-const MANUAL_STOP_DRAIN_MS = 1_500;
+// Decode-driven sidechain: original audio is reduced only while German plays.
+const TICK_MS = 25;
+const MANUAL_STOP_DRAIN_MS = 15_000;
 // Ein resume() ohne Antwort darf die Sitzung nicht stumm weiterlaufen lassen.
 const RESUME_TIMEOUT_MS = 5_000;
-// Der einzige Gemini-Eingang ist immer sprachoptimiert: Rumpelfilter,
-// Kompression für leise Callouts und abschließender Limiter. Dieser Pfad ist
-// vom hörbaren Original vollständig getrennt.
-const SPEECH_MAKEUP_GAIN = 6.8;
 
 interface ActiveSession {
   sessionId: string;
   ctx: AudioContext;
   media: MediaStream;
+  inputPeer: RTCPeerConnection | null;
+  inputIndependent: boolean;
   captureTrack: MediaStreamTrack;
   sourceGain: GainNode;
   translatedGain: GainNode;
   vad: NeuralVoiceDetector;
-  client: GeminiTranslator;
+  client: TranslatorClient;
   tickTimer: number;
   translationVolume: number;
   lastDuckGain: number;
   lastTranslatedTarget: number;
+  lastAudioHealthKey: string | null;
   sourceSpeaking: boolean;
   resumePending: boolean;
   vadReady: boolean;
   vadProbability: number;
   vadError: string | null;
-  geminiReady: boolean;
+  providerReady: boolean;
+  translatedAudioEnabled: boolean;
+}
+
+interface TranslatorClient {
+  start(): Promise<void>;
+  finishInput(timeoutMs?: number): Promise<void>;
+  stop(): void;
+  audioHealth(): { attached: boolean; live: boolean; muted: boolean; signal: boolean };
 }
 
 let session: ActiveSession | null = null;
+let tickCount = 0;
 // Schützt gegen parallele Starts (z. B. wiederholte Start-Nachrichten):
 // Nur die jüngste start()-Ausführung darf eine Session anlegen.
 let startGeneration = 0;
 let pendingStartSessionId: string | null = null;
 let gracefulStopPromise: Promise<void> | null = null;
+let finalizationError: string | null = null;
 
 function send(msg: Message): void {
   void chrome.runtime.sendMessage(msg).catch(() => {});
@@ -85,16 +88,16 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
       return undefined;
     }
     pendingStartSessionId = msg.sessionId;
-    void start(msg.sessionId, msg.streamId, msg.settings).finally(() => {
+    void start(msg.sessionId, msg.streamId, msg.settings, msg.inputOffer).finally(() => {
       if (pendingStartSessionId === msg.sessionId) pendingStartSessionId = null;
     });
   } else if (msg.type === 'offscreen-stop') {
     void stopGracefully().then(
-      () => sendResponse({ ok: true }),
+      () => sendResponse({ ok: true, finalizationError }),
       (error) => {
         console.warn('[live-translate] Graceful Stop fehlgeschlagen:', error);
         stop();
-        sendResponse({ ok: true });
+        sendResponse({ ok: true, finalizationError: 'Sitzungsende fehlgeschlagen: unvollständige Finalisierung.' });
       }
     );
     return true;
@@ -107,11 +110,12 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
   return undefined;
 });
 
-async function start(sessionId: string, streamId: string, settings: SessionSettings): Promise<void> {
+async function start(sessionId: string, streamId: string, settings: SessionSettings, inputOffer?: string): Promise<void> {
   stop();
   const generation = ++startGeneration;
   let pendingMedia: MediaStream | null = null;
   let pendingContext: AudioContext | null = null;
+  let pendingInputPeer: RTCPeerConnection | null = null;
   try {
     const media = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -125,9 +129,9 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       return;
     }
 
-    const ctx = new AudioContext();
+    const ctx = new AudioContext({ latencyHint: 'interactive' });
     pendingContext = ctx;
-    if (ctx.state !== 'running') await ctx.resume();
+    if (ctx.state !== 'running') await resumeAudioContextWithTimeout(ctx, RESUME_TIMEOUT_MS);
     if (ctx.state !== 'running') {
       throw new Error(`Chrome konnte die Audio-Engine nicht starten (Status: ${ctx.state}).`);
     }
@@ -140,9 +144,30 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     const captureTrack = media.getAudioTracks()[0];
     if (!captureTrack) throw new Error('Der Tab-Audiostream enthält keine Audiospur.');
     const source = ctx.createMediaStreamSource(media);
+    let agentInput = media;
+    if (validAudioSdp(inputOffer)) {
+      const inputPeer = new RTCPeerConnection({ iceServers: [] });
+      pendingInputPeer = inputPeer;
+      const tracks: MediaStreamTrack[] = [];
+      inputPeer.ontrack = event => { if (event.track.kind === 'audio') tracks.push(event.track); };
+      await inputPeer.setRemoteDescription({ type: 'offer', sdp: inputOffer });
+      await inputPeer.setLocalDescription(await inputPeer.createAnswer());
+      const sdp = await gatherLocalDescription(inputPeer);
+      if (generation !== startGeneration) throw new Error('Start abgebrochen.');
+      if (!tracks.length) throw new Error('Direkter Videoeingang enthält keine Audiospur.');
+      agentInput = new MediaStream(tracks);
+      send({ type: 'offscreen-input-answer', sessionId, sdp });
+      inputPeer.onconnectionstatechange = () => {
+        if (session?.sessionId !== sessionId) return;
+        if (inputPeer.connectionState === 'failed' || inputPeer.connectionState === 'disconnected') {
+          stop();
+          send({ type: 'offscreen-error', sessionId, detail: 'Direkter Videoeingang unterbrochen. Bitte neu starten.' });
+        }
+      };
+    }
+    const analysisSource = agentInput === media ? source : ctx.createMediaStreamSource(agentInput);
 
-    // Ein hörbarer Originalpfad: unverändert bei Atmo, weich auf 10 % während
-    // Sprache. Kein Bypass, kein Modus, kein paralleler Umschaltpfad.
+    // Ein Originalpfad; der Sidechain folgt ausschließlich hörbarem Dubbing.
     // DynamicsCompressorNode besitzt in Chrome automatisches Makeup-Gain und
     // verfärbte deshalb selbst den vermeintlich unberührten Originalton. Beide
     // Pfade summieren direkt in diesen deterministischen Soft-Knee-Waveshaper:
@@ -156,39 +181,9 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     sourceGain.gain.value = 1;
     source.connect(sourceGain).connect(masterCeiling);
 
-    // Ein einziger, immer optimaler Gemini-Eingang. Der Hochpass entfernt nur
-    // unbrauchbares Rumpeln; Kompressor und Makeup normalisieren leise Sprache.
-    const modelHighpass = ctx.createBiquadFilter();
-    modelHighpass.type = 'highpass';
-    modelHighpass.frequency.value = 80;
-    modelHighpass.Q.value = 0.7;
-    source.connect(modelHighpass);
-    let modelSource: AudioNode = modelHighpass;
-    if (!settings.rawModelAudio) {
-      const speechCompressor = ctx.createDynamicsCompressor();
-      speechCompressor.threshold.value = -40;
-      speechCompressor.knee.value = 20;
-      speechCompressor.ratio.value = 3;
-      speechCompressor.attack.value = 0.005;
-      speechCompressor.release.value = 0.4;
-      const speechMakeup = ctx.createGain();
-      speechMakeup.gain.value = SPEECH_MAKEUP_GAIN;
-      const modelLimiter = ctx.createDynamicsCompressor();
-      modelLimiter.threshold.value = -3;
-      modelLimiter.knee.value = 4;
-      modelLimiter.ratio.value = 12;
-      modelLimiter.attack.value = 0.002;
-      modelLimiter.release.value = 0.12;
-      modelHighpass
-        .connect(speechCompressor)
-        .connect(speechMakeup)
-        .connect(modelLimiter);
-      modelSource = modelLimiter;
-    }
-    // Experiment `rawModelAudio`: Gemini 3.5 überträgt Intonation, Tempo und
-    // Tonhöhe des Sprechers. Der Rohpfad (nur Hochpass) erhält diese Dynamik
-    // vollständig; der Sample-Soft-Limiter im PCM-Pfad verhindert weiterhin
-    // jede Sättigung.
+    // GPT-Live verhandelt Audio direkt über WebRTC. Der Quelltrack bleibt daher
+    // unverändert; Resampling, PCM-Packaging und TTS-Playback im Extension-Code
+    // entfallen vollständig.
     // Die übersetzte Spur läuft immer mit dem kalibrierten Unity-Pegel und
     // bekommt einen live regelbaren Gain und einen Sicherheits-Limiter.
     const translatedInput = ctx.createGain();
@@ -202,23 +197,10 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     translatedLimiter.release.value = 0.15;
     translatedInput.connect(translatedGain).connect(translatedLimiter).connect(masterCeiling);
 
-    const clientOptions = {
-      apiKey: settings.geminiKey,
-      ctx,
-      modelSource,
-      outputNode: translatedInput,
-      targetLanguage: settings.targetLanguage,
-      setupOptions: {
-        echoTargetLanguage: settings.echoTargetLanguage,
-        speechMode: settings.speechMode,
-        voiceName: settings.voiceName || null,
-        // Das Quell-Transkript wird immer angefordert; ob es angezeigt wird,
-        // entscheidet der Untertitel-Modus live im Service Worker.
-        inputTranscriptionEnabled: true
-      },
-      onTranscript: (lane: TranscriptLane, text: string, final: boolean) => {
+    const commonCallbacks = {
+      onTranscript: (event: TranscriptEvent) => {
         if (session?.sessionId !== sessionId) return;
-        send({ type: 'transcript', sessionId, text, final, lane });
+        send({ type: 'transcript', sessionId, event });
       },
       onStatus: (status: string) => {
         if (session?.sessionId !== sessionId) return;
@@ -226,23 +208,33 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       },
       onReadyChange: (ready: boolean) => {
         if (session?.sessionId !== sessionId) return;
-        session.geminiReady = ready;
+        session.providerReady = ready;
         session.lastDuckGain = Number.NaN;
         tick();
         publishDuckingTelemetry(sessionId);
       },
-      canContinueWithoutTranscript: () => session?.sessionId === sessionId,
       onError: (detail: string) => {
-        console.error('[live-translate] Gemini-Fehler:', detail);
+        console.error('[live-translate] GPT-Live-Fehler:', detail);
         if (session?.sessionId !== sessionId) return;
         stop();
         send({ type: 'offscreen-error', sessionId, detail });
       }
     };
-    const client = new GeminiTranslator(clientOptions);
+    // Forward both transcript lanes; subtitle selection can change live.
+    const inputTranscriptionEnabled = true;
+    const client: TranslatorClient = new GptLiveTranslator({
+      ctx,
+      inputStream: agentInput,
+      outputNode: translatedInput,
+      serverUrl: settings.liveServerUrl,
+      serverToken: settings.liveServerToken,
+      voice: settings.liveVoice,
+      inputTranscriptionEnabled,
+      ...commonCallbacks
+    });
     const vad = new NeuralVoiceDetector({
       ctx,
-      source,
+      source: analysisSource,
       onSpeechChange: (speaking, probability) => {
         if (session?.sessionId !== sessionId) return;
         session.sourceSpeaking = speaking;
@@ -261,6 +253,8 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       sessionId,
       ctx,
       media,
+      inputPeer: pendingInputPeer,
+      inputIndependent: agentInput !== media,
       captureTrack,
       sourceGain,
       translatedGain,
@@ -276,15 +270,19 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       translationVolume: settings.translationVolume,
       lastDuckGain: Number.NaN,
       lastTranslatedTarget: settings.translationVolume,
+      lastAudioHealthKey: null,
       sourceSpeaking: false,
       resumePending: false,
       vadReady: false,
       vadProbability: 0,
       vadError: null,
-      geminiReady: false
+      providerReady: false,
+      // GPT-Live liefert den Zielton über den WebRTC-Remote-Track.
+      translatedAudioEnabled: true
     };
     pendingMedia = null;
     pendingContext = null;
+    pendingInputPeer = null;
     const handleCaptureEnded = () => {
       if (session?.sessionId !== sessionId) return;
       captureTrack.onended = null;
@@ -308,10 +306,10 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       handleCaptureEnded();
       return;
     }
-    // Gemini sofort starten; die schwere lokale Silero-Initialisierung darf
+    // Den gewählten Provider sofort starten; die schwere lokale Silero-Initialisierung darf
     // den Beginn des laufenden Videos nicht mehr blockieren.
     const [, vadError] = await Promise.all([
-      // Promise.all verwirft sofort, wenn Gemini nicht starten kann. Ein bis zu
+      // Promise.all verwirft sofort, wenn der Provider nicht starten kann. Ein bis zu
       // 20 s dauernder Silero-Start darf diesen Fehler nicht mehr verdecken.
       client.start(),
       vad.start().then(
@@ -332,6 +330,7 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       for (const track of pendingMedia.getTracks()) track.stop();
     }
     if (pendingContext) void pendingContext.close().catch(() => {});
+    pendingInputPeer?.close();
     if (generation === startGeneration) {
       stop();
       send({
@@ -352,7 +351,7 @@ function tick(): void {
   if (ctx.state === 'suspended' && !session.resumePending) {
     session.resumePending = true;
     const sessionId = session.sessionId;
-    void resumeWithTimeout(ctx, RESUME_TIMEOUT_MS)
+    void resumeAudioContextWithTimeout(ctx, RESUME_TIMEOUT_MS)
       .then(() => {
         if (session?.sessionId === sessionId) session.resumePending = false;
       })
@@ -367,17 +366,15 @@ function tick(): void {
       });
   }
 
-  const speaking = session.sourceSpeaking;
-
-  // Soll-Werte komplett aus dem aktuellen Zustand ableiten.
-  const duckGain = sourceDuckGain({
-    sourceSpeaking: speaking,
-    translationReady: session.geminiReady
-  });
+  const health = session.client.audioHealth();
+  const duckGain = dubbingSourceGain(session.sourceSpeaking, health.signal, session.translationVolume);
 
   if (duckGain !== session.lastDuckGain) {
     session.lastDuckGain = duckGain;
-    const failOpen = duckGain === 1 && (!session.geminiReady || session.vadError !== null);
+    publishDuckingTelemetry(session.sessionId);
+    const failOpen =
+      duckGain === 1 &&
+      (!session.providerReady || !session.translatedAudioEnabled || session.vadError !== null);
     rampParam(
       session.sourceGain.gain,
       duckGain,
@@ -393,25 +390,10 @@ function tick(): void {
     session.lastTranslatedTarget = session.translationVolume;
     rampParam(session.translatedGain.gain, session.translationVolume, ctx, CONTROL_FADE_S);
   }
-}
-
-function resumeWithTimeout(ctx: AudioContext, timeoutMs: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`Die Audio-Engine reagiert nicht (Status: ${ctx.state}).`)),
-      timeoutMs
-    );
-    ctx.resume().then(
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
-    );
-  });
+  tickCount++;
+  // Ton-Monitor alle 50 ms: meldet hörbar-vs-stumm als Popup-Status, damit ein
+  // fehlender Zielton ohne Devtools eingrenzbar ist. Nur bei Wechsel senden.
+  if (tickCount % 2 === 0) audioHealthCheck();
 }
 
 function rampParam(param: AudioParam, target: number, ctx: AudioContext, duration: number): void {
@@ -423,7 +405,42 @@ function rampParam(param: AudioParam, target: number, ctx: AudioContext, duratio
 function applyOutputSettings(settings: OutputSettings): void {
   if (!session) return;
   session.translationVolume = clamp01(settings.translationVolume, 1);
+  // Sofort neu bewerten, damit ein aufgedrehter Regler umgehend wirkt.
+  session.lastAudioHealthKey = null;
   tick();
+}
+
+/** Ton-Monitor: unterscheidet stummen Track, Gain 0 und laufenden Zielton. */
+function audioHealthCheck(): void {
+  if (!session || !session.providerReady) return;
+  const health = session.client.audioHealth();
+  let key: string;
+  let status: string | null;
+  if (!health.attached) {
+    // Meldet bereits der 10-s-Watchdog in live.ts.
+    key = 'none';
+    status = null;
+  } else if (session.translationVolume <= 0) {
+    key = 'volume-zero';
+    status = 'Zielton aus · Lautstärke steht auf 0 %';
+  } else if (!health.live) {
+    key = 'track-ended';
+    status = 'Zielstimme abgebrochen · bitte neu starten';
+  } else if (health.muted) {
+    key = 'track-muted';
+    status = 'Zielstimme verbunden, liefert aber keinen Ton';
+  } else if (!health.signal) {
+    key = 'waiting-for-speech';
+    status = 'Verbunden · warte auf deutsche Sprachausgabe';
+  } else {
+    key = 'ok';
+    status = 'Deutsche Sprachausgabe · Audiopegel gemessen';
+  }
+  if (key === session.lastAudioHealthKey) return;
+  session.lastAudioHealthKey = key;
+  if (status !== null) {
+    send({ type: 'offscreen-status', sessionId: session.sessionId, status: withDuckingWarning(status) });
+  }
 }
 
 function clamp01(value: number, fallback: number): number {
@@ -431,7 +448,7 @@ function clamp01(value: number, fallback: number): number {
 }
 
 function withDuckingWarning(status: string): string {
-  return session?.vadError ? `${status} · Ducking aus (Original 100 %)` : status;
+  return session?.vadError ? `${status} · vereinfachter Audiomix` : status;
 }
 
 function handleVadFailure(sessionId: string, detail: string): void {
@@ -448,16 +465,13 @@ function handleVadFailure(sessionId: string, detail: string): void {
   send({
     type: 'offscreen-status',
     sessionId,
-    status: 'Ducking nicht verfügbar · Original bleibt bei 100 %'
+    status: 'Spracherkennung nicht verfügbar · Audiomix bleibt aktiv'
   });
 }
 
 function publishDuckingTelemetry(sessionId: string): void {
   if (session?.sessionId !== sessionId) return;
-  const sourceGain = sourceDuckGain({
-    sourceSpeaking: session.sourceSpeaking,
-    translationReady: session.geminiReady
-  });
+  const sourceGain = Number.isFinite(session.lastDuckGain) ? session.lastDuckGain : 1;
   send({
     type: 'ducking-telemetry',
     sessionId,
@@ -467,7 +481,8 @@ function publishDuckingTelemetry(sessionId: string): void {
       sourceGain,
       probability: session.vadProbability,
       error: session.vadError,
-      translationReady: session.geminiReady
+      translationReady: session.providerReady,
+      inputIndependent: session.inputIndependent
     }
   });
 }
@@ -475,10 +490,11 @@ function publishDuckingTelemetry(sessionId: string): void {
 function stop(): void {
   startGeneration++;
   if (!session) return;
-  const { client, vad, media, captureTrack, ctx, tickTimer } = session;
+  const { client, vad, media, inputPeer, captureTrack, ctx, tickTimer } = session;
   session = null;
   clearInterval(tickTimer);
   captureTrack.onended = null;
+  inputPeer?.close();
   try {
     vad.stop();
   } catch (err) {
@@ -487,7 +503,7 @@ function stop(): void {
   try {
     client.stop();
   } catch (err) {
-    console.warn('[live-translate] Gemini konnte nicht sauber gestoppt werden:', err);
+    console.warn('[live-translate] Übersetzungsclient konnte nicht sauber gestoppt werden:', err);
   }
   for (const track of media.getTracks()) track.stop();
   void ctx.close().catch(() => {});
@@ -501,10 +517,12 @@ function stopGracefully(): Promise<void> {
     return Promise.resolve();
   }
   active.captureTrack.onended = null;
+  finalizationError = null;
   const sessionId = active.sessionId;
   gracefulStopPromise = active.client
     .finishInput(MANUAL_STOP_DRAIN_MS)
     .catch((error) => {
+      finalizationError = error instanceof Error ? error.message : String(error);
       console.warn('[live-translate] Audio-Ende wurde per Timeout beendet:', error);
     })
     .then(() => {

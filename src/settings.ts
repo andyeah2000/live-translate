@@ -1,55 +1,23 @@
-import type { SessionSettings, SpeechMode, SubtitleMode } from './messages';
+import type { SessionSettings, SubtitleMode } from './messages';
 
-const TARGET_LANGUAGES = new Set([
-  'de',
-  'en',
-  'es',
-  'fr',
-  'it',
-  'pt-BR',
-  'pt-PT',
-  'nl',
-  'pl',
-  'tr',
-  'ru',
-  'uk',
-  'ja',
-  'ko',
-  'zh-Hans',
-  'zh-Hant',
-  'hi',
-  'ar'
-]);
-/**
- * Prebuilt-Stimmen der Live API. Ob das Translate-Modell sie akzeptiert,
- * entscheidet der Server; der Client fällt bei Ablehnung automatisch auf die
- * Standardstimme zurück.
- */
-export const VOICE_NAMES = new Set([
-  'Puck',
-  'Charon',
-  'Kore',
-  'Fenrir',
-  'Aoede',
-  'Leda',
-  'Orus',
-  'Zephyr'
+/** GPT-Live-Stimmen aus der offiziellen OpenAI-Dokumentation. */
+export const VOICE_IDS = new Set([
+  'marin', 'quartz', 'ripple', 'vesper', 'willow', 'stone', 'gleam', 'meridian',
+  'bossa', 'tempo', 'beacon', 'delta', 'cinder'
 ]);
 
 const SUBTITLE_MODES = new Set<SubtitleMode>(['translation', 'dual']);
-const SPEECH_MODES = new Set<SpeechMode>(['lecture', 'dialog']);
+const MAX_SERVER_TOKEN_LENGTH = 1_024;
+const DEFAULT_SERVER_URL = 'http://127.0.0.1:8787';
 
 export const DEFAULT_SETTINGS: SessionSettings = {
-  settingsVersion: 8,
-  geminiKey: '',
-  targetLanguage: 'de',
+  settingsVersion: 11,
+  liveServerUrl: DEFAULT_SERVER_URL,
+  liveServerToken: '',
+  liveVoice: 'meridian',
   subtitles: true,
   subtitleMode: 'translation',
   translationVolume: 1,
-  echoTargetLanguage: false,
-  speechMode: 'lecture',
-  voiceName: '',
-  rawModelAudio: false
 };
 
 const CANONICAL_SETTING_KEYS = new Set(Object.keys(DEFAULT_SETTINGS));
@@ -68,60 +36,47 @@ function volumeValue(value: unknown, fallback: number): number {
     : fallback;
 }
 
-function languageValue(value: unknown, allowed: Set<string>, fallback: string): string {
-  // Migration der vor 0.3 gespeicherten, generischen Sprachcodes auf von
-  // Gemini Live Translate explizit unterstützte BCP-47-Codes.
-  const migrated = value === 'pt' ? 'pt-BR' : value === 'zh' ? 'zh-Hans' : value;
-  return typeof migrated === 'string' && allowed.has(migrated) ? migrated : fallback;
+function serverUrlValue(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback;
+  try {
+    const url = new URL(value.trim());
+    const localHttp =
+      url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost');
+    if (url.protocol !== 'https:' && !localHttp) return fallback;
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return fallback;
+  }
 }
 
 function enumValue<T extends string>(value: unknown, allowed: Set<T>, fallback: T): T {
   return typeof value === 'string' && allowed.has(value as T) ? (value as T) : fallback;
 }
 
-function voiceValue(value: unknown): string {
-  return typeof value === 'string' && VOICE_NAMES.has(value) ? value : '';
-}
-
-/**
- * Storage ist eine dauerhafte Versionsgrenze: alte Extension-Versionen,
- * manuelle DevTools-Änderungen oder Sync-Tools können beliebige Werte
- * hinterlassen. Deshalb wird jeder geladene Wert validiert und begrenzt.
- */
+/** Jede geladene Browser-Einstellung wird auf die GPT-Live-Grenze reduziert. */
 export function sanitizeSettings(value: unknown): SessionSettings {
   const candidate = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
   return {
     settingsVersion: DEFAULT_SETTINGS.settingsVersion,
-    geminiKey: stringValue(candidate.geminiKey, '').trim(),
-    targetLanguage: languageValue(
-      candidate.targetLanguage,
-      TARGET_LANGUAGES,
-      DEFAULT_SETTINGS.targetLanguage
-    ),
+    liveServerUrl: serverUrlValue(candidate.liveServerUrl, DEFAULT_SETTINGS.liveServerUrl),
+    liveServerToken: stringValue(candidate.liveServerToken, '')
+      .trim()
+      .slice(0, MAX_SERVER_TOKEN_LENGTH),
+    liveVoice: enumValue(candidate.liveVoice, VOICE_IDS, DEFAULT_SETTINGS.liveVoice),
     subtitles: booleanValue(candidate.subtitles, DEFAULT_SETTINGS.subtitles),
     subtitleMode: enumValue(candidate.subtitleMode, SUBTITLE_MODES, DEFAULT_SETTINGS.subtitleMode),
-    translationVolume: volumeValue(
-      candidate.translationVolume,
-      DEFAULT_SETTINGS.translationVolume
-    ),
-    echoTargetLanguage: booleanValue(
-      candidate.echoTargetLanguage,
-      DEFAULT_SETTINGS.echoTargetLanguage
-    ),
-    speechMode: enumValue(candidate.speechMode, SPEECH_MODES, DEFAULT_SETTINGS.speechMode),
-    voiceName: voiceValue(candidate.voiceName),
-    rawModelAudio: booleanValue(candidate.rawModelAudio, DEFAULT_SETTINGS.rawModelAudio)
+    translationVolume: volumeValue(candidate.translationVolume, DEFAULT_SETTINGS.translationVolume)
   };
 }
 
 export async function loadSettings(): Promise<SessionSettings> {
-  // Ohne Default-Objekt laden, damit eine fehlende Versionsnummer zuverlässig
-  // als Altbestand erkennbar bleibt.
   const stored = await chrome.storage.local.get(null);
   const settings = sanitizeSettings(stored);
-  // Immer kanonisch zurückschreiben und ausnahmslos jeden unbekannten Schlüssel
-  // entfernen. So existiert im Storage exakt eine Gemini-Pipeline und kein
-  // historischer Konfigurations- oder Secret-Rest.
+  // Remove obsolete credentials and options; retain only current controls.
   await chrome.storage.local.set(settings);
   const unknownKeys = Object.keys(stored).filter((key) => !CANONICAL_SETTING_KEYS.has(key));
   if (unknownKeys.length > 0) await chrome.storage.local.remove(unknownKeys);
@@ -132,8 +87,6 @@ let saveQueue: Promise<void> = Promise.resolve();
 
 export function saveSettings(settings: SessionSettings): Promise<void> {
   const sanitized = sanitizeSettings(settings);
-  // Popup-Start und ein unmittelbar davor ausgelöstes Change-Event können
-  // gleichzeitig speichern. Serialisierung hält die neueste Eingabe stabil.
   saveQueue = saveQueue.catch(() => {}).then(() => chrome.storage.local.set(sanitized));
   return saveQueue;
 }

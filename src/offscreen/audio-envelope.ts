@@ -8,11 +8,11 @@ export const SOURCE_DUCK_FADE_UP_S = 0.7;
 export const SOURCE_FAIL_OPEN_S = 0.1;
 export const CONTROL_FADE_S = 0.12;
 
-/** Gemini wird pro zusammenhängendem Sprach-Turn ein- und ausgeblendet. */
-export const GEMINI_FADE_IN_S = 0.025;
-export const GEMINI_FADE_OUT_S = 0.03;
-export const GEMINI_INTERRUPT_FADE_S = 0.06;
-export const GEMINI_EDGE_DECLICK_S = 0.005;
+/** Die Zielstimme wird pro zusammenhängendem Sprach-Turn ein- und ausgeblendet. */
+export const TARGET_FADE_IN_S = 0.025;
+export const TARGET_FADE_OUT_S = 0.03;
+export const TARGET_INTERRUPT_FADE_S = 0.06;
+export const TARGET_EDGE_DECLICK_S = 0.005;
 
 const DEFAULT_CURVE_POINTS = 64;
 
@@ -35,7 +35,7 @@ export function cosineRamp(
   return curve;
 }
 
-/** Plant eine unterbrechbare S-Curve ab der aktuellen Param-Position. */
+/** Interruptible ramps avoid overlapping setValueCurve schedules in Chrome. */
 export function rampAudioParam(
   param: AudioParam,
   target: number,
@@ -48,7 +48,7 @@ export function rampAudioParam(
     param.setValueAtTime(target, startTime);
     return;
   }
-  param.setValueCurveAtTime(cosineRamp(current, target), startTime, duration);
+  param.linearRampToValueAtTime(target, startTime + duration);
 }
 
 /**
@@ -67,7 +67,7 @@ export function fadeOutAudioParam(param: AudioParam, startTime: number, endTime:
 }
 
 /**
- * Glättet nur die äußeren Kanten eines kompletten Gemini-Sprach-Turns. Die
+ * Glättet nur die äußeren Kanten eines kompletten Ziel-Sprach-Turns. Die
  * inneren Netzwerk-Chunks bleiben unangetastet und damit lückenlos.
  */
 export function applyCosineEdgeFades(

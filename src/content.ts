@@ -1,26 +1,22 @@
-import type { Message, TranscriptLane } from './messages';
+import type { Message, TranscriptEvent } from './messages';
 import { placeSubtitleHost, subtitleOverlayTarget } from './subtitle-placement';
+import { SubtitleState } from './subtitle-state';
+import { installMediaInput } from './media-input';
 
 const flagged = window as unknown as { __liveTranslateLoaded?: boolean };
 if (!flagged.__liveTranslateLoaded) {
   flagged.__liveTranslateLoaded = true;
   setup();
+  installMediaInput();
 }
 
 function setup(): void {
-  const MAX_LINE_LENGTH = 140;
-  const SEGMENT_GAP_MS = 2500;
   const HIDE_AFTER_MS = 5000;
 
   let host: HTMLDivElement | null = null;
   let previousLineEl: HTMLDivElement | null = null;
   let currentLineEl: HTMLDivElement | null = null;
-  let previousText = '';
-  let currentText = '';
-  // Dual-Modus: Das Original läuft als eigene Zeile über der Übersetzung mit.
-  let sourceText = '';
-  let lastSourceUpdate = 0;
-  let lastUpdate = 0;
+  const subtitleState = new SubtitleState();
   let hideTimer: number | undefined;
   let nativeVideo: HTMLVideoElement | null = null;
   let nativeTrack: TextTrack | null = null;
@@ -70,7 +66,8 @@ function setup(): void {
       nativeTrack.mode = 'showing';
     }
     clearNativeCue();
-    const text = [sourceText || previousText, currentText].filter(Boolean).join('\n').trim();
+    const snapshot = subtitleState.snapshot();
+    const text = [snapshot.upper, snapshot.lower].filter(Boolean).join('\n').trim();
     if (!text) return true;
     const now = Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : 0;
     const cue = new VTTCue(Math.max(0, now - 0.1), now + HIDE_AFTER_MS / 1_000, escapeVttText(text));
@@ -143,17 +140,10 @@ function setup(): void {
     }
     clearNativeTrack();
     ensureOverlay();
-    // Im Dual-Modus zeigt die obere Zeile das live mitlaufende Original;
-    // sonst wie gehabt den zuletzt abgeschlossenen Übersetzungssatz.
-    if (previousLineEl) previousLineEl.textContent = sourceText || previousText;
-    if (currentLineEl) currentLineEl.textContent = currentText;
+    const snapshot = subtitleState.snapshot();
+    if (previousLineEl) previousLineEl.textContent = snapshot.upper;
+    if (currentLineEl) currentLineEl.textContent = snapshot.lower;
     if (host) host.style.opacity = '1';
-  }
-
-  function finalizeSegment(): void {
-    const trimmed = currentText.trim();
-    if (trimmed) previousText = trimmed;
-    currentText = '';
   }
 
   function scheduleHide(): void {
@@ -161,54 +151,12 @@ function setup(): void {
     hideTimer = window.setTimeout(() => {
       if (host) host.style.opacity = '0';
       clearNativeCue();
-      finalizeSegment();
-      sourceText = '';
+      subtitleState.hide();
     }, HIDE_AFTER_MS);
   }
 
-  // Hält die aktuelle Zeile auch bei einem einzelnen langen Transkript-Chunk
-  // begrenzt: Der Anfang wandert an einer Wortgrenze in die vorherige Zeile,
-  // der Rest läuft als aktuelle Zeile weiter.
-  function rotateOverlongLine(): void {
-    while (currentText.length > MAX_LINE_LENGTH) {
-      const boundary = currentText.lastIndexOf(' ', MAX_LINE_LENGTH);
-      const cut = boundary > 0 ? boundary : MAX_LINE_LENGTH;
-      const head = currentText.slice(0, cut).trim();
-      if (head) previousText = head;
-      currentText = currentText.slice(cut).trimStart();
-    }
-  }
-
-  // Das Original behält nur das frischeste Zeilenende – ältere Wörter laufen
-  // an einer Wortgrenze hinaus, damit die Zeile mit dem Sprecher Schritt hält.
-  function trimOverlongSource(): void {
-    if (sourceText.length <= MAX_LINE_LENGTH) return;
-    const cutFrom = sourceText.length - MAX_LINE_LENGTH;
-    const boundary = sourceText.indexOf(' ', cutFrom);
-    sourceText = sourceText.slice(boundary > -1 ? boundary + 1 : cutFrom).trimStart();
-  }
-
-  function appendSourceSubtitle(text: string): void {
-    const now = Date.now();
-    if (sourceText && now - lastSourceUpdate > SEGMENT_GAP_MS) sourceText = '';
-    lastSourceUpdate = now;
-    sourceText += text;
-    trimOverlongSource();
-    render();
-    scheduleHide();
-  }
-
-  function appendSubtitle(text: string, final: boolean, lane: TranscriptLane): void {
-    if (lane === 'source') {
-      appendSourceSubtitle(text);
-      return;
-    }
-    const now = Date.now();
-    if (currentText && now - lastUpdate > SEGMENT_GAP_MS) finalizeSegment();
-    lastUpdate = now;
-    currentText += text;
-    rotateOverlongLine();
-    if (final) finalizeSegment();
+  function applySubtitle(event: TranscriptEvent): void {
+    subtitleState.apply(event);
     render();
     scheduleHide();
   }
@@ -219,15 +167,13 @@ function setup(): void {
     host = null;
     previousLineEl = null;
     currentLineEl = null;
-    previousText = '';
-    currentText = '';
-    sourceText = '';
+    subtitleState.clear();
     clearNativeTrack();
   }
 
   const onMessage = (msg: Message) => {
     if (msg.type === 'subtitle') {
-      appendSubtitle(msg.text, msg.final, msg.lane === 'source' ? 'source' : 'target');
+      applySubtitle(msg.event);
     } else if (msg.type === 'subtitle-clear') clear();
   };
   chrome.runtime.onMessage.addListener(onMessage);

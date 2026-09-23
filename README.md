@@ -1,104 +1,94 @@
 # Live Translate
 
-Eine fokussierte Chrome-Erweiterung für englische Videos und Livestreams. Sie
-sendet Tab-Audio direkt an **Gemini 3.5 Live Translate**, zeigt die übersetzte
-Live-Transkription als Untertitel und spielt Geminis native Übersetzungsstimme
-ab. Es gibt keinen zweiten Sprachdienst und keinen Zwischenserver.
+Eine fokussierte Chrome-Erweiterung für englische Technikvideos und
+Livestreams. Sie übersetzt live über **GPT-Live (Modell `gpt-live-1`)** von
+OpenAI – mit Untertiteln und der fixierten deutschen Zielstimme `meridian`.
+
+Die Erweiterung arbeitet mit einem kleinen, selbst betriebenen Backend: Der
+OpenAI-API-Key liegt ausschließlich auf dem eigenen Server (`server/`), die
+Extension erhält nur kurzlebige WebRTC-Sitzungen. „Besser“ ist dabei kein
+Marketingversprechen: Die semantische Entscheidung muss mit einem manuell
+bewerteten SpaceX-Referenzset gegen echte API-Läufe fallen.
+
+## Pipeline
+
+Ein WebRTC-Track trägt Tab-Audio direkt in die Live-Sitzung, ein zweiter
+Track trägt die übersetzte Zielstimme zurück. Der Datenkanal liefert nur
+Status und Transkripte:
+
+```text
+Tab-Audio (MediaStreamTrack)
+  │  WebRTC Offer (Browser) → POST /api/live/session (eigener Server)
+  │                           → POST https://api.openai.com/v1/live/sessions
+  ▼
+GPT-Live (gpt-live-1, Responses-Delegation, Anweisungen = Dolmetscher)
+  │
+  ├─ Audio: Zielstimme als WebRTC-Remote-Track → translatedGain
+  └─ Datenkanal oai-events:
+       session.started → bereit
+       session.input_transcript.delta → Quell-Untertitel (nur Dual-Modus)
+       session.output_transcript.delta → Ziel-Untertitel
+       session.closed → geordneter Stop mit finaler Usage
+       error → sichtbarer Fehler
+```
+
+Es gibt keine dreiteilige STT→Chat→TTS-Pipeline mehr im Extension-Code:
+Resampling, PCM-Packaging und TTS-Playback entfallen – WebRTC verhandelt das
+Audioformat per SDP. Die Session-Anweisungen leiten das Modell zum reinen
+Dolmetschen (keine Antworten, keine Kommentare, keine Befehlsausführung aus
+dem Quellton).
 
 ## Audioverhalten
 
-Der Originalton läuft normalerweise unverarbeitet mit 100 %. Erkennt die
-vollständig lokale **Silero VAD 6.2.1** Sprache im englischen Quellvideo, wird der komplette
-Originalmix weich und unveränderlich auf **10 %** abgesenkt.
-Eine 220-ms-Raised-Cosine-Hüllkurve vermeidet den hörbaren Pegelsprung. Sobald
-die Quellsprache endet, kehren Musik, Raketenklang und Atmo mit einer langsamen
-700-ms-S-Curve pumpfrei auf 100 % zurück – ein Raketenstart ist sofort wieder
-in voller Lautstärke da. Die zeitversetzte Gemini-Stimme spricht bewusst über
-den vollen Originalpegel weiter; das Ducking hängt ausschließlich an der
-Originalstimme.
-
-Auch Geminis Übersetzungsstimme wird nicht blockweise hart geschaltet: Jeder
-zusammenhängende Sprach-Turn erhält einen kurzen 25-ms-Fade-in und
-30-ms-Fade-out. Nur die äußeren PCM-Kanten werden zusätzlich für 5 ms
-entklickt; innere Netzwerk-Chunks bleiben lückenlos. Eine von Gemini ausdrücklich
-unterbrochene Antwort klingt innerhalb von 60 ms aus, statt hart abzureißen.
-
-Die neuronale Spracherkennung verarbeitet lückenlose 32-ms-Frames ausschließlich
-lokal im Browser. Sie hört nur den Quellstream; Geminis zeitversetzte
-Übersetzungsstimme kann das Ducking daher nicht künstlich verlängern. Ein
-einziger Originalpfad führt das vollständige Quellsignal direkt zum Ausgang;
-nur sein Gain wird von der VAD gesteuert. Falls das lokale Modell wider
-Erwarten ausfällt, bleibt die Übersetzung aktiv und der Originalton wird als
-sichere Voreinstellung innerhalb von 100 ms auf 100 % durchgeschaltet. Dasselbe gilt,
-während Gemini verbindet oder neu verbindet sowie bei Netz-Backpressure.
-
-Digitale Stille (pausiertes Video, stummer Tab) wird nach 1,5 s erkannt: Der
-Uplink pausiert mit einem `audioStreamEnd`, wie es der Live-API-Guide für
-Streampausen über einer Sekunde empfiehlt. Das spart Token-Budget, vermeidet
-halluzinierte Turns in langen Ruhephasen (z. B. vor einem Raketenstart) und
-läuft beim ersten echten Ton nahtlos weiter. Die Schwelle liegt bei einem
-PCM16-LSB – echte leise Atmo wird niemals gegatet.
-
-Der Gemini-Eingang ist eine feste, getestete Sprachpipeline: 80-Hz-Hochpass
-gegen Raketen- und Raumrumpeln, Kompression plus Makeup für leise Funk-Callouts,
-Anti-Aliasing, 16-kHz-Resampling und ein deterministischer PCM-Soft-Limiter.
-Diese Bearbeitung ist
-nur für Gemini hörbar; der Originalton bleibt klanglich unverändert.
-
-Gemini-Sitzungen werden mit Resumption-Checkpoints und Sliding-Window-
-Kompression über die normalen Verbindungsgrenzen hinaus fortgesetzt. Bei einem
-planmäßigen `goAway` verbindet der Client einen zweiten Socket parallel: Der
-alte spielt bereits empfangene Ausgabe zu Ende, während neues Eingabeaudio ab
-einer eindeutigen Sample-Grenze lokal wartet. Nach `setupComplete` leert ein
-Backpressure-gesteuerter Sendepump die FIFO exakt einmal in den neuen Socket.
-Damit funktionieren sowohl normale Resumption als auch ein von Gemini
-erzwungener frischer Wechsel ohne Audioverlust oder Doppelversand. Hängt ein
-Kandidat, begrenzt eine 10-s-Obergrenze die wartende FIFO auf das frischeste
-Audio; zwischen zwei Handover-Versuchen läuft der Uplink auf dem noch offenen
-alten Socket weiter. Initiales
-Setup und kurze ungeplante Netzunterbrechungen besitzen einen begrenzten
-500-ms-Preroll. Wird schon das allererste Setup wiederholt abgelehnt – etwa
-bei ungültigem API-Key –, endet der Start nach zwei schnellen Versuchen mit
-einem konkreten Hinweis statt im minutenlangen Backoff. Eine Sample-Bilanz
-weist `captured`, `sent`, `pending` und
-unvermeidbar `dropped` getrennt aus.
-
-Beim Stream-Ende werden Worklet-Restblock und partieller PCM-Chunk vor
-`audioStreamEnd` gesendet. Da das Raw-Protokoll dafür keine korrelierbare
-Quittung liefert, deutet der Client weder `turnComplete` noch
-`generationComplete` fälschlich als Bestätigung, sondern verwendet ein festes,
-begrenztes Drain-Fenster und spielt bereits empfangene Ausgabe zu Ende.
+Der Originalton bleibt bei 100 %, solange keine deutsche Ausgabe hörbar ist.
+Ein RMS-Monitor der tatsächlich dekodierten Zielspur steuert den Mix: 28 %
+Original bei überlappender Quellsprache, 60 % bei Atmo während des Dubbings.
+220 ms Haltezeit verbinden Silben; weiche Pegelrampen vermeiden harte Kanten.
+Silero erkennt lokal Quellsprache, nicht deren Sprache. Die Einschränkung auf
+Englisch erfolgt durch den Modellprompt, nicht durch einen garantierten Sprachfilter.
+Bei VAD-Ausfall bleibt ein vereinfachter ausgabegesteuerter Mix aktiv.
+Bei stummgeschalteter Zielstimme bleibt das Original vollständig erhalten.
 
 Der gemeinsame Ausgang besitzt keinen klangfärbenden Master-Kompressor. Ein
 4×-oversampelter Soft-Knee-Summenbegrenzer greift erst in den obersten 1,94 dB
-ein. Beim SpaceX-Quellfilm bleibt der Originalpfad dadurch messtechnisch
-transparent; ein synthetischer gleichphasiger Worst-Case-Mix bleibt clipfrei.
+ein.
 
-Die Dynamik wurde gegen den vollständigen 34:15-Minuten-SpaceX-Film
-**Critical Path** kalibriert. Die lokale VAD analysiert das breitbandige Signal
-ohne aggressiven Sprach-Hochpass. Der adaptive 384–736-ms-Sprach-Hangover
-verbindet kurze Wortpausen, bevor eine 700-ms-S-Curve die Atmo weich auf 100 %
-zurückführt.
-
-Zwei unabhängige Encodings ergaben über jeweils 64.235 VAD-Frames eine
-Wortkern-Vollabdeckung von 92,99–93,49 %, mindestens irgendeine
-VAD-Abdeckung bei 97,95–98,16 % der Wörter und 13,02–13,31 Pegelwechsel pro
-Minute. Die VAD steuert ausschließlich das hörbare Ducking; der Gemini-Uplink
-bleibt kontinuierlich und verliert deshalb auch Wörter ohne VAD-Treffer nicht.
-Alle Messwerte und ihre Grenzen stehen in [VERIFICATION.md](VERIFICATION.md).
+Die neuen Mixpegel sind Startwerte, keine universelle Lautheits- oder
+Studio-Dubbing-Garantie. Sprache, Musik und Raketenklang liegen im selben
+Quellmix; ohne Quellentrennung kann die englische Stimme nicht isoliert entfernt werden.
 
 ## Voraussetzungen und Build
 
-- Node.js 20 oder neuer
+- Node.js 20.19+, 22.13+ oder 24+
 - Chrome 116 oder neuer
-- Gemini API-Key mit Zugriff auf `gemini-3.5-live-translate-preview`
+- ein OpenAI-Projekt-API-Key mit **GPT-Live-Zugriff**
+- ein lokal erreichbarer Server (Standard `http://127.0.0.1:8787`)
 
 ```bash
+cp .env.example .env.local   # OPENAI_API_KEY + LIVE_TRANSLATE_SERVER_TOKEN eintragen
 npm install
 npm run check
 ```
 
 Der ladbare Build liegt anschließend in `dist/`.
+
+## Backend starten
+
+Auf diesem Mac ist inzwischen ein automatischer Hintergrunddienst installiert:
+siehe [SERVER_SERVICE.md](SERVER_SERVICE.md). Kein Terminalstart nötig.
+Der folgende manuelle Start ist nur für andere Installationen gedacht.
+
+```bash
+npm run server # liest .env.local
+# optional: LIVE_TRANSLATE_HOST, LIVE_TRANSLATE_PORT, LIVE_TRANSLATE_ALLOWED_ORIGIN
+```
+
+Der Server nimmt nur `POST /api/live/session` mit Origin-Check
+(`chrome-extension://` bzw. konfigurierte Origin) und zeitkonstantem
+Token-Vergleich entgegen und reicht SDP + Übersetzungskonfiguration an
+`POST /v1/live/sessions` mit der serverseitigen Dubbing-Konfiguration weiter. Er gibt die
+OpenAI-Antwort (`session.id` + `transport.sdp`) unverändert an die Extension
+zurück.
 
 ## Installation
 
@@ -106,43 +96,34 @@ Der ladbare Build liegt anschließend in `dist/`.
 2. Den Entwicklermodus aktivieren.
 3. **Entpackte Erweiterung laden** wählen.
 4. Den Ordner `dist/` auswählen.
-5. Ein englisches Video starten, das Extension-Popup öffnen und den Gemini-Key
-   eintragen.
+5. Ein englisches Video starten, das Extension-Popup öffnen und Server-URL
+   sowie Zugriffstoken eintragen.
 
-Das Popup enthält die direkten Produktkontrollen: API-Key, Zielsprache,
-Sprechweise (Vortrag & Doku / Schneller Dialog als getestete VAD-Presets),
-Stimme (automatisch oder eine Prebuilt-Stimme, mit automatischem Fallback,
-falls das Modell sie ablehnt), Untertitel an/aus, Original + Übersetzung als
-Dual-Untertitel, „Zielsprache nachsprechen" (`echoTargetLanguage`) und die
-Lautstärke der Gemini-Stimme. Sprachoptimierung, Übersetzungsaudio und
-dynamisches 10/100-Ducking bleiben feste Bestandteile der einen
-Produktpipeline. Ein verstecktes Experiment `rawModelAudio`
-(per DevTools: `chrome.storage.local.set({ rawModelAudio: true })`) schickt
-Gemini das nur hochpassgefilterte Originalsignal, um den Prosodie-Erhalt von
-Gemini 3.5 ohne Kompressor zu testen; Wirkung ab dem nächsten Start.
+Das Popup bietet Server-URL, Zugriffstoken, Untertitel, Dual-Untertitel und
+die Lautstärke der Zielspur. Die Handoff-Konfiguration bleibt absichtlich
+fixiert: nur englische Sprache möglichst früh ins Deutsche übersetzen. Die Stimme ist auswählbar; ein Wechsel startet die aktive Sitzung automatisch neu.
+Responses-Konfiguration bleibt erhalten; der Dubbing-Prompt verbietet Delegation und Websuche.
 
-Ein API-Key lässt sich in [Google AI Studio](https://aistudio.google.com/apikey)
-erstellen. Die technische Grundlage ist die offizielle
-[Gemini Live Translation API](https://ai.google.dev/gemini-api/docs/live-api/live-translate).
+Grundlage ist die offizielle OpenAI-Dokumentation für
+[GPT-Live](https://developers.openai.com/api/docs/guides/live),
+[WebRTC](https://developers.openai.com/api/docs/guides/voice-webrtc?api=live)
+und [Sessions](https://developers.openai.com/api/docs/guides/live-conversations).
 
 ## Datenschutz
 
-Der Gemini-Key wird ausschließlich in `chrome.storage.local` des lokalen
-Browserprofils gespeichert und direkt an
-`generativelanguage.googleapis.com` gesendet. Beim Start prägt der Client
-daraus kurzlebige Einmal-Tokens (`auth_tokens`-API) und verbindet damit über
-den dafür vorgesehenen `BidiGenerateContentConstrained`-Endpunkt: Der
-Langzeit-Key wandert nie in eine WebSocket-URL, und ein abgelehnter Key
-scheitert sofort mit einer klaren Meldung statt nach minutenlangem Reconnect.
-Ist die Token-API nicht erreichbar oder lehnt der Server einen Token-Socket
-ab, wechselt der Client sofort und dauerhaft auf die direkte
-Key-Verbindung – die Übersetzung hängt nie an der Token-Infrastruktur. Der Key wird
-nie in das Repository, Untertitel oder Logs geschrieben. Beim Laden werden
-alle nicht zur aktuellen Gemini-Konfiguration gehörenden Storage-Schlüssel
-automatisch entfernt.
-Privilegierte Runtime-Nachrichten (Start, Stop, Transkripte, Status)
-akzeptieren Service Worker, Popup und Offscreen-Dokument nur von
-Extension-eigenen Absendern, nie aus dem Renderer einer Webseite.
+Der OpenAI-API-Key liegt ausschließlich auf dem eigenen Server (Umgebung,
+nie im Repo, nie in Logs). Die Extension speichert nur
+Verbindungsdaten, Stimme und Ausgabeeinstellungen in `chrome.storage.local`; der Key
+erreicht den Browser nie. Beim Laden werden alle nicht zur aktuellen
+Konfiguration gehörenden Storage-Schlüssel automatisch entfernt, einschließlich alter API-Schlüssel.
+
+Privilegierte Runtime-Nachrichten (Start, Stop, Transkripte, Status) akzeptieren
+Service Worker, Popup und Offscreen-Dokument nur von Extension-eigenen
+Absendern, nie aus dem Renderer einer Webseite.
+
+Abrechnung: GPT-Live-Sitzungen werden pro Sekunde abgerechnet (WebRTC-Init
+mit 15-s-Gutschrift laut OpenAI-Doku); Backend-Nutzung separat. Details unter
+Kostenoptimierung in der OpenAI-Doku.
 
 ## Architektur
 
@@ -152,57 +133,61 @@ Popup
        ├─ one-shot Tab-Capture-ID direkt vor dem Offscreen-Start
        ├─ Content Script (Overlay + nativer Fullscreen-TextTrack)
        └─ Offscreen AudioContext
-            ├─ ein Originalpfad: weich 100 % ↔ fest 10 %
+            ├─ ein Originalpfad: ausgabegesteuert 100 % / 60 % / 28 %
             ├─ AudioWorklet: lückenloser Roh-Audio-Capturepfad
-            ├─ lokaler Worker: Resampling + Silero VAD 6.2.1 via ONNX/WASM
-            ├─ Gemini-Eingang: Hochpass → Kompressor → Resampler → Soft-Limiter
+            ├─ lokaler Worker: Silero VAD 6.2.1 via ONNX/WASM
             ├─ Ausgang: transparenter Soft-Knee-Summenbegrenzer
-            └─ Gemini Live Translate
-                 ├─ kontinuierlicher 16-kHz-PCM-Uplink in 100-ms-Chunks
-                 ├─ Stille-Gating mit audioStreamEnd bei Streampausen
-                 ├─ 24-kHz-Übersetzungsaudio
-                 ├─ Original- und Übersetzungs-Transkription
-                 └─ paralleler Dual-Socket-GoAway-Handover
+            └─ GptLiveTranslator (src/offscreen/live.ts)
+                 ├─ WebRTC PeerConnection + oai-events-Datenkanal
+                 ├─ Remote-Track → translatedGain → Ausgang
+                 └─ live-protocol.ts: Antwort- + Event-Parser
+Server (server/)
+  ├─ live-server.mjs: Origin-/Token-Check, POST /api/live/session
+  └─ live-session.mjs: Anweisungen + Sitzungskonfiguration
 ```
 
 Wichtige Dateien:
 
 - `src/offscreen/main.ts` – Audio-Graph, Ducking und Sitzungslebenszyklus
+- `src/offscreen/live.ts` – WebRTC-Adapter (Offer, Answer, Remote-Audio)
+- `src/offscreen/live-protocol.ts` – Antwort-/Event-Parser, Endpoint-Builder
+- `server/live-server.mjs` – vertrauenswürdiges Backend
+- `server/live-session.mjs` – Sitzungskonfiguration
+- `server/dubbing-prompt.mjs` – Englisch-only-Prompt und männliche Stimme
+- `src/offscreen/dubbing-mix.ts` – dekodierte Ausgabeaktivität und Originalpegel
 - `src/offscreen/neural-vad.ts` – lokaler AudioWorklet-/Worker-VAD-Pfad
 - `src/offscreen/vad-worker.ts` – Silero-ONNX-Inferenz und rekurrenter Zustand
 - `src/offscreen/voice-detector.ts` – Wahrscheinlichkeitshysterese und Pegellogik
-- `src/offscreen/gemini.ts` – Gemini-WebSocket, Reconnect und Wiedergabe
-- `src/offscreen/pcm.ts` – Anti-Aliasing, Resampling und PCM-Konvertierung
-- `src/offscreen/soft-limiter.ts` – deterministische Peak-Begrenzung
+- `src/subtitle-state.ts` – getrennte Source-/Target-Untertitelzustände
 - `src/background.ts` – Tab-/Offscreen-Koordination
-- `src/content.ts` – Untertitel-Overlay
+- `src/content.ts` – Overlay/Fullscreen-Adapter
 
 ## Qualitätsprüfung
 
 ```bash
 npm run typecheck  # striktes TypeScript
-npm test           # Audio-, Ducking-, Settings- und Protokolltests
+npm run lint       # TypeScript-ESLint
+npm test           # Audio-, Untertitel-, Protokoll- und Settings-Tests
+npm run coverage   # Tests plus 90/75/80-Mindestwerte
 npm run bundle     # reproduzierbarer MV3-Build
 npm run check      # alles oben plus Dependency-Audit
 ```
 
 Dieselbe Prüfung läuft bei jedem Push und Pull Request in GitHub Actions mit
-Node.js 24. Die Actions sind auf verifizierte Commit-SHAs gepinnt.
+Node.js 24.
 
 ## Grenzen
 
-- Die Erweiterung ist für englische Quellvideos optimiert. Die Gemini-API
-  erkennt die Eingangssprache automatisch und bietet derzeit keine separate
-  `sourceLanguageCode`-Sperre.
-- Silero erkennt Sprachaktivität, aber nicht die gesprochene Sprache. Im für
-  englische Videos gedachten Modus wird daher jedes erkannte Sprachsegment als
-  englische Quellsprache behandelt.
-- Extrem menschenähnlicher Gesang kann wie bei jeder VAD als Sprache gelten.
-- Live-Übersetzung hat eine Gemini-bedingte Verzögerung von einigen Sekunden.
-- Eine absolute Garantie für jedes übersetzte Wort ist bei einem externen
-  Preview-Modell nicht seriös. Lokal nachweisbar sind dagegen lückenloser
-  Normal-/GoAway-Transport, Restchunk-Flush und null PCM-Sättigung im
-  vollständigen Referenzvideo.
+- Ohne laufenden eigenen Server gibt es keine Sitzung – das ist Absicht,
+  damit der API-Key nie in den Browser gelangt.
+- Die Quellsprache ist auf Englisch festgelegt (Modellprompt, keine harte Garantie).
+- Die Zielsprache und Stimme sind durch den Handoff fest auf Deutsch bzw.
+  `meridian` gesetzt.
+- Live-Übersetzung hat netz- und modellabhängig eine merkliche Verzögerung.
+- Eine absolute Garantie für jedes übersetzte Wort ist bei externen Modellen
+  nicht seriös. Lokal nachweisbar sind Transport, WebRTC-Lifecycle und
+  PCM-Sättigung; Übersetzungsqualität braucht eine bilinguale
+  Golden-Set-Abnahme.
 - Chrome-interne Seiten und der Chrome Web Store können nicht aufgenommen
   werden.
 - Ein fremdes, cross-origin `<iframe>` im eigenen nativen Vollbild kann aus

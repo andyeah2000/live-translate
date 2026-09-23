@@ -8,7 +8,7 @@ globalThis.__messages = [];
 globalThis.chrome = {
   storage: {
     local: {
-      async get() { return { settingsVersion: 7, geminiKey: 'test-key', targetLanguage: 'de', subtitles: true, translationVolume: 1 }; },
+      async get() { return { settingsVersion: 11, liveServerUrl: 'http://127.0.0.1:8787', liveServerToken: 'test-token', liveVoice: 'marin', subtitles: true, translationVolume: 1 }; },
       async set() {},
       async remove() {}
     }

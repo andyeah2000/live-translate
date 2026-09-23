@@ -19,7 +19,8 @@ const RESTRICTED_PREFIXES = [
 ];
 
 export function configurationError(settings: SessionSettings): string | null {
-  if (!settings.geminiKey) return 'Bitte zuerst einen Gemini API-Key eintragen.';
+  if (!settings.liveServerUrl) return 'Bitte zuerst die GPT-Live-Server-URL eintragen.';
+  if (!settings.liveServerToken) return 'Bitte zuerst den Zugriffstoken des GPT-Live-Servers eintragen.';
   return null;
 }
 
@@ -50,11 +51,9 @@ export function popupMonitorPresentation(state: SessionState): PopupMonitorPrese
   if (!state.running) return { text: 'Bereit', state: 'idle' };
   // Ein lokaler VAD-Ausfall ist kein fataler Übersetzungsfehler, darf aber nie
   // als endloses „Verbindet“ verborgen werden.
-  if (state.ducking?.error) return { text: 'Ducking aus', state: 'error' };
+  if (state.ducking?.error) return { text: 'Mix vereinfacht', state: 'active' };
   if (!state.ducking?.ready || !state.ducking.translationReady) {
     return { text: 'Verbindet', state: 'loading' };
   }
-  return state.ducking.speaking
-    ? { text: 'Sprache · 10%', state: 'active' }
-    : { text: 'Atmo · 100%', state: 'active' };
+  return { text: `Original · ${Math.round(state.ducking.sourceGain * 100)}%`, state: 'active' };
 }

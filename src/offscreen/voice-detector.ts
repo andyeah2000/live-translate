@@ -11,26 +11,6 @@ const ATTACK_POSITIVE_FRAMES = 2;
 const RELEASE_SCORE_LIMIT = 23;
 const STRONG_NEGATIVE_SCORE = 2;
 const AMBIGUOUS_NEGATIVE_SCORE = 1;
-export const DUCKED_SOURCE_GAIN = 0.1;
-
-export interface DuckingState {
-  sourceSpeaking: boolean;
-  translationReady: boolean;
-}
-
-/**
- * Exakter linearer Zielpegel für den dynamischen Originalpfad. Nur erkannte
- * Sprache im Quellvideo darf das Original absenken. Endet die Quellsprache,
- * kehrt die volle Atmo (Raketenstart!) sofort zurück – die zeitversetzte
- * Gemini-Stimme spricht bewusst über den vollen Originalpegel weiter.
- */
-export function sourceDuckGain(state: DuckingState): number {
-  if (!state.sourceSpeaking || !state.translationReady) {
-    return 1;
-  }
-  return DUCKED_SOURCE_GAIN;
-}
-
 /**
  * Hysterese für Silero-v6-Wahrscheinlichkeiten (ein Frame = 32 ms).
  * Zwei positive Frames innerhalb von drei starten das Ducking. Beim Release

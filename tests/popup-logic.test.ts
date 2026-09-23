@@ -13,7 +13,7 @@ const runningState = (overrides: Partial<SessionState> = {}): SessionState => ({
   running: true,
   tabId: 7,
   sessionId: 'session-a',
-  status: 'Übersetzung läuft (Gemini)',
+  status: 'Übersetzung läuft (GPT-Live)',
   error: null,
   ducking: {
     ready: true,
@@ -26,9 +26,16 @@ const runningState = (overrides: Partial<SessionState> = {}): SessionState => ({
   ...overrides
 });
 
-test('start validation requires a Gemini key', () => {
-  assert.match(configurationError(DEFAULT_SETTINGS) ?? '', /API-Key/);
-  assert.equal(configurationError({ ...DEFAULT_SETTINGS, geminiKey: 'AIza-test' }), null);
+test('start validation requires the GPT-Live server token', () => {
+  assert.match(configurationError(DEFAULT_SETTINGS) ?? '', /Zugriffstoken/);
+  assert.match(
+    configurationError({ ...DEFAULT_SETTINGS, liveServerUrl: '' }) ?? '',
+    /Server-URL/
+  );
+  assert.equal(
+    configurationError({ ...DEFAULT_SETTINGS, liveServerToken: 'local-token' }),
+    null
+  );
 });
 
 test('URL validation blocks privileged and store pages', () => {
@@ -45,12 +52,12 @@ test('URL validation blocks privileged and store pages', () => {
 
 test('popup exposes live status text instead of silently discarding it', () => {
   assert.deepEqual(popupStatusPresentation(runningState()), {
-    text: 'Übersetzung läuft (Gemini)',
+    text: 'Übersetzung läuft (GPT-Live)',
     error: false
   });
   assert.deepEqual(
-    popupStatusPresentation(runningState({ status: 'Fehlerstatus', error: 'Gemini abgelehnt' })),
-    { text: 'Gemini abgelehnt', error: true }
+    popupStatusPresentation(runningState({ status: 'Fehlerstatus', error: 'GPT-Live abgelehnt' })),
+    { text: 'GPT-Live abgelehnt', error: true }
   );
 });
 
@@ -66,5 +73,5 @@ test('popup prioritizes a local ducking failure over the loading state', () => {
       translationReady: true
     }
   });
-  assert.deepEqual(popupMonitorPresentation(state), { text: 'Ducking aus', state: 'error' });
+  assert.deepEqual(popupMonitorPresentation(state), { text: 'Mix vereinfacht', state: 'active' });
 });
