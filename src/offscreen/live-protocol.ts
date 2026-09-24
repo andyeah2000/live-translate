@@ -10,6 +10,7 @@ export type LiveServerEvent =
   | { kind: 'closed' }
   | { kind: 'transcript'; event: TranscriptEvent }
   | { kind: 'error'; detail: string }
+  | { kind: 'delegation'; id: string }
   | { kind: 'ignored' };
 
 function recordValue(value: unknown): Record<string, unknown> | null {
@@ -47,6 +48,11 @@ export function parseLiveServerEvent(value: unknown): LiveServerEvent {
     return sessionId ? { kind: 'started', sessionId } : { kind: 'ignored' };
   }
   if (type === 'session.closed') return { kind: 'closed' };
+  if (type === 'session.delegation.created') {
+    const delegation = recordValue(event.delegation);
+    const id = stringValue(delegation?.id);
+    return id ? { kind: 'delegation', id } : { kind: 'ignored' };
+  }
   if (type === 'session.input_transcript.delta' || type === 'session.output_transcript.delta') {
     // Preserve the delta byte-for-byte. In particular, do not trim spaces at
     // chunk boundaries: GPT-Live emits exact incremental transcript text.

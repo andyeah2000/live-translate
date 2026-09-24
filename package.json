@@ -1,6 +1,6 @@
 {
   "name": "live-translate",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -14,7 +14,9 @@
     "bundle": "node build.mjs",
     "server": "node --env-file=.env.local server/live-server.mjs",
     "build": "npm run typecheck && npm run bundle",
-    "check": "npm run typecheck && npm run lint && npm run coverage && npm run bundle && npm audit --audit-level=moderate"
+    "check": "npm run typecheck && npm run lint && npm run test && npm run coverage && npm run bundle && npm audit --audit-level=moderate",
+    "macos:test": "swift test --package-path macos",
+    "macos:build": "node scripts/build-macos.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.280",

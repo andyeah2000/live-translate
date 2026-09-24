@@ -43,3 +43,9 @@ test('builds the extension backend endpoint without leaking query fragments', ()
     'https://example.test/base/api/live/session'
   );
 });
+
+test('exposes only valid client delegations so the transport can reject tool work', () => {
+  assert.deepEqual(parseLiveServerEvent({ type: 'session.delegation.created', delegation: { id: 'task_1' } }),
+    { kind: 'delegation', id: 'task_1' });
+  assert.deepEqual(parseLiveServerEvent({ type: 'session.delegation.created', delegation: {} }), { kind: 'ignored' });
+});

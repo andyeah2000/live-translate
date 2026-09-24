@@ -1,6 +1,6 @@
-import { DUBBING_PROMPT, DUBBING_VOICE } from './dubbing-prompt.mjs';
+import { DUBBING_PROMPT, DUBBING_VOICE, TRANSLATION_PROFILE } from './dubbing-prompt.mjs';
 
-export const LIVE_VOICES = new Set(['marin', 'quartz', 'ripple', 'vesper', 'willow', 'stone', 'gleam', 'meridian', 'bossa', 'tempo', 'beacon', 'delta', 'cinder']);
+export const LIVE_VOICES = new Set(TRANSLATION_PROFILE.voices);
 
 function asRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null;
@@ -19,28 +19,15 @@ export function parseSessionRequest(value) {
 export function createLiveSessionConfig(request) {
   return {
     session: {
-      model: 'gpt-live-1',
+      model: TRANSLATION_PROFILE.model,
       instructions: DUBBING_PROMPT,
+      store: false,
       audio: {
         output: {
           voice: LIVE_VOICES.has(request.voice) ? request.voice : DUBBING_VOICE
         }
       },
-      delegation: {
-        type: 'responses',
-        responses: {
-          parallel_tool_calls: false,
-          model: 'gpt-5.6-terra',
-          reasoning: {
-            effort: 'medium'
-          },
-          tools: [
-            {
-              type: 'web_search'
-            }
-          ]
-        }
-      }
+      delegation: { type: 'client' }
     },
     transport: { type: 'webrtc', sdp: request.sdp }
   };

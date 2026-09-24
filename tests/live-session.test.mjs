@@ -5,9 +5,9 @@ import { DUBBING_PROMPT } from '../server/dubbing-prompt.mjs';
 test('dubbing is English-only, low-delay and does not answer or delegate', () => {
   assert.match(DUBBING_PROMPT, /NUR verständliche ENGLISCHE/);
   assert.match(DUBBING_PROMPT, /Warte nicht auf Satzende/);
-  assert.match(DUBBING_PROMPT, /Sehr hohes Tempo ist der Standard/);
-  assert.match(DUBBING_PROMPT, /sammle keine ganzen Sätze/);
-  assert.match(DUBBING_PROMPT, /lebendige Satzmelodie auch bei hohem Tempo/);
+  assert.match(DUBBING_PROMPT, /sobald genügend Kontext vorliegt/);
+  assert.match(DUBBING_PROMPT, /Verständlichkeit und vollständige Bedeutung/);
+  assert.match(DUBBING_PROMPT, /natürlicher Satzmelodie/);
   assert.match(DUBBING_PROMPT, /NIEMALS delegieren/);
   assert.match(DUBBING_PROMPT, /Keine Begrüßung/);
 });
@@ -18,16 +18,9 @@ test('forwards only the exact GPT-Live handoff configuration', () => {
     session: {
       model: 'gpt-live-1',
       instructions: DUBBING_PROMPT,
+      store: false,
       audio: { output: { voice: 'meridian' } },
-      delegation: {
-        type: 'responses',
-        responses: {
-          parallel_tool_calls: false,
-          model: 'gpt-5.6-terra',
-          reasoning: { effort: 'medium' },
-          tools: [{ type: 'web_search' }]
-        }
-      }
+      delegation: { type: 'client' }
     },
     transport: { type: 'webrtc', sdp: 'offer-sdp' }
   });

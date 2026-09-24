@@ -3,6 +3,28 @@
 Diese Datei trennt nachgewiesene Eigenschaften von Modellqualität, die ohne
 eine bilinguale menschliche Referenz nicht seriös garantiert werden kann.
 
+## Aktueller Prüfstand: 24. September 2026
+
+- `npm run check`: erfolgreich; Typecheck, ESLint, 100 Tests einschließlich
+  Server-Tests, Coverage, MV3-Build und Audit mit null bekannten Schwachstellen.
+- Coverage der TypeScript-Tests: 94,42 % Lines, 81,32 % Branches,
+  81,03 % Functions. Die Mindestwerte 90/75/80 wurden nicht abgesenkt.
+- `swift test --package-path macos`: 13 Tests erfolgreich; PCM16,
+  Puffergrenzen, Delta-Texte, echtes Sitzungsprotokoll mit simuliertem Transport,
+  Abbrüche, fehlendes Guthaben und bestätigte finale Nutzungswerte.
+- Native Ausgabeprüfung: 12.000 Testton-Samples durch AVAudioEngine abgespielt.
+- Release-App mit Swift 6.4 auf macOS 27 gebaut; lokale Signaturprüfung erfolgreich.
+- Der neue Projektschlüssel wurde über das native Pop-up im Schlüsselbund
+  gespeichert. Auch der erneute echte GPT-Live-Test damit wurde wegen fehlenden
+  API-Guthabens abgelehnt. Der lokale Systemaudio-Test wurde durch macOS TCC
+  abgelehnt. Es liegt deshalb noch keine vollständige Live-Abnahme vor.
+- Das kompakte Pop-up mit nativen Bedienelementen, Einstellungen und
+  Schlüssel-Speicherung wurde in der installierten Menüleisten-App geprüft.
+
+Die weiter unten dokumentierten Vollvideo- und Chrome-Messungen stammen aus
+früheren Projektständen und wurden bei dieser macOS-Erweiterung nicht erneut
+durchgeführt. Insbesondere sind sie kein Qualitätsnachweis für die native App.
+
 ## Automatisierte Abnahme
 
 ```bash
@@ -18,8 +40,8 @@ Actions führt denselben Befehl bei Pushes und Pull Requests mit Node.js 24 aus.
 
 Die Tests decken unter anderem ab:
 
-- exakt 10 % Quellpegel während Sprache und exakt 100 % außerhalb – die
-  Zielstimme läuft bewusst über den vollen Originalpegel weiter;
+- ausgabegesteuerten Quellmix mit 100 % außerhalb der deutschen Ausgabe,
+  28 % bei gleichzeitiger Quellsprache und 60 % bei Atmosphäre;
 - getrennte Source-/Target-Untertitel bei Partial, Complete, Late Chunk,
   Interrupt, neuem Turn und der gemeinsamen Overlay-/Fullscreen-Darstellung;
 - GPT-Live-Protokoll: Session-Antwort-Parser (`session.id` + `transport.sdp`),
@@ -27,8 +49,8 @@ Die Tests decken unter anderem ab:
   `session.input_transcript.delta`, `session.output_transcript.delta`),
   unveränderte Delta-Texte mit `start_ms`/`end_ms`, Endpoint-Builder und
   Ignorieren unbekannter Events;
-- Server-Validierung: SDP-Pflicht und unveränderliches Handoff-JSON mit
-  Deutsch/`marin`, Responses-Delegation und Websuche;
+- Server-Validierung: SDP-Pflicht, gemeinsames Übersetzungsprofil, Standardstimme
+  `meridian`, Client-Delegation ohne Responses-Backend oder Websuche;
 - Begrenzung und Verwerfung von Server-URL, Token, Stimme und Ausgabeoptionen;
   wirkungslose Sprach-, Keyterm- und Echo-Einstellungen werden entfernt;
 - das Entfernen der abgelösten Provider-Keys (`grokKey`, `geminiKey`,
@@ -47,19 +69,13 @@ Die Tests decken unter anderem ab:
 - Untertitel-Reparenting Body → Fullscreen-Container → Body;
 - lokale Silero-Modellintegrität und MV3-CSP.
 
-Coverage misst die importierten, testbaren Logikmodule einschließlich
-`live-protocol.ts`, `subtitle-state.ts`, `audio-context-state.ts` und
-`server/live-session.mjs`-Logik (über tsx-kompatible Pfade, wo importierbar).
-Ausgenommen sind die Browser-/Geräteadapter `content.ts`, `popup.ts`,
-`offscreen/main.ts`, `offscreen/live.ts` (WebRTC-Transport), die
-AudioWorklet-Dateien, `vad-worker.ts` und der rein DOM-basierte
-Popup-/Offscreen-Bootstrap; diese werden durch Build, statischen Audit und
-die Chrome-Abnahme geprüft.
-
-Der WebRTC-Transport (`live.ts`) besteht bewusst nur aus Verbindungsaufbau,
-Remote-Track-Anbindung und Event-Weiterleitung – jede Entscheidung liegt in
-den getesteten reinen Modulen. Abgenommen ist er erst mit dem Chrome-Lauf
-gegen die echte API.
+Coverage misst die durch die TypeScript-Tests importierten Module, jetzt auch
+`offscreen/live.ts`. Die zusätzlichen Transporttests simulieren WebRTC-Peer,
+Datenkanal und Audioelement. Sie prüfen den einzigen hörbaren Audioausgang,
+Fallback, Autoplayfehler, Delegation, Verbindungsfehler und Close-Timeouts.
+Server-Tests laufen zusätzlich in `npm test`; deren Abdeckung wird nicht in
+der TypeScript-Coverage behauptet. Nicht importierte Browser-Bootstraps und
+Audiotreiber benötigen weiter eine echte Browser-/Geräteprüfung.
 
 ## Vollvideo-Audit: SpaceX Critical Path
 
@@ -119,7 +135,7 @@ SpaceX-Players verfügbar.
   Validierung (Erwartung 401/401/403/400).
 - Der frühere Smoke-Test wurde entfernt: HTTP 502 belegt keinen gültigen
   OpenAI-Key und ersetzt keine erfolgreiche WebRTC-Sitzung.
-- Echter End-to-End-Lauf nur im Browser mit Mikrofon/Tab-Audio:
+- Echter End-to-End-Lauf im Browser mit Tab-Audio:
   `session.started` abwarten, sprechen, `session.output_transcript.delta`
   und Remote-Audio prüfen, mit `session.close` beenden und `session.closed`
   mit finaler Usage abwarten.
@@ -127,6 +143,10 @@ SpaceX-Players verfügbar.
   (WebRTC + Managing sessions, Stand 2026): `POST /v1/live/sessions` mit
   `session` + `transport: { type: "webrtc", sdp }`, Datenkanal `oai-events`,
   kein `session.start` nach HTTP-Start, kein `audio.format` bei WebRTC.
+- Der native `LiveTranslateProbe --live-test` prüft denselben Dienst über
+  WebSocket mit einer freigegebenen Sprachdatei. Der App-Test muss zusätzlich
+  echte ScreenCaptureKit-Eingabe, Ausschluss der eigenen Ausgabe und hörbare
+  deutsche Übersetzung bestätigen; ein Probe-Erfolg allein reicht dafür nicht.
 
 ## Ehrliche Grenze
 

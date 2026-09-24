@@ -1,14 +1,37 @@
 # Live Translate
 
-Eine fokussierte Chrome-Erweiterung für englische Technikvideos und
-Livestreams. Sie übersetzt live über **GPT-Live (Modell `gpt-live-1`)** von
-OpenAI – mit Untertiteln und der fixierten deutschen Zielstimme `meridian`.
+Gesprochene Live-Übersetzung ins Deutsche mit **OpenAI GPT-Live
+(`gpt-live-1`)**. Als kleine native macOS-Menüleisten-App für Systemton oder
+eine einzelne App, zusätzlich als Chrome-Erweiterung für einen Tab.
 
-Die Erweiterung arbeitet mit einem kleinen, selbst betriebenen Backend: Der
-OpenAI-API-Key liegt ausschließlich auf dem eigenen Server (`server/`), die
-Extension erhält nur kurzlebige WebRTC-Sitzungen. „Besser“ ist dabei kein
-Marketingversprechen: Die semantische Entscheidung muss mit einem manuell
-bewerteten SpaceX-Referenzset gegen echte API-Läufe fallen.
+Die macOS-App verbindet sich direkt per WebSocket mit OpenAI. Die Erweiterung
+nutzt WebRTC und ein eigenes lokales Backend. Beide verwenden denselben
+Übersetzungsprompt und dieselbe Stimmenliste. Standardstimme ist `meridian`.
+
+## macOS-Menüleisten-App
+
+Voraussetzungen: macOS 14+, Xcode mit Swift 6, Node.js für das Buildskript,
+ein OpenAI-Projektschlüssel mit GPT-Live-Zugriff und API-Guthaben.
+
+```bash
+npm run macos:test
+npm run macos:build
+```
+
+Die App liegt unter `macos/build/Live Translate.app` und lässt sich in den
+Programme-Ordner kopieren. Sie öffnet ein kleines Pop-up am Symbol in der
+Menüleiste und besitzt kein Dock-Symbol und kein Hauptfenster. Einstellungen,
+Audioquelle, Stimme, Lautstärke, Untertitel und Start/Stopp liegen im Pop-up.
+
+Der Schlüssel wird über die Einstellungen in den macOS-Schlüsselbund
+gespeichert. macOS muss die Aufnahme von Systemaudio erlauben. Es werden
+keine Bildschirmbilder oder Mikrofonsignale an OpenAI geschickt. Der eigene
+Ausgabeton ist von der Aufnahme ausgeschlossen; virtuelle Audiotreiber sind
+nicht erforderlich. Die App senkt die Lautstärke anderer Apps nicht ab.
+
+[Einrichtung und Bedienung](docs/MACOS.md) ·
+[API- und Forschungsentscheidungen](docs/RESEARCH.md) ·
+[Prüfstand und Grenzen](VERIFICATION.md)
 
 ## Pipeline
 
@@ -21,7 +44,7 @@ Tab-Audio (MediaStreamTrack)
   │  WebRTC Offer (Browser) → POST /api/live/session (eigener Server)
   │                           → POST https://api.openai.com/v1/live/sessions
   ▼
-GPT-Live (gpt-live-1, Responses-Delegation, Anweisungen = Dolmetscher)
+GPT-Live (gpt-live-1, Client-Delegation, Anweisungen = Dolmetscher)
   │
   ├─ Audio: Zielstimme als WebRTC-Remote-Track → translatedGain
   └─ Datenkanal oai-events:
@@ -102,7 +125,9 @@ zurück.
 Das Popup bietet Server-URL, Zugriffstoken, Untertitel, Dual-Untertitel und
 die Lautstärke der Zielspur. Die Handoff-Konfiguration bleibt absichtlich
 fixiert: nur englische Sprache möglichst früh ins Deutsche übersetzen. Die Stimme ist auswählbar; ein Wechsel startet die aktive Sitzung automatisch neu.
-Responses-Konfiguration bleibt erhalten; der Dubbing-Prompt verbietet Delegation und Websuche.
+Es ist kein Responses-Backend und keine Websuche konfiguriert. Unerwartete
+Delegationsereignisse führen den Dolmetschermodus fort; wiederholte Abweichung
+stoppt die Sitzung mit einer sichtbaren Fehlermeldung.
 
 Grundlage ist die offizielle OpenAI-Dokumentation für
 [GPT-Live](https://developers.openai.com/api/docs/guides/live),
@@ -111,8 +136,9 @@ und [Sessions](https://developers.openai.com/api/docs/guides/live-conversations)
 
 ## Datenschutz
 
-Der OpenAI-API-Key liegt ausschließlich auf dem eigenen Server (Umgebung,
-nie im Repo, nie in Logs). Die Extension speichert nur
+Der OpenAI-API-Key der Erweiterung liegt ausschließlich auf dem eigenen
+Server (Umgebung, nie im Repo, nie in Logs). Die macOS-App speichert ihren
+Schlüssel im lokalen Schlüsselbund. Die Extension speichert nur
 Verbindungsdaten, Stimme und Ausgabeeinstellungen in `chrome.storage.local`; der Key
 erreicht den Browser nie. Beim Laden werden alle nicht zur aktuellen
 Konfiguration gehörenden Storage-Schlüssel automatisch entfernt, einschließlich alter API-Schlüssel.
@@ -153,7 +179,11 @@ Wichtige Dateien:
 - `src/offscreen/live-protocol.ts` – Antwort-/Event-Parser, Endpoint-Builder
 - `server/live-server.mjs` – vertrauenswürdiges Backend
 - `server/live-session.mjs` – Sitzungskonfiguration
-- `server/dubbing-prompt.mjs` – Englisch-only-Prompt und männliche Stimme
+- `server/dubbing-prompt.mjs` – Zugriff auf das gemeinsame Übersetzungsprofil
+- `macos/Sources/LiveTranslateCore/Resources/translation-profile.json` – Modell, Stimmen und Prompt für beide Apps
+- `macos/Sources/LiveTranslate/` – natives Menüleisten-Pop-up und Sitzungssteuerung
+- `macos/Sources/LiveTranslateCore/` – WebSocket, Live-Protokoll und begrenzte PCM-Puffer
+- `macos/Sources/LiveTranslateAudio/` – ScreenCaptureKit, AVAudioEngine und Schlüsselbund
 - `src/offscreen/dubbing-mix.ts` – dekodierte Ausgabeaktivität und Originalpegel
 - `src/offscreen/neural-vad.ts` – lokaler AudioWorklet-/Worker-VAD-Pfad
 - `src/offscreen/vad-worker.ts` – Silero-ONNX-Inferenz und rekurrenter Zustand
@@ -174,15 +204,14 @@ npm run check      # alles oben plus Dependency-Audit
 ```
 
 Dieselbe Prüfung läuft bei jedem Push und Pull Request in GitHub Actions mit
-Node.js 24.
+Node.js 24. Ein zusätzlicher macOS-Job prüft Swift-Tests, App-Build und Signatur.
 
 ## Grenzen
 
-- Ohne laufenden eigenen Server gibt es keine Sitzung – das ist Absicht,
-  damit der API-Key nie in den Browser gelangt.
-- Die Quellsprache ist auf Englisch festgelegt (Modellprompt, keine harte Garantie).
-- Die Zielsprache und Stimme sind durch den Handoff fest auf Deutsch bzw.
-  `meridian` gesetzt.
+- Die Erweiterung benötigt das eigene Backend, die macOS-App nicht.
+- Die Erweiterung übersetzt Englisch. In der macOS-App ist zusätzlich eine
+  automatische Quellsprache auswählbar; die Auswahl wirkt als Modellanweisung.
+- Zielsprache ist Deutsch; eine Stimme wird vor Beginn der Sitzung ausgewählt.
 - Live-Übersetzung hat netz- und modellabhängig eine merkliche Verzögerung.
 - Eine absolute Garantie für jedes übersetzte Wort ist bei externen Modellen
   nicht seriös. Lokal nachweisbar sind Transport, WebRTC-Lifecycle und

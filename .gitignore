@@ -5,3 +5,7 @@ coverage/
 .playwright-cli/
 .env.local
 .env*.local
+macos/.build/
+macos/build/
+macos/.swiftpm/
+artifacts/
