@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
-import ScreenCaptureKit
+// Older SDKs lack Sendable annotations; shareable content is consumed only on MainActor.
+@preconcurrency import ScreenCaptureKit
 import LiveTranslateCore
 
 public final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
