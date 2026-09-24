@@ -22,7 +22,7 @@
     "@types/chrome": "^0.0.280",
     "esbuild": "^0.28.1",
     "eslint": "^10.8.0",
-    "tsx": "^4.23.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.65.0"
   },
