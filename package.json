@@ -27,6 +27,6 @@
     "typescript-eslint": "^8.65.0"
   },
   "dependencies": {
-    "onnxruntime-web": "1.22.0"
+    "onnxruntime-web": "1.30.0"
   }
 }
