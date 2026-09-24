@@ -2,9 +2,17 @@ import { execFileSync } from 'node:child_process';
 import { cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { selectSigningIdentity } from './macos-signing.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const packagePath = join(root, 'macos');
+const explicitIdentity = process.env.LIVE_TRANSLATE_SIGN_IDENTITY;
+const signingIdentity = selectSigningIdentity(explicitIdentity?.trim() ? '' : execFileSync(
+  'security', ['find-identity', '-v', '-p', 'codesigning'], { encoding: 'utf8' }
+), explicitIdentity);
+if (signingIdentity === '-') {
+  console.warn('Ad-hoc-Testbuild: macOS-Audiofreigaben bleiben nach Codeänderungen nicht erhalten.');
+}
 execFileSync('swift', ['build', '--package-path', packagePath, '-c', 'release'], { stdio: 'inherit' });
 const bin = execFileSync('swift', ['build', '--package-path', packagePath, '-c', 'release', '--show-bin-path'], { encoding: 'utf8' }).trim();
 const app = join(packagePath, 'build', 'Live Translate.app');
@@ -12,6 +20,8 @@ mkdirSync(join(app, 'Contents', 'MacOS'), { recursive: true });
 mkdirSync(join(app, 'Contents', 'Resources'), { recursive: true });
 cpSync(join(bin, 'LiveTranslate'), join(app, 'Contents', 'MacOS', 'LiveTranslate'));
 cpSync(join(packagePath, 'Sources', 'LiveTranslateCore', 'Resources', 'translation-profile.json'), join(app, 'Contents', 'Resources', 'translation-profile.json'));
+cpSync(join(root, 'public', 'vad', 'silero_vad_16k_op15.onnx'), join(app, 'Contents', 'Resources', 'silero_vad_16k_op15.onnx'));
+cpSync(join(root, 'THIRD_PARTY_NOTICES.md'), join(app, 'Contents', 'Resources', 'THIRD_PARTY_NOTICES.md'));
 const iconset = join(packagePath, 'build', 'AppIcon.iconset');
 execFileSync('swift', [join(root, 'scripts', 'macos-icon.swift'), iconset], { stdio: 'inherit' });
 execFileSync('iconutil', ['-c', 'icns', iconset, '-o', join(app, 'Contents', 'Resources', 'AppIcon.icns')], { stdio: 'inherit' });
@@ -27,7 +37,7 @@ writeFileSync(join(app, 'Contents', 'Info.plist'), `<?xml version="1.0" encoding
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>${version}</string>
 <key>CFBundleVersion</key><string>${version}</string>
-<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>LSMinimumSystemVersion</key><string>14.4</string>
 <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
@@ -35,6 +45,6 @@ writeFileSync(join(app, 'Contents', 'Info.plist'), `<?xml version="1.0" encoding
 <key>NSAudioCaptureUsageDescription</key><string>Systemaudio wird während deiner gestarteten Übersetzung an OpenAI gesendet. Die eigene Übersetzerstimme wird ausgeschlossen.</string>
 </dict></plist>
 `);
-execFileSync('codesign', ['--force', '--sign', '-', '--identifier', 'org.andyeah.live-translate', app], { stdio: 'inherit' });
+execFileSync('codesign', ['--force', '--sign', signingIdentity, '--identifier', 'org.andyeah.live-translate', app], { stdio: 'inherit' });
 execFileSync('codesign', ['--verify', '--deep', '--strict', app], { stdio: 'inherit' });
 console.log(app);

@@ -34,11 +34,13 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## ONNX Runtime Web
+## ONNX Runtime (Web and native macOS)
 
 Local WASM runtime assets are provided by
 [Microsoft ONNX Runtime](https://github.com/microsoft/onnxruntime) through the
-`onnxruntime-web` npm package.
+`onnxruntime-web` npm package. The macOS app statically links ONNX Runtime
+1.24.2 via Microsoft's `onnxruntime-swift-package-manager` and embeds the same
+Silero model listed above.
 
 - Copyright: Microsoft Corporation
 - License: MIT

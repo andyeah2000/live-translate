@@ -53,4 +53,6 @@ jobs:
         run: swift test --package-path macos
 
       - name: Build and verify the menu bar app
+        env:
+          LIVE_TRANSLATE_SIGN_IDENTITY: '-'
         run: node scripts/build-macos.mjs

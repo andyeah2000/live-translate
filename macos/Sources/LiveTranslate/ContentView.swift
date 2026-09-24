@@ -15,6 +15,7 @@ struct ContentView: View {
                 Text(settingsVisible ? "Einstellungen" : "Live Translate").font(.headline)
                 Spacer()
                 if !settingsVisible {
+                    optionsMenu
                     Button { settingsVisible = true } label: { Image(systemName: "gearshape") }
                         .buttonStyle(.borderless).help("Einstellungen")
                 }
@@ -37,33 +38,46 @@ struct ContentView: View {
                 Text(notice).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Divider()
-            HStack {
-                Text(model.status).font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Menu {
-                    Button("Audioquelle lokal testen") { model.testCapture() }.disabled(model.isBusy)
-                    Button("App-Liste aktualisieren") { model.refreshSources() }.disabled(model.isBusy)
-                    Button("Transkript exportieren …") { model.exportTranscript() }.disabled(model.timeline.captions.isEmpty)
-                    Menu("Verbindung") {
-                        Text("Modell: GPT-Live")
-                        Text("Eingang: \(Int(model.inputBufferMs)) ms")
-                        Text("Ausgang: \(Int(model.outputBufferMs)) ms")
-                        Text(model.roundTripMs.map { "Netzwerk: \(Int($0)) ms" } ?? "Netzwerk: —")
-                        Text("API-Nutzung: \(Int(model.billedSeconds)) s")
-                        Text(model.finalized ? "Sitzung bestätigt beendet" : "Keine Abschlussbestätigung")
-                    }
-                    Divider()
-                    Button("Live Translate beenden") { NSApp.terminate(nil) }.keyboardShortcut("q")
-                } label: { Image(systemName: "ellipsis.circle") }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                    .help("Weitere Optionen")
-            }
         }
         .padding(14)
         .frame(width: 310)
         .controlSize(.small)
         .onAppear { model.refreshSources() }
+    }
+
+    private var optionsMenu: some View {
+        Menu {
+            Button("Audioquelle lokal testen") { model.testCapture() }.disabled(model.isBusy)
+            Button("App-Liste aktualisieren") { model.refreshSources() }.disabled(model.isBusy)
+            Button("Transkript exportieren …") { model.exportTranscript() }.disabled(model.timeline.captions.isEmpty)
+            Menu("Verbindung") {
+                Text("Modell: GPT-Live")
+                Text("Eingang: \(Int(model.inputBufferMs)) ms")
+                Text("Ausgang: \(Int(model.outputBufferMs)) ms")
+                Text(model.roundTripMs.map { "Netzwerk: \(Int($0)) ms" } ?? "Netzwerk: —")
+                Text("API-Nutzung: \(Int(model.billedSeconds)) s")
+                Text(model.finalized ? "Sitzung bestätigt beendet" : "Keine Abschlussbestätigung")
+            }
+            Divider()
+            Button("Live Translate beenden") { NSApp.terminate(nil) }.keyboardShortcut("q")
+        } label: { Image(systemName: "ellipsis.circle") }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .help("Weitere Optionen")
+    }
+
+    private func volumeRow(_ title: String, value: Binding<Double>, muted: Binding<Bool>) -> some View {
+        GridRow {
+            Text(title).foregroundStyle(.secondary).frame(width: 48, alignment: .leading)
+            Slider(value: value, in: 0...1).accessibilityLabel("Lautstärke \(title)")
+                .disabled(muted.wrappedValue)
+            Button { muted.wrappedValue.toggle() } label: {
+                Image(systemName: muted.wrappedValue || value.wrappedValue == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .frame(width: 16)
+            }
+            .buttonStyle(.borderless)
+            .help(muted.wrappedValue ? "\(title) einschalten" : "\(title) stummschalten")
+            .accessibilityLabel(muted.wrappedValue ? "\(title) einschalten" : "\(title) stummschalten")
+        }
     }
 
     private var controls: some View {
@@ -90,10 +104,11 @@ struct ContentView: View {
                     }.labelsHidden().disabled(model.isBusy)
                 }
             }
-            HStack(spacing: 8) {
-                Image(systemName: "speaker.fill").foregroundStyle(.secondary)
-                Slider(value: $model.volume, in: 0...1).accessibilityLabel("Lautstärke der Übersetzung")
-                Image(systemName: "speaker.wave.3.fill").foregroundStyle(.secondary)
+            Toggle("Auto-Dubbing", isOn: $model.duckSource)
+                .help("Neuronale Spracherkennung mit Silero; Originalton während hörbarer Übersetzung automatisch absenken")
+            Grid(horizontalSpacing: 10, verticalSpacing: 8) {
+                volumeRow("Original", value: $model.sourceVolume, muted: $model.sourceMuted)
+                volumeRow("Deutsch", value: $model.volume, muted: $model.translationMuted)
             }
             Toggle("Schwebende Untertitel", isOn: $model.showOverlay)
             let caption = model.timeline.latest(.target)
@@ -138,6 +153,16 @@ private struct SettingsView: View {
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Link("API-Guthaben verwalten", destination: URL(string: "https://platform.openai.com/settings/organization/billing/overview")!)
                 .font(.caption)
+            Divider()
+            Toggle("Neuronales Auto-Dubbing", isOn: $model.duckSource)
+            if model.duckSource {
+                HStack {
+                    Text("Sprache \(Int(model.duckLevel * 100)) %").monospacedDigit().frame(width: 90, alignment: .leading)
+                    Slider(value: $model.duckLevel, in: 0...1).accessibilityLabel("Originalpegel während der Übersetzung")
+                }
+            }
+            Text("Der Originalregler wirkt während der Übersetzung und beim lokalen Audiotest.")
+                .font(.caption).foregroundStyle(.secondary)
             Divider()
             Picker("Sitzungslimit", selection: $model.maxMinutes) {
                 Text("15 Minuten").tag(15); Text("30 Minuten").tag(30)

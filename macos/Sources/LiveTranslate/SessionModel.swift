@@ -19,7 +19,12 @@ final class SessionModel: ObservableObject {
     @Published var selectedSource = "system"
     @Published var voice = "meridian"
     @Published var englishOnly = true
-    @Published var volume = 0.85 { didSet { playback?.volume = Float(volume) } }
+    @Published var volume = 0.85 { didSet { updateMix() } }
+    @Published var translationMuted = false { didSet { updateMix() } }
+    @Published var sourceVolume = 1.0 { didSet { updateMix() } }
+    @Published var sourceMuted = false { didSet { updateMix() } }
+    @Published var duckSource = true { didSet { updateMix() } }
+    @Published var duckLevel = 0.28 { didSet { updateMix() } }
     @Published var showOverlay = false { didSet { overlay.setVisible(showOverlay, model: self) } }
     @Published var showSource = true
     @Published var hasKey = false
@@ -51,6 +56,7 @@ final class SessionModel: ObservableObject {
     private var lastMeterUpdate = Date.distantPast
     private var lastInputRMS = 0.0
     private var delegationCount = 0
+    private var restoringMix = true
     private var sleepObserver: NSObjectProtocol?
 
     var isBusy: Bool { [.testing, .preparing, .connecting, .running, .stopping].contains(phase) }
@@ -61,7 +67,7 @@ final class SessionModel: ObservableObject {
         case .testing: "Audioquelle lokal prüfen …"
         case .preparing: "Audiozugriff vorbereiten …"
         case .connecting: "GPT-Live verbinden …"
-        case .running: inputLevel > 0.008 ? "Übersetzung läuft" : "Hört auf den Quellton"
+        case .running: "Übersetzung aktiv"
         case .stopping: "Übersetzung abschließen …"
         case .failed: "Sitzung angehalten"
         }
@@ -72,9 +78,31 @@ final class SessionModel: ObservableObject {
         do { hasKey = try KeychainStore.read() != nil } catch { errorMessage = error.localizedDescription }
         voice = UserDefaults.standard.string(forKey: "voice") ?? profile?.defaultVoice ?? "meridian"
         if profile?.voices.contains(voice) != true { voice = "meridian" }
+        let defaults = UserDefaults.standard
+        volume = defaults.object(forKey: "translationVolume") as? Double ?? 0.85
+        sourceVolume = defaults.object(forKey: "sourceVolume") as? Double ?? 1
+        duckSource = defaults.object(forKey: "duckSource") as? Bool ?? true
+        duckLevel = defaults.object(forKey: "duckLevel") as? Double ?? 0.28
+        restoringMix = false
         refreshSources()
         sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in
             Task { @MainActor in await SessionModel.shared.stop() }
+        }
+    }
+
+    private func updateMix(persist: Bool = true) {
+        playback?.volume = translationMuted ? 0 : Float(volume)
+        var mix = SourceMix()
+        mix.volume = sourceVolume; mix.muted = sourceMuted
+        mix.ducking = duckSource; mix.duckLevel = duckLevel
+        mix.translationAudible = !translationMuted && volume > 0 && (playback?.outputRMS ?? 0) > 0.002
+        capture?.setMix(mix)
+        if persist && !restoringMix {
+            let defaults = UserDefaults.standard
+            defaults.set(volume, forKey: "translationVolume")
+            defaults.set(sourceVolume, forKey: "sourceVolume")
+            defaults.set(duckSource, forKey: "duckSource")
+            defaults.set(duckLevel, forKey: "duckLevel")
         }
     }
 
@@ -136,13 +164,14 @@ final class SessionModel: ObservableObject {
                 try await capture.prepare(bundleIdentifier: source)
                 try Task.checkCancellation()
                 guard self.generation == id else { throw CancellationError() }
-                self.phase = .connecting
-                let playback = AudioPlayback(); playback.volume = Float(self.volume)
-                try playback.start(); self.playback = playback
-                try await connection.start(apiKey: apiKey, profile: profile, voice: self.voice, englishOnly: self.englishOnly)
+                self.updateMix(persist: false)
+                try await capture.start()
                 try Task.checkCancellation()
                 guard self.generation == id else { throw CancellationError() }
-                try await capture.start()
+                self.phase = .connecting
+                let playback = AudioPlayback(); playback.volume = self.translationMuted ? 0 : Float(self.volume)
+                try playback.start(); self.playback = playback
+                try await connection.start(apiKey: apiKey, profile: profile, voice: self.voice, englishOnly: self.englishOnly)
                 try Task.checkCancellation()
                 guard self.generation == id else { throw CancellationError() }
                 self.phase = .running; self.sessionStart = Date()
@@ -165,7 +194,7 @@ final class SessionModel: ObservableObject {
             lastInputRMS = max(lastInputRMS, rms)
             return
         }
-        guard self.generation == generation, [.running, .connecting].contains(phase) else { return }
+        guard self.generation == generation, phase == .running else { return }
         do { try inputQueue.append(data); receivedSamples += data.count / 2; lastInputRMS = rms }
         catch { Task { await stop(error: error.localizedDescription) } }
     }
@@ -188,6 +217,7 @@ final class SessionModel: ObservableObject {
                         self.lastMeterUpdate = now
                         self.inputLevel = self.lastInputRMS
                         self.outputLevel = self.playback?.outputRMS ?? 0
+                        self.updateMix(persist: false)
                         self.inputBufferMs = self.inputQueue.milliseconds
                         self.outputBufferMs = (self.playback?.queuedSeconds ?? 0) * 1_000
                         self.elapsed = now.timeIntervalSince(self.sessionStart ?? now)
@@ -279,14 +309,16 @@ final class SessionModel: ObservableObject {
             do {
                 try await capture.prepare(bundleIdentifier: source)
                 try Task.checkCancellation()
+                self.updateMix(persist: false)
                 try await capture.start()
                 try await Task.sleep(for: .seconds(10))
                 guard self.generation == id else { await capture.stop(); return }
                 let samples = self.receivedSamples
                 let audible = self.lastInputRMS > 0.002
                 await self.stop()
-                self.notice = audible
-                    ? "Systemton bestätigt: \(samples) Audiosamples empfangen. Der Test hat kein Audio an OpenAI gesendet."
+                self.notice = samples == 0
+                    ? "Keine Audiodaten empfangen. Bitte die macOS-Systemaudiofreigabe und die gewählte Quelle prüfen."
+                    : audible ? "Systemton bestätigt: \(samples) Audiosamples empfangen. Der Test hat kein Audio an OpenAI gesendet."
                     : "Audiozugriff geprüft, aber kein hörbarer Quellton empfangen. Starte Ton in der gewählten App und teste erneut."
             } catch {
                 await capture.stop()

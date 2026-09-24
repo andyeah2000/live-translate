@@ -5,19 +5,31 @@ eine bilinguale menschliche Referenz nicht seriös garantiert werden kann.
 
 ## Aktueller Prüfstand: 24. September 2026
 
-- `npm run check`: erfolgreich; Typecheck, ESLint, 100 Tests einschließlich
+- `npm run check`: erfolgreich; Typecheck, ESLint, 105 Tests einschließlich
   Server-Tests, Coverage, MV3-Build und Audit mit null bekannten Schwachstellen.
 - Coverage der TypeScript-Tests: 94,42 % Lines, 81,32 % Branches,
   81,03 % Functions. Die Mindestwerte 90/75/80 wurden nicht abgesenkt.
-- `swift test --package-path macos`: 13 Tests erfolgreich; PCM16,
+- `swift test --package-path macos`: 19 Tests erfolgreich; PCM16,
   Puffergrenzen, Delta-Texte, echtes Sitzungsprotokoll mit simuliertem Transport,
   Abbrüche, fehlendes Guthaben und bestätigte finale Nutzungswerte.
 - Native Ausgabeprüfung: 12.000 Testton-Samples durch AVAudioEngine abgespielt.
 - Release-App mit Swift 6.4 auf macOS 27 gebaut; lokale Signaturprüfung erfolgreich.
-- Der neue Projektschlüssel wurde über das native Pop-up im Schlüsselbund
-  gespeichert. Auch der erneute echte GPT-Live-Test damit wurde wegen fehlenden
-  API-Guthabens abgelehnt. Der lokale Systemaudio-Test wurde durch macOS TCC
-  abgelehnt. Es liegt deshalb noch keine vollständige Live-Abnahme vor.
+- Native Mix-Regressionen prüfen Sprach-/Atmosphäre-Absenkung, Stummschaltung,
+  Pegelrampen, Silero-Hysterese und Stereo-Deinterleaving ohne Veränderung des
+  API-Eingangs. Das echte gebündelte ONNX-Modell läuft im Test auf Stille.
+- Lokaler Silero-Test mit dem vorhandenen synthetischen Sprachclip: 290
+  Inferenzen, 462 erkannte 20-ms-Sprachblöcke, maximale Wahrscheinlichkeit
+  0,99999964; etwa 38 ms gesamte Inferenz-/Konvertierungszeit. Das ist keine
+  Messung der Ende-zu-Ende-Latenz oder der Erkennungsqualität natürlicher Videos.
+- Der frühere TCC-Signaturfehler ist im macOS-Protokoll nachgewiesen. Das
+  Buildskript verwendet nun eine beständige Apple-Zertifikatssignatur statt
+  einer bei jedem Build wechselnden Ad-hoc-Identität.
+- Der neue native Mix verwendet einen Core-Audio-Tap mit reiner Audiofreigabe.
+  Der echte lokale Audiotest erreicht die macOS-Freigabeaufforderung. Deren
+  Bestätigung und die hörbare Abnahme des vollständigen Mixes stehen noch aus.
+- Der Projektschlüssel liegt im Schlüsselbund. Der letzte echte GPT-Live-Test
+  wurde wegen fehlenden API-Guthabens abgelehnt. Es liegt deshalb noch keine
+  vollständige Live-Abnahme vor.
 - Das kompakte Pop-up mit nativen Bedienelementen, Einstellungen und
   Schlüssel-Speicherung wurde in der installierten Menüleisten-App geprüft.
 
@@ -145,7 +157,7 @@ SpaceX-Players verfügbar.
   kein `session.start` nach HTTP-Start, kein `audio.format` bei WebRTC.
 - Der native `LiveTranslateProbe --live-test` prüft denselben Dienst über
   WebSocket mit einer freigegebenen Sprachdatei. Der App-Test muss zusätzlich
-  echte ScreenCaptureKit-Eingabe, Ausschluss der eigenen Ausgabe und hörbare
+  echte Core-Audio-Tap-Eingabe, Ausschluss der eigenen Ausgabe und hörbare
   deutsche Übersetzung bestätigen; ein Probe-Erfolg allein reicht dafür nicht.
 
 ## Ehrliche Grenze

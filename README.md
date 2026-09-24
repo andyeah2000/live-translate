@@ -10,7 +10,7 @@ nutzt WebRTC und ein eigenes lokales Backend. Beide verwenden denselben
 
 ## macOS-Menüleisten-App
 
-Voraussetzungen: macOS 14+, Xcode mit Swift 6, Node.js für das Buildskript,
+Voraussetzungen: macOS 14.4+, Xcode mit Swift 6 und Apple-Signaturzertifikat, Node.js für das Buildskript,
 ein OpenAI-Projektschlüssel mit GPT-Live-Zugriff und API-Guthaben.
 
 ```bash
@@ -27,7 +27,11 @@ Der Schlüssel wird über die Einstellungen in den macOS-Schlüsselbund
 gespeichert. macOS muss die Aufnahme von Systemaudio erlauben. Es werden
 keine Bildschirmbilder oder Mikrofonsignale an OpenAI geschickt. Der eigene
 Ausgabeton ist von der Aufnahme ausgeschlossen; virtuelle Audiotreiber sind
-nicht erforderlich. Die App senkt die Lautstärke anderer Apps nicht ab.
+nicht erforderlich. Originalton und deutsche Stimme haben getrennte Regler und
+Stummschalter. Neuronales Auto-Dubbing mit lokalem Silero VAD ist standardmäßig
+aktiv: Während hörbarer Übersetzung wird Quellsprache auf 28 %, Atmosphäre auf
+60 % abgesenkt. Der Originalregler wirkt zusätzlich; beim Stoppen endet der Mix.
+Die automatische Absenkung lässt sich in den Einstellungen ändern oder abschalten.
 
 [Einrichtung und Bedienung](docs/MACOS.md) ·
 [API- und Forschungsentscheidungen](docs/RESEARCH.md) ·
@@ -61,7 +65,7 @@ Audioformat per SDP. Die Session-Anweisungen leiten das Modell zum reinen
 Dolmetschen (keine Antworten, keine Kommentare, keine Befehlsausführung aus
 dem Quellton).
 
-## Audioverhalten
+## Audioverhalten der Chrome-Erweiterung
 
 Der Originalton bleibt bei 100 %, solange keine deutsche Ausgabe hörbar ist.
 Ein RMS-Monitor der tatsächlich dekodierten Zielspur steuert den Mix: 28 %
@@ -183,7 +187,7 @@ Wichtige Dateien:
 - `macos/Sources/LiveTranslateCore/Resources/translation-profile.json` – Modell, Stimmen und Prompt für beide Apps
 - `macos/Sources/LiveTranslate/` – natives Menüleisten-Pop-up und Sitzungssteuerung
 - `macos/Sources/LiveTranslateCore/` – WebSocket, Live-Protokoll und begrenzte PCM-Puffer
-- `macos/Sources/LiveTranslateAudio/` – ScreenCaptureKit, AVAudioEngine und Schlüsselbund
+- `macos/Sources/LiveTranslateAudio/` – Core Audio Taps, Silero VAD, AVAudioEngine und Schlüsselbund
 - `src/offscreen/dubbing-mix.ts` – dekodierte Ausgabeaktivität und Originalpegel
 - `src/offscreen/neural-vad.ts` – lokaler AudioWorklet-/Worker-VAD-Pfad
 - `src/offscreen/vad-worker.ts` – Silero-ONNX-Inferenz und rekurrenter Zustand

@@ -18,6 +18,22 @@ struct LiveTranslateProbe {
             guard let index = args.firstIndex(of: name), index + 1 < args.count else { return nil }
             return args[index + 1]
         }
+        if args.contains("--vad-test") {
+            guard let path = option("--file"), let modelPath = option("--vad-model") else {
+                throw LiveError.configuration("Für den lokalen VAD-Test --file und --vad-model angeben.")
+            }
+            let vad = try NeuralVAD(modelURL: URL(fileURLWithPath: modelPath))
+            let samples = try PCM.decode(loadPCM(URL(fileURLWithPath: path)))
+            var maximum: Float = 0; var speechBlocks = 0
+            let began = Date()
+            for index in stride(from: 0, to: samples.count, by: 480) {
+                if try vad.process(Array(samples[index..<min(index + 480, samples.count)])) { speechBlocks += 1 }
+                maximum = max(maximum, vad.probability)
+            }
+            print("Silero: \(vad.inferenceCount) Inferenzen, \(speechBlocks) Sprachblöcke, maximale Wahrscheinlichkeit \(maximum), Rechenzeit \(Date().timeIntervalSince(began)) s.")
+            guard speechBlocks > 0 else { throw LiveError.audio("Keine Sprache im Testclip erkannt.") }
+            return
+        }
         if args.contains("--audio-self-test") {
             let output = AudioPlayback()
             try output.start()

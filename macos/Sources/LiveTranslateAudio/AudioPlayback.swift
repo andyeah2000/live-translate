@@ -10,7 +10,8 @@ public final class AudioPlayback {
     private var scheduledFrames = 0
     private var startTask: Task<Void, Never>?
     private var generation = UUID()
-    public private(set) var outputRMS = 0.0
+    private let meter = PlaybackMeter()
+    public var outputRMS: Double { meter.level }
     public private(set) var playedFrames = 0
     public private(set) var underruns = 0
     public var queuedSeconds: Double { Double(scheduledFrames) / Double(PCM.sampleRate) }
@@ -23,6 +24,9 @@ public final class AudioPlayback {
         engine.connect(timePitch, to: engine.mainMixerNode, format: format)
         timePitch.pitch = 0
         timePitch.rate = 1
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { [meter] buffer, _ in
+            meter.measure(buffer)
+        }
     }
 
     public func start() throws { engine.prepare(); try engine.start() }
@@ -37,7 +41,6 @@ public final class AudioPlayback {
               let channels = buffer.floatChannelData else { throw LiveError.audio("Der Audioausgabepuffer konnte nicht angelegt werden.") }
         buffer.frameLength = AVAudioFrameCount(samples.count)
         samples.withUnsafeBufferPointer { channels[0].update(from: $0.baseAddress!, count: samples.count) }
-        outputRMS = PCM.rms(samples)
         if scheduledFrames == 0 && player.isPlaying { player.pause(); underruns += 1 }
         scheduledFrames += samples.count
         timePitch.rate = PlaybackPolicy.rate(queuedSeconds: queuedSeconds)
@@ -48,7 +51,6 @@ public final class AudioPlayback {
                 self.scheduledFrames = max(0, self.scheduledFrames - samples.count)
                 self.playedFrames += samples.count
                 self.timePitch.rate = PlaybackPolicy.rate(queuedSeconds: self.queuedSeconds)
-                if self.scheduledFrames == 0 { self.outputRMS = 0 }
             }
         }
         if !player.isPlaying {
@@ -81,6 +83,21 @@ public final class AudioPlayback {
         generation = UUID()
         startTask?.cancel(); startTask = nil
         player.stop(); engine.stop(); engine.reset()
-        scheduledFrames = 0; outputRMS = 0; timePitch.rate = 1
+        scheduledFrames = 0; meter.reset(); timePitch.rate = 1
     }
+}
+
+private final class PlaybackMeter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rms = 0.0
+    private var lastActive = Date.distantPast
+    var level: Double { lock.withLock { Date().timeIntervalSince(lastActive) < 0.22 ? rms : 0 } }
+    func measure(_ buffer: AVAudioPCMBuffer) {
+        guard let channels = buffer.floatChannelData, buffer.frameLength > 0 else { return }
+        var energy = 0.0
+        for index in 0..<Int(buffer.frameLength) { energy += Double(channels[0][index] * channels[0][index]) }
+        let value = sqrt(energy / Double(buffer.frameLength))
+        lock.withLock { if value > 0.001 { rms = value; lastActive = Date() } }
+    }
+    func reset() { lock.withLock { rms = 0; lastActive = .distantPast } }
 }
