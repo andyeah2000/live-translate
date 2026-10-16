@@ -137,6 +137,8 @@ test('start validates before requesting permission and sends the canonical URL',
     assert.match(popup.get('#status').textContent, /HTTPS/);
     assert.equal(popup.permissions.length, 0);
     assert.equal(popup.messages.some(message => message.type === 'start-session'), false);
+    popup.broadcast(idleState());
+    assert.match(popup.get('#status').textContent, /HTTPS/, 'background telemetry must not erase validation errors');
 
     popup.get('#liveServerUrl').value = ' https://backend.example/translate/// ';
     popup.get('#toggle').dispatch('click');
@@ -289,4 +291,53 @@ test('service worker startup failure is visible and a later broadcast recovers t
     assert.equal(popup.get('#status').textContent, 'Bereit');
     assert.equal(popup.get('#status').classes.has('error'), false);
   } finally { popup.restore(); }
+});
+
+test('output controls are locked while a start or voice snapshot is being applied', async () => {
+  for (const action of ['start-session', 'change-voice'] as const) {
+    let finish!: (value: { ok: boolean }) => void;
+    const pending = new Promise<{ ok: boolean }>(resolve => { finish = resolve; });
+    const popup = await mount({ send: async message => {
+      if (message.type === action) return pending;
+      return message.type === 'get-state' ? idleState() : { ok: true };
+    } });
+    try {
+      await popup.ready();
+      if (action === 'start-session') popup.get('#toggle').dispatch('click');
+      else popup.get('#liveVoice').dispatch('change');
+      await until(() => popup.messages.some(message => message.type === action));
+      assert.equal(popup.get('#translationVolume').disabled, true, 'volume cannot race the session settings snapshot');
+      assert.equal(popup.get('#subtitles').disabled, true);
+      assert.equal(popup.get('#dualSubtitles').disabled, true);
+      popup.get('#translationVolume').dispatch('input');
+      assert.equal(popup.messages.some(message => message.type === 'update-output-settings'), false);
+      finish({ ok: true });
+      await until(() => !popup.get('#translationVolume').disabled);
+      assert.equal(popup.get('#subtitles').disabled, false);
+      assert.equal(popup.get('#dualSubtitles').disabled, false);
+    } finally { finish({ ok: true }); popup.restore(); }
+  }
+});
+
+test('an active session can still be stopped during a pending voice change', async () => {
+  let finish!: (value: { ok: boolean }) => void;
+  const pending = new Promise<{ ok: boolean }>(resolve => { finish = resolve; });
+  let state = { ...idleState(), running: true, tabId: 7, sessionId: 'active' };
+  const popup = await mount({ send: async message => {
+    if (message.type === 'get-state') return state;
+    if (message.type === 'change-voice') return pending;
+    if (message.type === 'stop-session') state = { ...state, running: false };
+    return { ok: true };
+  } });
+  try {
+    await popup.ready();
+    popup.get('#liveVoice').dispatch('change');
+    await until(() => popup.messages.some(message => message.type === 'change-voice'));
+    assert.equal(popup.get('#toggle').disabled, false, 'Stop remains available during voice negotiation');
+    popup.get('#toggle').dispatch('click');
+    await until(() => popup.messages.some(message => message.type === 'stop-session'));
+    finish({ ok: true });
+    await until(() => !popup.get('#toggle').disabled && !popup.get('#liveVoice').disabled);
+    assert.equal(popup.get('#toggle').textContent, 'Start');
+  } finally { finish({ ok: true }); popup.restore(); }
 });

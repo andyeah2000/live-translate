@@ -590,6 +590,23 @@ test('an unresponsive direct-input offer is cancelled before bounded fallback to
   assert.ok(lifecycleEvents.indexOf('tab:media-input-stop') < lifecycleEvents.indexOf('runtime:offscreen-start'));
 });
 
+test('a frozen page cannot block Stop behind subtitle delivery or page cleanup', async (t) => {
+  reset();
+  const nativeTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (callback: () => void, delay: number) =>
+    nativeTimeout(callback, delay === 1_000 ? 20 : delay));
+  subtitleSendGate = deferred<void>();
+  clearSendGate = deferred<void>();
+  stuckInputStop = true;
+  emit({ type: 'transcript', sessionId: 'session-a', event: { kind: 'chunk', lane: 'target', text: 'blocked page' } });
+  await waitFor(() => tabMessages.some(({ message }) => message.type === 'subtitle'), 'blocked transcript');
+  assert.deepEqual(await request({ type: 'stop-session' }), { ok: true });
+  assert.equal((sessionStore.sessionState as { running: boolean }).running, false);
+  const cleanup = tabMessages.find(({ message }) => message.type === 'media-input-stop');
+  assert.equal(cleanup?.message.sessionId, 'session-a');
+  assert.deepEqual(tabMessages.map(({ message }) => message.type), ['subtitle', 'media-input-stop', 'subtitle-clear']);
+});
+
 test('a rejected local audio answer stops the matching session visibly', async () => {
   reset();
   inputAnswerResponse = { ok: false, error: 'local answer rejected' };

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { placeSubtitleHost, subtitleOverlayTarget } from '../src/subtitle-placement';
+import { placeSubtitleHost, subtitleFullscreenElement, subtitleOverlayTarget } from '../src/subtitle-placement';
 
 function element(tagName: string): Element {
   return { tagName } as Element;
@@ -37,4 +37,18 @@ test('subtitle overlay follows a fullscreen container and returns to the body', 
   } as unknown as Element;
   placeSubtitleHost(host, bodyTarget);
   assert.equal(host.parentNode, bodyTarget);
+});
+
+test('fullscreen placement resolves nested web-component shadow roots', () => {
+  const video = element('VIDEO');
+  const player = { tagName: 'PLAYER', shadowRoot: { fullscreenElement: video } } as unknown as Element;
+  const outer = { tagName: 'OUTER', shadowRoot: { fullscreenElement: player } } as unknown as Element;
+  const body = element('BODY') as HTMLElement;
+  const root = element('HTML') as HTMLElement;
+  assert.equal(subtitleFullscreenElement(outer), video);
+  assert.equal(subtitleFullscreenElement(null), null);
+  assert.equal(subtitleOverlayTarget(outer, body, root), body);
+  const container = element('DIV');
+  const shadowPlayer = { tagName: 'PLAYER', shadowRoot: { fullscreenElement: container } } as unknown as Element;
+  assert.equal(subtitleOverlayTarget(shadowPlayer, body, root), container);
 });

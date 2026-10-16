@@ -40,6 +40,8 @@ export function initializePopup(): void {
   };
   let stateRevision = 0;
   let operationPending = false;
+  let voicePending = false;
+  let localError: string | null = null;
   let connectionSettings = { liveServerUrl: '', liveServerToken: '' };
 
   function collectSettings(includeConnectionEdits = true): SessionSettings {
@@ -56,23 +58,31 @@ export function initializePopup(): void {
   }
 
   function setStatus(text: string, isError = false): void {
+    localError = isError ? text : null;
+    renderStatus(text, isError);
+  }
+
+  function renderStatus(text: string, isError: boolean): void {
     statusLine.textContent = text;
     statusLine.classList.toggle('error', isError);
   }
 
   function renderState(): void {
     toggleButton.textContent = state.running ? 'Stop' : 'Start';
+    // An active session can still be stopped while its voice is being changed.
+    toggleButton.disabled = operationPending || (voicePending && !state.running);
     toggleButton.classList.toggle('running', state.running);
     toggleButton.setAttribute('aria-pressed', String(state.running));
     // Credentials stay fixed; voice changes restart through the background queue.
-    liveServerUrlInput.disabled = state.running || operationPending;
-    liveServerTokenInput.disabled = state.running || operationPending;
-    voiceSelect.disabled = operationPending;
+    liveServerUrlInput.disabled = state.running || operationPending || voicePending;
+    liveServerTokenInput.disabled = state.running || operationPending || voicePending;
+    voiceSelect.disabled = operationPending || voicePending;
     voiceSelect.title = 'Stimme wechseln – laufende Übersetzung startet automatisch neu';
     const status = popupStatusPresentation(state);
-    setStatus(status.text, status.error);
+    renderStatus(status.error ? status.text : (localError ?? status.text), status.error || localError !== null);
     toggleButton.title = status.text;
     renderMonitor();
+    renderOutputControls();
   }
 
   function renderMonitor(): void {
@@ -159,6 +169,7 @@ export function initializePopup(): void {
 
   async function onToggle(): Promise<void> {
     if (operationPending) return;
+    localError = null;
     operationPending = true;
     toggleButton.disabled = true;
     renderState();
@@ -177,15 +188,12 @@ export function initializePopup(): void {
       setStatus(err instanceof Error ? err.message : String(err), true);
     } finally {
       operationPending = false;
-      toggleButton.disabled = false;
-      // Keep a local validation/start error visible until the next state update.
-      liveServerUrlInput.disabled = state.running;
-      liveServerTokenInput.disabled = state.running;
-      voiceSelect.disabled = false;
+      renderState();
     }
   }
 
   function saveConfiguration(): void {
+    localError = null;
     const settings = collectSettings();
     const validationError = configurationError(settings, false);
     if (validationError) {
@@ -197,12 +205,16 @@ export function initializePopup(): void {
       if (liveServerUrlInput.value.trim() === settings.liveServerUrl) {
         liveServerUrlInput.value = normalizeServerUrl(settings.liveServerUrl)!;
       }
-      const status = popupStatusPresentation(state);
-      setStatus(status.text, status.error);
+      localError = null;
+      renderState();
     }).catch(() => setStatus('Speichern fehlgeschlagen.', true));
   }
 
   async function changeVoice(): Promise<void> {
+    if (operationPending || voicePending) return;
+    voicePending = true;
+    localError = null;
+    renderState();
     try {
       const settings = collectSettings(false);
       await saveSettings(settings);
@@ -213,6 +225,9 @@ export function initializePopup(): void {
       await refreshState();
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err), true);
+    } finally {
+      voicePending = false;
+      renderState();
     }
   }
 
@@ -220,10 +235,16 @@ export function initializePopup(): void {
     const value = translationVolumeInput.value;
     translationValue.textContent = `${value} %`;
     translationVolumeInput.style.setProperty('--fill', `${value}%`);
-    dualSubtitlesInput.disabled = !subtitlesInput.checked;
+    const applyingSnapshot = operationPending || voicePending;
+    translationVolumeInput.disabled = applyingSnapshot;
+    subtitlesInput.disabled = applyingSnapshot;
+    dualSubtitlesInput.disabled = applyingSnapshot || !subtitlesInput.checked;
   }
 
   function updateOutputSettings(): void {
+    if (operationPending || voicePending) return;
+    localError = null;
+    renderState();
     const settings = collectSettings(false);
     renderOutputControls();
     void saveSettings(settings).catch(() => setStatus('Speichern fehlgeschlagen.', true));

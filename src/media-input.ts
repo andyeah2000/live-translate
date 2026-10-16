@@ -6,9 +6,16 @@ export function installMediaInput(): void {
   let stream: MediaStream | null = null;
   let id: string | null = null;
   let generation = 0;
+  let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearRecoveryTimer = () => {
+    if (recoveryTimer !== null) clearTimeout(recoveryTimer);
+    recoveryTimer = null;
+  };
   const stop = () => {
     generation++;
+    clearRecoveryTimer();
     peer?.close(); peer = null;
+    if (stream) stream.onaddtrack = null;
     stream?.getTracks().forEach(track => track.stop()); stream = null;
     id = null;
   };
@@ -27,12 +34,52 @@ export function installMediaInput(): void {
     if (!stream.getAudioTracks().length) throw new Error('Video liefert keine direkte Audiospur.');
     const connection = new RTCPeerConnection({ iceServers: [] });
     peer = connection;
-    stream.getAudioTracks().forEach(track => {
-      connection.addTrack(track, stream!);
-      // A media source replacement can end captured tracks without changing ICE.
-      // Close the bridge so the receiver's connection watchdog sees the loss.
-      track.onended = () => { if (peer === connection) stop(); };
-    });
+    const captured = stream;
+    const slots: Array<{ track: MediaStreamTrack; sender: RTCRtpSender }> = [];
+    const watchTrack = (slot: typeof slots[number]) => {
+      const watched = slot.track;
+      watched.onended = () => {
+        if (peer !== connection || slot.track !== watched) return;
+        // Source/ad changes end the old capture track before adding its
+        // successor. Keep the negotiated peer long enough to replace it.
+        if (recoveryTimer === null && slots.every(item => item.track.readyState === 'ended')) {
+          recoveryTimer = setTimeout(() => {
+            if (peer !== connection) return;
+            recoveryTimer = null;
+            stop();
+          }, 5_000);
+        }
+      };
+    };
+    for (const track of captured.getAudioTracks()) {
+      const slot = { track, sender: connection.addTrack(track, captured) };
+      slots.push(slot);
+      watchTrack(slot);
+    }
+    captured.onaddtrack = ({ track }) => {
+      if (peer !== connection) return;
+      // Source changes can also add video tracks after the initial cleanup.
+      if (track.kind !== 'audio') {
+        track.stop();
+        captured.removeTrack(track);
+        return;
+      }
+      const slot = slots.find(item => item.track.readyState === 'ended');
+      if (!slot) {
+        // Adding an extra m-line would require renegotiation. Do not silently
+        // translate the wrong track when the source topology changes.
+        stop();
+        return;
+      }
+      slot.track.onended = null;
+      slot.track = track;
+      watchTrack(slot);
+      void slot.sender.replaceTrack(track).then(() => {
+        if (peer === connection && slot.track === track && track.readyState === 'live') clearRecoveryTimer();
+      }, () => {
+        if (peer === connection && slot.track === track) stop();
+      });
+    };
     await connection.setLocalDescription(await connection.createOffer());
     const sdp = await gatherLocalDescription(connection);
     if (peer !== connection) throw new Error('Audioaufnahme ersetzt.');

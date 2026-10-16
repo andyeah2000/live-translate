@@ -3,6 +3,55 @@
 Diese Datei trennt nachgewiesene Eigenschaften von Modellqualität, die ohne
 eine bilinguale menschliche Referenz nicht seriös garantiert werden kann.
 
+## Nachprüfung: 16. Oktober 2026 · Version 3.0.2
+
+- Vertiefte Architekturprüfung mit drei getrennten Prüflinien und zusätzlicher
+  unabhängiger Gegenprüfung der Aufnahme-/Lebenszyklusänderungen. Ergebnisse
+  und verbleibende Grenzen stehen in `ARCHITECTURE_AUDIT.md`.
+- Vollständiges `npm run check` mit Node **24.22.0** erfolgreich:
+  TypeScript, ESLint, **174/174 Tests**, Coverage, MV3-Build und Audit mit
+  **0 bekannten Schwachstellen**. Gegenüber 3.0.1 neun zusätzliche Testfälle.
+- Coverage: **96,47 % Lines / 86,04 % Branches / 86,81 % Functions**;
+  die Coverage-Ausführung enthält 155 TypeScript-Tests. Die Mindestwerte
+  **90/75/80** bleiben unverändert.
+- Wegen stockender FileProvider-Zugriffe wurde der abschließende Lauf aus
+  einer lokalen Kopie außerhalb des synchronisierten Projektordners ausgeführt.
+  Die 105 kopierten Quelldateien wurden anschließend vor der Buildübernahme
+  per SHA-256 gegen das Arbeitsverzeichnis geprüft. Alle waren identisch.
+- Der geprüfte Build liegt in `dist/`, als ZIP in
+  `artifacts/live-translate-3.0.2-chrome.zip` und als bytegeprüfte Desktop-Kopie
+  `~/Desktop/LiveTranslateChrome`. Keine Zugangsdaten sind Teil des Builds.
+- Lokaler Server mit gespeicherter Konfiguration auf `127.0.0.1:8787`:
+  fehlender Token **401**, falscher Token **401**, fremde Origin **403**,
+  ungültiges SDP **400**. Diese vier Probes erzeugen keine Providersitzung.
+
+### Echte Provider- und Chrome-Prüfungen
+
+Der native Probe-Client hat mit `gpt-live-1` und Stimme `meridian` tatsächlich
+Audio übertragen und deutsche Audioausgabe empfangen. Der synthetische
+englische Clip dauert **16,38 Sekunden**. Zahlen, Verneinung und die Form einer
+Frage blieben in der deutschen Übersetzung erhalten. Gemessen wurden
+**1,87 Sekunden** Verbindungsaufbau und **3,02 Sekunden** bis zur ersten nicht
+stillen Ausgabe nach dem ersten nicht stillen Eingang. **44 Quell- und 49
+Zieltranskript-Deltas**, bestätigtes `session.closed`, 26 Nutzungssekunden.
+Die Paketzeit ist keine Messung semantischer Übersetzungsverzögerung. Eine
+menschliche Hörbewertung wurde damit nicht ersetzt.
+
+Im tatsächlich geladenen **Chrome-Build 3.0.1** wurden auf einem YouTube-Video
+deutsche Untertitel und der Status **„Deutsche Sprachausgabe · Audiopegel
+gemessen“** beobachtet. Ziel-Lautstärke **0 %** stellte den angezeigten
+Originalpegel auf **100 %**; Zurückstellen auf **100 %** aktivierte die Ausgabe
+wieder. Der Stop-Knopf führte sichtbar zu **„Gestoppt“** ohne angezeigten
+Finalisierungsfehler. Das offizielle Tesla-Video „Roadster Event“ wurde
+zusätzlich geöffnet und bei 0:00 pausiert bereitgelegt.
+
+Der aktualisierte Build **3.0.2** benötigt nach dem Austausch der Desktop-Dateien
+ein manuelles Neuladen der Erweiterung. Seine vollständige Live-Abnahme wird
+erst nach diesem Neuladen bestätigt. Die Browsersteuerung verweigert den
+automatischen Zugriff auf `chrome://extensions`; die Sperre wurde nicht
+umgangen. Längere Sitzungen, wechselnde Netzbedingungen, vollständige
+Vollbild-Abnahme und bilinguale Hörbewertung bleiben offen.
+
 ## Prüfstand: 16. Oktober 2026 · Version 3.0.1
 
 Geprüfte Ausgangsbasis: `f7d1a896230df5a0ce022198cefcf0e768814db6`.
@@ -64,10 +113,11 @@ beibehalten. Der Session-Vertrag wurde am 16. Oktober 2026 mit der
 [offiziellen Create-Session-Dokumentation](https://developers.openai.com/api/reference/resources/live/methods/create)
 abgeglichen.
 
-In diesem frischen Checkout sind weder `.env.local`/`OPENAI_API_KEY` noch der
-früher dokumentierte LaunchAgent vorhanden. Es wurden keine kostenpflichtigen
-Live-Anfragen ausgeführt. Echte Chrome-Tab-Aufnahme, hörbare Übersetzung,
-bilinguale Genauigkeit und Ende-zu-Ende-Latenz bleiben daher offen.
+Zum Zeitpunkt dieses ersten Prüflaufs waren weder `.env.local`/`OPENAI_API_KEY`
+noch der früher dokumentierte LaunchAgent im frischen Checkout vorhanden.
+Dieser erste Lauf enthielt keine kostenpflichtigen Live-Anfragen. Die später
+ausgeführten Provider- und Chrome-Prüfungen stehen im Abschnitt zur Nachprüfung
+oben; deren genaue Grenzen bleiben maßgeblich.
 Die folgenden älteren Ergebnisse sind historische Evidenz und wurden nur dort
 erneut geprüft, wo der aktuelle Abschnitt dies ausdrücklich ausweist.
 

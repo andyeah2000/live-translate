@@ -71,6 +71,16 @@ function broadcast(msg: Message): void {
   });
 }
 
+function sendToTab(tabId: number, message: object): Promise<unknown> {
+  // A busy or frozen page can retain a message port indefinitely. Subtitle
+  // delivery and cleanup share the session queue, so neither may block Stop.
+  return withMessageTimeout(
+    chrome.tabs.sendMessage(tabId, message),
+    1_000,
+    'Der Video-Tab antwortet nicht.'
+  );
+}
+
 /**
  * Sendet an das Offscreen-Dokument und wartet auf dessen Bestätigung.
  * Direkt nach createDocument() ist der Message-Listener dort unter Umständen
@@ -259,7 +269,7 @@ async function startSession(
     const detail = err instanceof Error ? err.message : String(err);
     // Nur aufräumen, wenn nicht inzwischen bewusst gestoppt/neu gestartet wurde.
     if (epoch === sessionEpoch) {
-      await chrome.tabs.sendMessage(tabId, { type: 'media-input-stop' }).catch(() => {});
+      await sendToTab(tabId, { type: 'media-input-stop', sessionId }).catch(() => {});
       await stopSession(detail);
     }
     return { ok: false, error: detail };
@@ -281,9 +291,8 @@ async function stopSession(error: string | null = null): Promise<void> {
     throw err;
   }
   if (state.tabId !== null) {
-    await chrome.tabs.sendMessage(state.tabId, { type: 'media-input-stop' }).catch(() => {});
-    await chrome.tabs
-      .sendMessage(state.tabId, { type: 'subtitle-clear' } satisfies Message)
+    await sendToTab(state.tabId, { type: 'media-input-stop', sessionId: state.sessionId }).catch(() => {});
+    await sendToTab(state.tabId, { type: 'subtitle-clear' } satisfies Message)
       .catch(() => {});
   }
   error ??= lastFinalizationError;
@@ -327,8 +336,7 @@ async function forwardTranscript(
   }
   // Das Senden wird bewusst abgewartet. Dadurch kann die serialisierte
   // Stop-Operation `subtitle-clear` garantiert erst danach zustellen.
-  await chrome.tabs
-    .sendMessage(currentState.tabId, { type: 'subtitle', event } satisfies Message)
+  await sendToTab(currentState.tabId, { type: 'subtitle', event } satisfies Message)
     .catch(() => {});
 }
 
@@ -352,8 +360,7 @@ async function updateOutputSettings(
   // Beim Abschalten und beim Moduswechsel sauber neu beginnen, damit keine
   // veraltete Original-Zeile aus dem vorherigen Modus stehen bleibt.
   if (!msg.settings.subtitles || previousOutput.mode !== nextMode) {
-    await chrome.tabs
-      .sendMessage(observedState.tabId, { type: 'subtitle-clear' } satisfies Message)
+    await sendToTab(observedState.tabId, { type: 'subtitle-clear' } satisfies Message)
       .catch(() => {});
   }
   // Auch nach dem asynchronen Clear nur die weiterhin identische Sitzung

@@ -3,14 +3,23 @@ import test from 'node:test';
 import { installMediaInput } from '../src/media-input';
 
 test('direct input acknowledges negotiation and cleans failures without stopping a replacement session', async () => {
-  const names = ['chrome', 'document', 'window', 'HTMLMediaElement', 'RTCPeerConnection', 'setInterval', 'clearInterval'] as const;
+  const names = ['chrome', 'document', 'window', 'HTMLMediaElement', 'RTCPeerConnection', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] as const;
   const previous = Object.fromEntries(names.map(name => [name, (globalThis as Record<string, unknown>)[name]]));
-  const tracks: Array<{ kind: string; stopped: boolean; onended?: () => void; stop(): void }> = [];
+  type CapturedTrack = { kind: string; readyState: string; stopped: boolean; onended?: (() => void) | null; stop(): void };
+  const tracks: CapturedTrack[] = [];
+  const streams: Array<{ onaddtrack?: ((event: { track: CapturedTrack }) => void) | null; add(track: CapturedTrack): void }> = [];
+  const replacements: CapturedTrack[] = [];
+  let replacement: () => Promise<void> = async () => {};
+  let recovery: (() => void) | null = null;
   let listener!: (message: Record<string, unknown>, sender: { id: string }, respond: (value: unknown) => void) => unknown;
   let pagehide!: () => void;
   let health!: () => void;
   let answer: () => Promise<void> = async () => {};
   const peers: PeerMock[] = [];
+  const newTrack = (kind: string): CapturedTrack => ({
+    kind, readyState: 'live', stopped: false,
+    stop() { this.stopped = true; this.readyState = 'ended'; }
+  });
   class MediaMock {
     paused = false;
     ended = false;
@@ -18,14 +27,18 @@ test('direct input acknowledges negotiation and cleans failures without stopping
     clientWidth = 640;
     clientHeight = 360;
     captureStream() {
-      const captured = ['audio', 'video'].map(kind => ({ kind, stopped: false, stop() { this.stopped = true; } }));
+      const captured = ['audio', 'video'].map(newTrack);
       tracks.push(...captured);
-      return {
+      const stream = {
+        onaddtrack: null as ((event: { track: CapturedTrack }) => void) | null,
         getTracks: () => captured,
         getAudioTracks: () => captured.filter(track => track.kind === 'audio'),
         getVideoTracks: () => captured.filter(track => track.kind === 'video'),
-        removeTrack: (track: typeof captured[number]) => captured.splice(captured.indexOf(track), 1)
+        removeTrack: (track: CapturedTrack) => captured.splice(captured.indexOf(track), 1),
+        add(track: CapturedTrack) { captured.push(track); tracks.push(track); this.onaddtrack?.({ track }); }
       };
+      streams.push(stream);
+      return stream;
     }
   }
   class PeerMock {
@@ -33,7 +46,7 @@ test('direct input acknowledges negotiation and cleans failures without stopping
     iceGatheringState = 'complete';
     localDescription = { sdp: 'v=0\r\n' };
     constructor() { peers.push(this); }
-    addTrack() {}
+    addTrack() { return { replaceTrack(track: CapturedTrack) { replacements.push(track); return replacement(); } }; }
     createOffer = async () => this.localDescription;
     setLocalDescription = async () => {};
     setRemoteDescription = () => answer();
@@ -47,7 +60,9 @@ test('direct input acknowledges negotiation and cleans failures without stopping
     HTMLMediaElement: MediaMock,
     RTCPeerConnection: PeerMock,
     setInterval: (handler: () => void) => { health = handler; return 1; },
-    clearInterval: () => {}
+    clearInterval: () => {},
+    setTimeout: (handler: () => void) => { recovery = handler; return 1; },
+    clearTimeout: () => { recovery = null; }
   });
   const request = (message: Record<string, unknown>) => new Promise<unknown>(resolve => {
     const result = listener(message, { id: 'test' }, resolve);
@@ -79,8 +94,21 @@ test('direct input acknowledges negotiation and cleans failures without stopping
     assert.equal(peers.at(-1)!.closed, false, 'a late negotiation failure must not stop a replacement capture');
     tracks[0]!.onended!();
     assert.equal(peers.at(-1)!.closed, false, 'an old ended track must not stop a replacement capture');
-    tracks.filter(track => track.kind === 'audio').at(-1)!.onended!();
-    assert.equal(peers.at(-1)!.closed, true, 'ending the media source closes the direct bridge');
+    const oldAudio = tracks.filter(track => track.kind === 'audio').at(-1)!;
+    oldAudio.readyState = 'ended'; oldAudio.onended!();
+    assert.equal(peers.at(-1)!.closed, false, 'source replacement gets a bounded recovery window');
+    const replacementAudio = newTrack('audio');
+    streams.at(-1)!.add(replacementAudio);
+    const replacementVideo = newTrack('video');
+    streams.at(-1)!.add(replacementVideo);
+    await Promise.resolve();
+    assert.deepEqual(replacements, [replacementAudio]);
+    assert.equal(recovery, null, 'successful track replacement cancels the no-audio deadline');
+    assert.equal(replacementVideo.stopped, true, 'later video tracks must also be discarded');
+    assert.equal(peers.at(-1)!.closed, false, 'source replacement retains the existing peer and paid session');
+    replacementAudio.readyState = 'ended'; replacementAudio.onended!();
+    (recovery as (() => void) | null)?.();
+    assert.equal(peers.at(-1)!.closed, true, 'a permanently ended source eventually closes the bridge');
     await request({ type: 'media-input-offer', sessionId: 'd' });
     assert.deepEqual(await request({ type: 'media-input-stop', sessionId: 'old' }), { ok: true });
     assert.equal(peers.at(-1)!.closed, false, 'late scoped cleanup preserves the replacement bridge');
@@ -90,6 +118,22 @@ test('direct input acknowledges negotiation and cleans failures without stopping
     pagehide();
     assert.equal(peers.at(-1)!.closed, true);
     assert.equal(tracks.every(track => track.stopped), true);
+    await request({ type: 'media-input-offer', sessionId: 'f' });
+    const failedAudio = tracks.filter(track => track.kind === 'audio').at(-1)!;
+    failedAudio.readyState = 'ended'; failedAudio.onended!();
+    let rejectReplacement!: (error: Error) => void;
+    replacement = () => new Promise((_resolve, reject) => { rejectReplacement = reject; });
+    streams.at(-1)!.add(newTrack('audio'));
+    await request({ type: 'media-input-offer', sessionId: 'g' });
+    rejectReplacement(new Error('late replacement failure'));
+    await Promise.resolve();
+    assert.equal(peers.at(-1)!.closed, false, 'a stale replacement failure cannot stop the new capture');
+    const currentAudio = tracks.filter(track => track.kind === 'audio').at(-1)!;
+    currentAudio.readyState = 'ended'; currentAudio.onended!();
+    replacement = async () => { throw new Error('replacement rejected'); };
+    streams.at(-1)!.add(newTrack('audio'));
+    await Promise.resolve();
+    assert.equal(peers.at(-1)!.closed, true, 'a rejected current replacement closes the failed bridge');
     runtime.id = '';
     health();
   } finally {

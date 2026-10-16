@@ -1,5 +1,5 @@
 import type { Message, TranscriptEvent } from './messages';
-import { placeSubtitleHost, subtitleOverlayTarget } from './subtitle-placement';
+import { placeSubtitleHost, subtitleFullscreenElement, subtitleOverlayTarget } from './subtitle-placement';
 import { SubtitleState } from './subtitle-state';
 import { installMediaInput } from './media-input';
 
@@ -27,7 +27,7 @@ function setup(): void {
   const nativeTracks = new WeakMap<HTMLVideoElement, TextTrack>();
 
   function fullscreenVideo(): HTMLVideoElement | null {
-    const fullscreen = document.fullscreenElement;
+    const fullscreen = subtitleFullscreenElement(document.fullscreenElement);
     return fullscreen?.tagName === 'VIDEO' ? (fullscreen as HTMLVideoElement) : null;
   }
 
@@ -45,6 +45,8 @@ function setup(): void {
   function clearNativeTrack(): void {
     clearNativeCue();
     if (nativeTrack) nativeTrack.mode = 'disabled';
+    nativeVideo?.removeEventListener('seeking', onMediaTimelineChange);
+    nativeVideo?.removeEventListener('ratechange', onMediaTimelineChange);
     nativeTrack = null;
     nativeVideo = null;
   }
@@ -64,13 +66,18 @@ function setup(): void {
       nativeTrack = existingTrack ?? video.addTextTrack('subtitles', 'Live Translation', 'und');
       nativeTracks.set(video, nativeTrack);
       nativeTrack.mode = 'showing';
+      video.addEventListener('seeking', onMediaTimelineChange);
+      video.addEventListener('ratechange', onMediaTimelineChange);
     }
     clearNativeCue();
     const snapshot = subtitleState.snapshot();
     const text = [snapshot.upper, snapshot.lower].filter(Boolean).join('\n').trim();
     if (!text) return true;
     const now = Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : 0;
-    const cue = new VTTCue(Math.max(0, now - 0.1), now + HIDE_AFTER_MS / 1_000, escapeVttText(text));
+    // Cue timestamps use media time; the hide timer uses wall time. At 2x,
+    // five media seconds would otherwise disappear after only 2.5 seconds.
+    const rate = Number.isFinite(video.playbackRate) && video.playbackRate > 0 ? video.playbackRate : 1;
+    const cue = new VTTCue(Math.max(0, now - 0.1), now + HIDE_AFTER_MS / 1_000 * rate, escapeVttText(text));
     cue.line = -3;
     cue.align = 'center';
     nativeTrack.addCue(cue);
@@ -186,6 +193,10 @@ function setup(): void {
 
   const onFullscreenChange = () => render();
   document.addEventListener('fullscreenchange', onFullscreenChange);
+  // Listen directly on the active native video, including inside shadow roots.
+  // Reanchor its cue without extending the existing wall-clock expiry.
+  function onMediaTimelineChange(): void { render(); }
+  window.addEventListener('pagehide', clear);
 
   // Wurde die Extension neu geladen/entfernt, ist dieser Skript-Kontext
   // verwaist – Overlay aufräumen statt es für immer stehen zu lassen.
@@ -200,6 +211,7 @@ function setup(): void {
       clear();
       window.clearInterval(healthTimer);
       document.removeEventListener('fullscreenchange', onFullscreenChange);
+      window.removeEventListener('pagehide', clear);
       try {
         chrome.runtime.onMessage.removeListener(onMessage);
       } catch {

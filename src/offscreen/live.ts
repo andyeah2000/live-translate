@@ -148,6 +148,9 @@ export class GptLiveTranslator {
     if (this.stopped || connection !== this.peer) throw this.failure ?? new Error('Die GPT-Live-Sitzung wurde beendet.');
     await connection.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
     await this.waitForStart();
+    // The ready event and a terminal event can arrive in the same task before
+    // this continuation runs. Never turn that failure into a successful start.
+    if (this.stopped) throw this.failure ?? new Error('Die GPT-Live-Sitzung wurde beendet.');
     this.watchReceivers();
   }
 
@@ -235,7 +238,10 @@ export class GptLiveTranslator {
     this.remoteAudio = null;
     this.meter?.disconnect();
     this.meter = null;
-    if (this.lastTrack) this.lastTrack.onunmute = null;
+    if (this.lastTrack) {
+      this.lastTrack.onunmute = null;
+      this.lastTrack.onended = null;
+    }
     this.lastTrack = null;
     this.attachedTrackIds.clear();
     this.playbackGeneration++;
@@ -325,7 +331,10 @@ export class GptLiveTranslator {
   private connectTrack(track: MediaStreamTrack, stream: MediaStream): void {
     if (this.stopped || (this.lastTrack === track && this.remoteAudio !== null)) return;
     try {
-      if (this.lastTrack) this.lastTrack.onunmute = null;
+      if (this.lastTrack) {
+        this.lastTrack.onunmute = null;
+        this.lastTrack.onended = null;
+      }
       this.remoteAudio?.disconnect();
       console.info(
         `[live-translate] Remote-Audiotrack: readyState=${track.readyState} muted=${track.muted} enabled=${track.enabled}`
@@ -351,12 +360,20 @@ export class GptLiveTranslator {
       });
       this.attachedTrackIds.add(track.id);
       this.lastTrack = track;
-      this.opts.onStatus(`GPT-Live aktiv · Zielstimme verbunden · Spur ${this.attachedTrackIds.size}`);
+      track.onended = () => {
+        if (this.lastTrack !== track || this.stopped || this.closing || this.sessionClosed) return;
+        this.fail('Die GPT-Live-Zielstimme wurde unerwartet beendet. Bitte neu starten.');
+      };
+      if (track.readyState === 'ended') {
+        track.onended(new Event('ended'));
+        return;
+      }
       // Manche Tracks starten stumm und liefern erst später Frames. Falls der
       // Track dauerhaft stumm bleibt, wird das sichtbar statt still.
       track.onunmute = () => {
         console.info('[live-translate] Remote-Audiotrack liefert Frames.');
       };
+      this.opts.onStatus(`GPT-Live aktiv · Zielstimme verbunden · Spur ${this.attachedTrackIds.size}`);
     } catch (error) {
       this.fail(`Die GPT-Live-Audiospur konnte nicht wiedergegeben werden: ${errorMessage(error)}`);
     }
@@ -374,6 +391,9 @@ export class GptLiveTranslator {
     if (event.kind === 'started') {
       if (this.closing || this.ready) return;
       this.setReady(true);
+      // onReadyChange may synchronously stop a failed AudioContext. Do not
+      // resurrect its status or install a watchdog after resource teardown.
+      if (this.stopped || this.closing || this.sessionClosed) return;
       this.resolveStart?.();
       this.clearStartTimer();
       // Empfängerstand direkt in den Status: So ist ohne Devtools sichtbar,
@@ -395,7 +415,14 @@ export class GptLiveTranslator {
       this.opts.onTranscript(event.event);
     } else if (event.kind === 'closed') {
       const expected = this.closing;
+      const detail = 'GPT-Live hat die Sitzung beendet. Bitte neu starten.';
       this.sessionClosed = true;
+      if (!expected) {
+        this.failure = new Error(detail);
+        // clearTimers also clears the startup callbacks. Settle its promise
+        // first when the server closes before session.started.
+        this.rejectStart?.(this.failure);
+      }
       this.clearTimers();
       this.setReady(false);
       this.resolveClosed?.();
@@ -403,7 +430,7 @@ export class GptLiveTranslator {
       this.rejectClosed = null;
       if (!expected) {
         this.stop();
-        this.opts.onError('GPT-Live hat die Sitzung beendet. Bitte neu starten.');
+        this.opts.onError(detail);
       }
     } else if (event.kind === 'delegation') {
       this.rejectedDelegations += 1;

@@ -17,13 +17,14 @@ async function harness(run: (state: Awaited<ReturnType<typeof setup>>) => Promis
   }
 }
 
-async function setup(options: { response?: () => Promise<Response>; sourceCaptions?: boolean; failPlayback?: boolean; autoStart?: boolean } = {}) {
+async function setup(options: { response?: () => Promise<Response>; sourceCaptions?: boolean; failPlayback?: boolean; autoStart?: boolean; readyCallback?: (ready: boolean) => void } = {}) {
   const errors: string[] = [];
   const captions: TranscriptEvent[] = [];
   const statuses: string[] = [];
   const ready: boolean[] = [];
   const timeouts = new Map<ReturnType<typeof setTimeout>, { callback: () => void; delay: number }>();
-  const track = { kind: 'audio', id: 'remote', readyState: 'live', muted: false, enabled: true, onunmute: null as (() => void) | null };
+  const track = { kind: 'audio', id: 'remote', readyState: 'live', muted: false, enabled: true,
+    onunmute: null as (() => void) | null, onended: null as (() => void) | null };
   class Channel extends EventTarget {
     readyState = 'open';
     sent: Record<string, unknown>[] = [];
@@ -91,7 +92,7 @@ async function setup(options: { response?: () => Promise<Response>; sourceCaptio
     serverUrl: 'http://localhost:8787', serverToken: 'local-test', voice: 'meridian',
     inputTranscriptionEnabled: options.sourceCaptions ?? true,
     onTranscript: event => captions.push(event), onStatus: status => statuses.push(status),
-    onReadyChange: value => ready.push(value), onError: detail => errors.push(detail)
+    onReadyChange: value => { ready.push(value); options.readyCallback?.(value); }, onError: detail => errors.push(detail)
   });
   return { client, peer, channel, track, audio, output, connections, sourceStreams, captions, errors, statuses, ready,
     fireTimeouts(delay: number) {
@@ -100,6 +101,7 @@ async function setup(options: { response?: () => Promise<Response>; sourceCaptio
         clearTimeout(timer); timeouts.delete(timer); entry.callback();
       }
     },
+    pendingTimeouts: () => timeouts.size,
     resources: () => ({ disconnected, played, removed }) };
 }
 
@@ -135,6 +137,43 @@ test('session errors during startup retain the provider error', async () => harn
   await rejected;
   assert.deepEqual(state.errors, ['quota exceeded']);
 }, { autoStart: false }));
+
+test('session.closed before readiness rejects the startup waiter instead of abandoning it', async () => harness(async state => {
+  const starting = state.client.start();
+  await new Promise(resolve => setImmediate(resolve));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bounded = Promise.race([starting, new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error('startup waiter remained pending')), 50);
+  })]);
+  const rejected = assert.rejects(bounded, /GPT-Live hat die Sitzung beendet/);
+  state.channel.emit({ type: 'session.closed' });
+  try { await rejected; }
+  finally { clearTimeout(timer); }
+  assert.equal(state.peer.closed, true);
+  assert.equal(state.pendingTimeouts(), 0);
+  assert.equal(state.errors.length, 1);
+}, { autoStart: false }));
+
+test('a provider failure immediately after session.started cannot report successful startup', async () => harness(async state => {
+  const starting = state.client.start();
+  const rejected = assert.rejects(starting, /quota exceeded/);
+  await new Promise(resolve => setImmediate(resolve));
+  state.channel.emit({ type: 'session.started', session: { id: 'live-test' } });
+  state.channel.emit({ type: 'error', error: { message: 'quota exceeded' } });
+  await rejected;
+  assert.equal(state.peer.closed, true);
+  assert.deepEqual(state.errors, ['quota exceeded']);
+}, { autoStart: false }));
+
+test('cancellation inside readiness callback cannot install timers after teardown', async () => {
+  let cancel = () => {};
+  await harness(async state => {
+    cancel = () => state.client.stop();
+    await assert.rejects(state.client.start(), /beendet/);
+    assert.equal(state.pendingTimeouts(), 0);
+    assert.equal(state.statuses.some(status => status.startsWith('GPT-Live aktiv')), false);
+  }, { readyCallback: ready => { if (ready) cancel(); } });
+});
 
 test('an unfinished stopped session cannot claim graceful finalization', async () => harness(async state => {
   await state.client.start();
@@ -218,6 +257,34 @@ test('an obsolete play rejection cannot kill a replacement audio track', async (
   assert.equal(state.peer.closed, false);
   assert.deepEqual(state.errors, []);
   assert.equal(state.client.audioHealth().live, true);
+}));
+
+test('an ended target track stops paid input instead of leaving a silent active session', async () => harness(async state => {
+  await state.client.start();
+  state.peer.attach();
+  state.track.readyState = 'ended';
+  state.track.onended?.();
+  assert.equal(state.peer.closed, true);
+  assert.deepEqual(state.ready, [true, false]);
+  assert.match(state.errors[0] ?? '', /Zielstimme.*beendet/);
+  assert.equal(state.track.onended, null);
+}));
+
+test('obsolete or finalizing output track endings cannot fail a valid session', async () => harness(async state => {
+  await state.client.start();
+  state.peer.attach();
+  const oldEnded = state.track.onended;
+  const replacement = { ...state.track, id: 'replacement', onended: null, onunmute: null };
+  state.peer.attach(replacement);
+  oldEnded?.();
+  assert.equal(state.peer.closed, false);
+  assert.equal(state.track.onended, null);
+  const finishing = state.client.finishInput();
+  replacement.readyState = 'ended';
+  replacement.onended?.();
+  state.channel.emit({ type: 'session.closed' });
+  await finishing;
+  assert.deepEqual(state.errors, []);
 }));
 
 test('remote audio has one audible Web Audio path and releases every resource', async () => harness(async state => {

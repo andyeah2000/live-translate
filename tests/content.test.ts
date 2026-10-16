@@ -25,6 +25,8 @@ test('fullscreen subtitles create tracks only for visible text and reuse and dis
   const previous = Object.fromEntries(names.map(name => [name, (globalThis as Record<string, unknown>)[name]]));
   const messages: Array<(message: unknown, sender?: unknown) => void> = [];
   const documentEvents = new Map<string, () => void>();
+  const videoEvents = new Map<string, () => void>();
+  const windowEvents = new Map<string, Array<() => void>>();
   const timeouts = new Map<number, () => void>();
   const intervals = new Map<number, () => void>();
   let timerId = 0;
@@ -32,7 +34,9 @@ test('fullscreen subtitles create tracks only for visible text and reuse and dis
   const root = new ElementMock('HTML');
   const tracks: Array<{ mode: string; cues: unknown[]; addCue(cue: unknown): void; removeCue(cue: unknown): void }> = [];
   const video = {
-    tagName: 'VIDEO', currentTime: 12,
+    tagName: 'VIDEO', currentTime: 12, playbackRate: 2,
+    addEventListener: (name: string, callback: () => void) => videoEvents.set(name, callback),
+    removeEventListener: (name: string) => videoEvents.delete(name),
     addTextTrack() {
       const track = {
         mode: 'disabled', cues: [] as unknown[],
@@ -64,7 +68,8 @@ test('fullscreen subtitles create tracks only for visible text and reuse and dis
       setTimeout: (callback: () => void) => { const id = ++timerId; timeouts.set(id, callback); return id; },
       setInterval: setIntervalMock,
       clearInterval: (id: number) => intervals.delete(id),
-      addEventListener() {}
+      addEventListener: (name: string, callback: () => void) => windowEvents.set(name, [...(windowEvents.get(name) ?? []), callback]),
+      removeEventListener: (name: string, callback: () => void) => windowEvents.set(name, (windowEvents.get(name) ?? []).filter(listener => listener !== callback))
     },
     setInterval: setIntervalMock,
     clearInterval: (id: number) => intervals.delete(id),
@@ -86,9 +91,17 @@ test('fullscreen subtitles create tracks only for visible text and reuse and dis
     assert.equal(tracks.length, 1);
     assert.equal(tracks[0]!.mode, 'showing');
     assert.equal((tracks[0]!.cues[0] as { text: string }).text, '&lt;b>A &amp; B');
+    assert.equal((tracks[0]!.cues[0] as { endTime: number }).endTime, 22, '2x playback keeps captions visible for the same wall-clock duration');
+    video.currentTime = 100;
+    videoEvents.get('seeking')!();
+    assert.equal((tracks[0]!.cues[0] as { startTime: number }).startTime, 99.9, 'seeking reanchors the current caption to the new media time');
+    video.playbackRate = 1;
+    videoEvents.get('ratechange')!();
+    assert.equal((tracks[0]!.cues[0] as { endTime: number }).endTime, 105);
     send({ type: 'subtitle-clear' });
     assert.equal(tracks[0]!.mode, 'disabled');
     assert.equal(tracks[0]!.cues.length, 0);
+    assert.equal(videoEvents.size, 0, 'inactive videos must release timeline listeners');
     documentEvents.get('fullscreenchange')!();
     assert.equal(tracks.length, 1);
     assert.equal(tracks[0]!.mode, 'disabled');
@@ -103,6 +116,9 @@ test('fullscreen subtitles create tracks only for visible text and reuse and dis
     const host = body.children[0]!;
     const box = host.shadow!.children[1]!;
     assert.equal(box.children[1]!.textContent, '<script>literal</script>');
+    windowEvents.get('pagehide')!.forEach(listener => listener());
+    assert.equal(body.children.length, 0, 'pagehide must not retain subtitles in the back/forward cache');
+    send({ type: 'subtitle', event: { kind: 'chunk', lane: 'target', text: 'new caption' } });
     runtime.id = '';
     for (const callback of intervals.values()) callback();
     assert.equal(body.children.length, 0, 'extension invalidation removes the overlay');
