@@ -1,10 +1,8 @@
 import type { SessionSettings, SubtitleMode } from './messages';
+import { TRANSLATION_PROFILE } from './translation-profile';
 
-/** GPT-Live-Stimmen aus der offiziellen OpenAI-Dokumentation. */
-export const VOICE_IDS = new Set([
-  'marin', 'quartz', 'ripple', 'vesper', 'willow', 'stone', 'gleam', 'meridian',
-  'bossa', 'tempo', 'beacon', 'delta', 'cinder'
-]);
+/** GPT-Live-Stimmen aus dem gemeinsamen Übersetzungsprofil (offizielle OpenAI-Liste). */
+export const VOICE_IDS: ReadonlySet<string> = new Set(TRANSLATION_PROFILE.voices);
 
 const SUBTITLE_MODES = new Set<SubtitleMode>(['translation', 'dual']);
 export const MAX_SERVER_TOKEN_LENGTH = 1_024;
@@ -14,7 +12,7 @@ export const DEFAULT_SETTINGS: SessionSettings = {
   settingsVersion: 11,
   liveServerUrl: DEFAULT_SERVER_URL,
   liveServerToken: '',
-  liveVoice: 'meridian',
+  liveVoice: TRANSLATION_PROFILE.defaultVoice,
   subtitles: true,
   subtitleMode: 'translation',
   translationVolume: 1,
@@ -51,7 +49,7 @@ export function normalizeServerUrl(value: unknown): string | null {
   }
 }
 
-function enumValue<T extends string>(value: unknown, allowed: Set<T>, fallback: T): T {
+function enumValue<T extends string>(value: unknown, allowed: ReadonlySet<T>, fallback: T): T {
   return typeof value === 'string' && allowed.has(value as T) ? (value as T) : fallback;
 }
 

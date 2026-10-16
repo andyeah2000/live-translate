@@ -7,6 +7,8 @@ const MAX_REQUEST_BYTES = 128 * 1024;
 const MAX_RESPONSE_BYTES = 256 * 1024;
 
 function send(response, status, body, origin = null) {
+  // Tell the extension whether an identical retry can succeed (transient upstream state).
+  if (body.error && body.retryable === undefined) body.retryable = status >= 500 && status !== 503;
   if (response.destroyed || response.writableEnded) return;
   const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', Vary: 'Origin' };
   if (origin) headers['Access-Control-Allow-Origin'] = origin;
@@ -48,7 +50,7 @@ function readJson(request) {
   });
 }
 
-async function readSessionResponse(upstream) {
+async function readSessionResponse(upstream, dcid) {
   if (!upstream.body) throw new Error('missing-body');
   const reader = upstream.body.getReader();
   const chunks = [];
@@ -67,7 +69,10 @@ async function readSessionResponse(upstream) {
         !payload.transport.sdp.trim() || payload.transport.sdp.length > 65_536) {
       throw new Error('invalid-session-response');
     }
-    return { session: { id: payload.session.id }, transport: { type: 'webrtc', sdp: payload.transport.sdp } };
+    const transport = { type: 'webrtc', sdp: payload.transport.sdp };
+    // Echo the channel ID so the browser knows this server forwarded it.
+    if (dcid !== undefined) transport.dcid = dcid;
+    return { session: { id: payload.session.id }, transport };
   } finally {
     await reader.cancel().catch(() => {});
     reader.releaseLock();
@@ -136,6 +141,7 @@ export function createLiveServer({
       if (!upstream.ok) {
         // Cancel error bodies too: unconsumed responses hold upstream sockets.
         await upstream.body?.cancel().catch(() => {});
+        const retryable = upstream.status >= 500 || upstream.status === 408;
         const detail = upstream.status === 401
           ? 'OpenAI lehnt den API-Key ab (401). OPENAI_API_KEY in .env.local prüfen und Server neu starten. Der Server-Zugriffstoken ist gültig.'
           : upstream.status === 403
@@ -143,10 +149,10 @@ export function createLiveServer({
             : upstream.status === 429
               ? 'OpenAI-Limit erreicht (429). API-Guthaben und Rate-Limit prüfen.'
               : `OpenAI hat die GPT-Live-Sitzung abgelehnt (HTTP ${upstream.status}).`;
-        return send(response, 502, { error: detail }, origin);
+        return send(response, 502, { error: detail, retryable }, origin);
       }
       let payload;
-      try { payload = await readSessionResponse(upstream); }
+      try { payload = await readSessionResponse(upstream, sessionRequest.dcid); }
       catch { return send(response, 502, { error: 'OpenAI lieferte keine vollständige GPT-Live-Sitzungsantwort.' }, origin); }
       send(response, 201, payload, origin);
     } catch {

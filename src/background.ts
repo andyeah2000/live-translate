@@ -27,10 +27,17 @@ let transcriptQueue: Promise<void> = Promise.resolve();
 let voiceChangeRevision = 0;
 
 const OFFSCREEN_CLOSE_ATTEMPTS = 3;
+/** A deliberate Stop lets the German voice finish its sentence and collects final usage. */
+const GRACEFUL_DRAIN_MS = 15_000;
+const RESTART_DRAIN_MS = 1_500;
+const TELEMETRY_MIN_INTERVAL_MS = 250;
 const OFFSCREEN_CLOSE_RETRY_MS = 50;
 let lastFinalizationError: string | null = null;
 
 void chrome.action.setBadgeBackgroundColor({ color: '#1a7f37' }).catch(() => {});
+
+let badgeRunning: boolean | null = null;
+let lastTelemetry: SessionState['ducking'] = null;
 
 async function getState(): Promise<SessionState> {
   const { sessionState } = await chrome.storage.session.get('sessionState');
@@ -60,8 +67,12 @@ function enqueueSessionOperation<T>(operation: () => Promise<T>): Promise<T> {
 }
 
 async function setState(state: SessionState): Promise<void> {
+  lastTelemetry = state.ducking;
   await chrome.storage.session.set({ sessionState: state });
-  void chrome.action.setBadgeText({ text: state.running ? 'ON' : '' }).catch(() => {});
+  if (badgeRunning !== state.running) {
+    badgeRunning = state.running;
+    void chrome.action.setBadgeText({ text: state.running ? 'ON' : '' }).catch(() => {});
+  }
   broadcast({ type: 'session-state', state });
 }
 
@@ -91,8 +102,8 @@ async function sendToOffscreen(msg: Message): Promise<void> {
     try {
       const response = (await withMessageTimeout(
         chrome.runtime.sendMessage(msg),
-        // A graceful stop drains up to 15 s; allow its final acknowledgement.
-        msg.type === 'offscreen-stop' ? 17_000 : 3_000,
+        // A graceful stop drains up to drainMs; allow its final acknowledgement.
+        msg.type === 'offscreen-stop' ? (msg.drainMs ?? GRACEFUL_DRAIN_MS) + 2_000 : 3_000,
         'Die Audioverarbeitung antwortet nicht.'
       )) as { ok?: boolean; finalizationError?: string | null } | undefined;
       if (response?.ok) {
@@ -172,14 +183,14 @@ async function tabCaptureIsStillActive(tabId: number): Promise<boolean> {
   });
 }
 
-async function stopAndCloseOffscreenDocument(): Promise<void> {
+async function stopAndCloseOffscreenDocument(drainMs: number): Promise<void> {
   if (!(await hasOffscreenDocument())) return;
 
   let lastError: unknown = null;
   try {
     // Zuerst Audio, Capture, Worker und WebRTC im lebenden Dokument stoppen.
     // closeDocument bleibt danach die zweite, unabhängige Sicherheitsgrenze.
-    await sendToOffscreen({ type: 'offscreen-stop' });
+    await sendToOffscreen({ type: 'offscreen-stop', drainMs });
   } catch (error) {
     // Ein beschädigtes Dokument kann nicht mehr antworten. Trotzdem aktiv
     // schließen; erfolgreich verifiziertes Schließen ist ebenfalls ein
@@ -213,15 +224,41 @@ async function getSubtitleOutput(): Promise<{ enabled: boolean; mode: SubtitleMo
   };
 }
 
+async function setSubtitleOutput(enabled: boolean, mode: SubtitleMode): Promise<void> {
+  await chrome.storage.session.set({ subtitlesEnabled: enabled, subtitleMode: mode });
+}
+
+/** A frozen renderer can keep injection pending forever; it must not block Stop. */
+function injectContentScript(tabId: number): Promise<unknown> {
+  return withMessageTimeout(
+    chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'], injectImmediately: true }),
+    3_000,
+    'Die Seite reagiert nicht auf die Untertitel-Einbindung.'
+  );
+}
+
 async function startSession(
   tabId: number,
   settings: SessionSettings
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  await stopSession();
-  const epoch = sessionEpoch;
+  const previous = await getState();
+  if (previous.running || (await hasOffscreenDocument())) {
+    // A replacement (voice change, new tab) needs no long drain of the old voice.
+    await stopSession(null, { drainMs: RESTART_DRAIN_MS, restart: true });
+  }
+  const epoch = ++sessionEpoch;
   const sessionId = crypto.randomUUID();
+  resetSubtitleDelivery();
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    await setState({
+      running: false,
+      tabId: null,
+      sessionId: null,
+      status: 'Starte…',
+      error: null,
+      ducking: null
+    });
+    await injectContentScript(tabId);
     const inputOffer = await withMessageTimeout(
       chrome.tabs.sendMessage(tabId, { type: 'media-input-offer', sessionId }),
       6_000,
@@ -239,10 +276,7 @@ async function startSession(
       ).catch(() => {});
     }
     await ensureOffscreenDocument();
-    await chrome.storage.session.set({
-      subtitlesEnabled: settings.subtitles,
-      subtitleMode: settings.subtitleMode
-    });
+    await setSubtitleOutput(settings.subtitles, settings.subtitleMode);
     await setState({
       running: true,
       tabId,
@@ -270,18 +304,29 @@ async function startSession(
     // Nur aufräumen, wenn nicht inzwischen bewusst gestoppt/neu gestartet wurde.
     if (epoch === sessionEpoch) {
       await sendToTab(tabId, { type: 'media-input-stop', sessionId }).catch(() => {});
-      await stopSession(detail);
+      await stopSession(detail, { drainMs: RESTART_DRAIN_MS });
     }
     return { ok: false, error: detail };
   }
 }
 
-async function stopSession(error: string | null = null): Promise<void> {
+interface StopOptions {
+  /** Longest wait for GPT-Live's session.closed (final usage). */
+  drainMs?: number;
+  /** Replaced by a new session at once: do not publish an intermediate stopped state. */
+  restart?: boolean;
+}
+
+async function stopSession(error: string | null = null, options: StopOptions = {}): Promise<void> {
   sessionEpoch++;
   lastFinalizationError = null;
   const state = await getState();
+  if (state.running && !options.restart) {
+    // Show the drain immediately; the offscreen status is dropped while stopping.
+    await setState({ ...state, status: 'Beende…' });
+  }
   try {
-    await stopAndCloseOffscreenDocument();
+    await stopAndCloseOffscreenDocument(options.drainMs ?? GRACEFUL_DRAIN_MS);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     console.warn('[live-translate] Offscreen-Dokument konnte nicht sauber geschlossen werden:', err);
@@ -291,53 +336,69 @@ async function stopSession(error: string | null = null): Promise<void> {
     throw err;
   }
   if (state.tabId !== null) {
+    resetSubtitleDelivery();
     await sendToTab(state.tabId, { type: 'media-input-stop', sessionId: state.sessionId }).catch(() => {});
-    await sendToTab(state.tabId, { type: 'subtitle-clear' } satisfies Message)
+    await sendToTab(state.tabId, { type: 'subtitle-clear', sessionId: state.sessionId ?? undefined, final: true } satisfies Message)
       .catch(() => {});
   }
-  error ??= lastFinalizationError;
+  if (options.restart) return;
+  // An unconfirmed final usage after a deliberate Stop is a note, not a failure.
+  const finalizationNote = lastFinalizationError && !/vor session\.started/.test(lastFinalizationError)
+    ? 'Gestoppt · Abschluss von GPT-Live unbestätigt'
+    : null;
   await setState({
     running: false,
     tabId: null,
     sessionId: null,
-    status: error ? 'Fehler' : 'Gestoppt',
+    status: error ? 'Fehler' : (finalizationNote ?? 'Gestoppt'),
     error,
     ducking: null
   });
 }
 
-async function forwardTranscript(
-  sessionId: string,
-  event: TranscriptEvent
-): Promise<void> {
-  const observedState = await getState();
-  if (
-    !observedState.running ||
-    observedState.tabId === null ||
-    observedState.sessionId !== sessionId
-  ) {
-    return;
-  }
+// Subtitle delivery: at most one tabs.sendMessage in flight; everything that
+// arrives meanwhile goes out as one ordered batch. The display lag therefore
+// stays at a single round trip even when the page's main thread is busy.
+let subtitleBatch: TranscriptEvent[] = [];
+let subtitleTarget: { tabId: number; sessionId: string } | null = null;
+let subtitleSending = false;
+let subtitleGeneration = 0;
+
+function resetSubtitleDelivery(): void {
+  subtitleGeneration++;
+  subtitleBatch = [];
+  subtitleTarget = null;
+  subtitleSending = false;
+}
+
+async function forwardTranscript(sessionId: string, event: TranscriptEvent): Promise<void> {
   const output = await getSubtitleOutput();
   if (!output.enabled) return;
   // Both transcript lanes arrive continuously; visibility can change live.
   if (event.lane === 'source' && output.mode !== 'dual') return;
-  // Zwischen Zustandsprüfung und Versand kann eine Sitzung ersetzt worden
-  // sein. Nur der weiterhin identische Tab und die identische Session dürfen
-  // einen Untertitel erhalten.
-  const currentState = await getState();
-  if (
-    !currentState.running ||
-    currentState.tabId === null ||
-    currentState.tabId !== observedState.tabId ||
-    currentState.sessionId !== sessionId
-  ) {
-    return;
+  const state = await getState();
+  if (!state.running || state.tabId === null || state.sessionId !== sessionId) return;
+  if (subtitleTarget?.sessionId !== sessionId || subtitleTarget.tabId !== state.tabId) {
+    resetSubtitleDelivery();
+    subtitleTarget = { tabId: state.tabId, sessionId };
   }
-  // Das Senden wird bewusst abgewartet. Dadurch kann die serialisierte
-  // Stop-Operation `subtitle-clear` garantiert erst danach zustellen.
-  await sendToTab(currentState.tabId, { type: 'subtitle', event } satisfies Message)
-    .catch(() => {});
+  subtitleBatch.push(event);
+  if (!subtitleSending) void flushSubtitles();
+}
+
+async function flushSubtitles(): Promise<void> {
+  const generation = subtitleGeneration;
+  subtitleSending = true;
+  try {
+    while (generation === subtitleGeneration && subtitleTarget && subtitleBatch.length > 0) {
+      const { tabId, sessionId } = subtitleTarget;
+      const events = subtitleBatch;
+      subtitleBatch = [];
+      await sendToTab(tabId, { type: 'subtitle-batch', sessionId, events } satisfies Message).catch(() => {});
+    }
+  } finally {
+    if (generation === subtitleGeneration) subtitleSending = false;
+  }
 }
 
 async function updateOutputSettings(
@@ -345,10 +406,7 @@ async function updateOutputSettings(
 ): Promise<void> {
   const previousOutput = await getSubtitleOutput();
   const nextMode: SubtitleMode = msg.settings.subtitleMode === 'dual' ? 'dual' : 'translation';
-  await chrome.storage.session.set({
-    subtitlesEnabled: msg.settings.subtitles,
-    subtitleMode: nextMode
-  });
+  await setSubtitleOutput(msg.settings.subtitles, nextMode);
   const observedState = await getState();
   if (
     !observedState.running ||
@@ -358,8 +416,11 @@ async function updateOutputSettings(
     return;
   }
   // Beim Abschalten und beim Moduswechsel sauber neu beginnen, damit keine
-  // veraltete Original-Zeile aus dem vorherigen Modus stehen bleibt.
+  // veraltete Original-Zeile aus dem vorherigen Modus stehen bleibt. Noch nicht
+  // gesendete Untertitel verfallen; ein bereits gesendetes Bündel erreicht die
+  // Seite über denselben Kanal vor dem Clear.
   if (!msg.settings.subtitles || previousOutput.mode !== nextMode) {
+    resetSubtitleDelivery();
     await sendToTab(observedState.tabId, { type: 'subtitle-clear' } satisfies Message)
       .catch(() => {});
   }
@@ -446,16 +507,11 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
         });
       return true;
     case 'transcript':
+      // Ordered but independent of the session queue: a Stop drain or a slow
+      // status write must never hold back subtitles of the running session.
       transcriptQueue = transcriptQueue
         .catch(() => {})
-        .then(() =>
-          enqueueSessionOperation(() =>
-            forwardTranscript(
-              msg.sessionId,
-              msg.event
-            )
-          )
-        )
+        .then(() => forwardTranscript(msg.sessionId, msg.event))
         .catch((err) => console.warn('[live-translate] Untertitel-Weiterleitung fehlgeschlagen:', err));
       break;
     case 'offscreen-status':
@@ -473,18 +529,43 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
       }).catch((err) => console.warn('[live-translate] Fehlerbehandlung fehlgeschlagen:', err));
       break;
     case 'ducking-telemetry':
-      void enqueueSessionOperation(async () => {
-        const state = await getState();
-        if (state.running && state.sessionId === msg.sessionId) {
-          await setState({ ...state, ducking: parseDuckingTelemetry(msg.telemetry) });
-        }
-      }).catch((err) => console.warn('[live-translate] Ducking-Status fehlgeschlagen:', err));
+      queueTelemetry(msg.sessionId, parseDuckingTelemetry(msg.telemetry));
       break;
     default:
       break;
   }
   return undefined;
 });
+
+// Telemetry (mix level, delay, usage) arrives several times per second. Write
+// readiness changes at once and coalesce the rest, so storage writes and
+// popup broadcasts stay bounded.
+let pendingTelemetry: { sessionId: string; telemetry: SessionState['ducking'] } | null = null;
+let telemetryTimer: ReturnType<typeof setTimeout> | null = null;
+let lastTelemetryWrite = 0;
+
+function queueTelemetry(sessionId: string, telemetry: SessionState['ducking']): void {
+  pendingTelemetry = { sessionId, telemetry };
+  const current = lastTelemetry;
+  const urgent = !current || current.ready !== telemetry?.ready ||
+    current.translationReady !== telemetry?.translationReady || current.error !== telemetry?.error;
+  const wait = urgent ? 0 : Math.max(0, TELEMETRY_MIN_INTERVAL_MS - (Date.now() - lastTelemetryWrite));
+  if (telemetryTimer !== null) {
+    if (!urgent) return;
+    clearTimeout(telemetryTimer);
+  }
+  telemetryTimer = setTimeout(() => {
+    telemetryTimer = null;
+    const next = pendingTelemetry;
+    pendingTelemetry = null;
+    if (!next) return;
+    lastTelemetryWrite = Date.now();
+    void enqueueSessionOperation(async () => {
+      const state = await getState();
+      if (state.running && state.sessionId === next.sessionId) await setState({ ...state, ducking: next.telemetry });
+    }).catch((err) => console.warn('[live-translate] Ducking-Status fehlgeschlagen:', err));
+  }, wait);
+}
 
 function parseDuckingTelemetry(value: unknown): SessionState['ducking'] {
   if (!value || typeof value !== 'object') return null;
@@ -502,7 +583,16 @@ function parseDuckingTelemetry(value: unknown): SessionState['ducking'] {
         : 0,
     error: typeof candidate.error === 'string' ? candidate.error : null,
     translationReady: candidate.translationReady === true,
-    inputIndependent: candidate.inputIndependent === true
+    inputIndependent: candidate.inputIndependent === true,
+    lagMs: typeof candidate.lagMs === 'number' && Number.isFinite(candidate.lagMs) && candidate.lagMs >= 0
+      ? Math.min(candidate.lagMs, 600_000)
+      : null,
+    usageSeconds: typeof candidate.usageSeconds === 'number' && Number.isFinite(candidate.usageSeconds) && candidate.usageSeconds >= 0
+      ? candidate.usageSeconds
+      : 0,
+    reconnects: typeof candidate.reconnects === 'number' && Number.isInteger(candidate.reconnects) && candidate.reconnects >= 0
+      ? candidate.reconnects
+      : 0
   };
 }
 
@@ -575,11 +665,12 @@ chrome.tabCapture.onStatusChanged.addListener((info) => {
 });
 
 // Nach einem Seiten-Reload ist das Untertitel-Overlay weg – neu injizieren.
-// Die Audio-Aufnahme läuft über die Navigation hinweg weiter.
+// Die Audio-Aufnahme läuft über die Navigation hinweg weiter; ein getrennter
+// direkter Videoeingang fällt im Offscreen-Dokument auf Tab-Audio zurück.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status !== 'complete') return;
   void getState()
-    .then((observedState) => {
+    .then(async (observedState) => {
       if (
         !observedState.running ||
         observedState.tabId !== tabId ||
@@ -588,18 +679,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
         return;
       }
       const observedSessionId = observedState.sessionId;
-      return enqueueSessionOperation(async () => {
-        const currentState = await getState();
-        if (
-          !currentState.running ||
-          currentState.tabId !== tabId ||
-          currentState.sessionId !== observedSessionId
-        ) {
-          return;
-        }
-        try {
-          await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-        } catch {
+      // Injection runs outside the session queue: a hanging page must not
+      // delay Stop. Only a failed injection enqueues the stop.
+      try {
+        await injectContentScript(tabId);
+      } catch {
+        await enqueueSessionOperation(async () => {
           const failedState = await getState();
           if (
             failedState.running &&
@@ -608,8 +693,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
           ) {
             await stopSession('Die Seite hat gewechselt – bitte die Übersetzung neu starten.');
           }
-        }
-      });
+        });
+      }
     })
     .catch((err) => console.warn('[live-translate] Navigation konnte nicht verarbeitet werden:', err));
 });

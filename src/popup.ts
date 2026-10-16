@@ -3,10 +3,11 @@ import type { Message, SessionSettings, SessionState } from './messages';
 import {
   configurationError,
   isTranslatableUrl,
+  liveStatsPresentation,
   popupMonitorPresentation,
   popupStatusPresentation
 } from './popup-logic';
-import { loadSettings, normalizeServerUrl, sanitizeSettings, saveSettings, VOICE_IDS } from './settings';
+import { DEFAULT_SETTINGS, loadSettings, normalizeServerUrl, sanitizeSettings, saveSettings, VOICE_IDS } from './settings';
 
 function el<T extends HTMLElement>(selector: string): T {
   const found = document.querySelector<T>(selector);
@@ -29,6 +30,7 @@ export function initializePopup(): void {
   const connectionDetails = el<HTMLDetailsElement>('#connection');
   const voiceSelect = el<HTMLSelectElement>('#liveVoice');
   const inputMode = el<HTMLElement>('#inputMode');
+  const liveStats = el<HTMLElement>('#liveStats');
 
   let state: SessionState = {
     running: false,
@@ -46,7 +48,7 @@ export function initializePopup(): void {
 
   function collectSettings(includeConnectionEdits = true): SessionSettings {
     return {
-      settingsVersion: 11,
+      settingsVersion: DEFAULT_SETTINGS.settingsVersion,
       liveServerUrl: includeConnectionEdits ? liveServerUrlInput.value.trim() : connectionSettings.liveServerUrl,
       liveServerToken: includeConnectionEdits ? liveServerTokenInput.value.trim() : connectionSettings.liveServerToken,
       // The server validates the selected voice and owns the translation prompt.
@@ -93,6 +95,7 @@ export function initializePopup(): void {
     originalValue.textContent = `${Math.round(gain * 100)} %`;
     originalMeter.value = gain;
     inputMode.textContent = state.running ? (state.ducking?.inputIndependent ? 'DIRECT' : 'TAB') : 'LIVE-MIX';
+    liveStats.textContent = liveStatsPresentation(state);
     inputMode.title = state.ducking?.inputIndependent
       ? 'Agent-Eingang unabhängig von Player-Lautstärke und Stummschaltung'
       : 'Tab-Eingang: Player-Lautstärke beeinflusst den Agenten; Video auf 100 % stellen';

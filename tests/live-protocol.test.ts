@@ -5,7 +5,12 @@ import { parseLiveServerEvent, parseLiveSessionAnswer, liveSessionEndpoint } fro
 test('parses the opaque Live session id and WebRTC SDP answer', () => {
   assert.deepEqual(
     parseLiveSessionAnswer({ session: { id: 'sess_123' }, transport: { sdp: 'v=0\r\n' } }),
-    { sessionId: 'sess_123', sdp: 'v=0\r\n' }
+    { sessionId: 'sess_123', sdp: 'v=0\r\n', dcid: null }
+  );
+  // The own server echoes the pre-negotiated event channel.
+  assert.deepEqual(
+    parseLiveSessionAnswer({ session: { id: 'sess_123' }, transport: { sdp: 'v=0\r\n', dcid: 4 } }),
+    { sessionId: 'sess_123', sdp: 'v=0\r\n', dcid: 4 }
   );
   assert.equal(parseLiveSessionAnswer({ session: { id: 'sess_123' } }), null);
 });
@@ -34,7 +39,25 @@ test('recognizes session lifecycle events', () => {
     parseLiveServerEvent({ type: 'session.started', session: { id: 'sess_1' } }),
     { kind: 'started', sessionId: 'sess_1' }
   );
-  assert.deepEqual(parseLiveServerEvent({ type: 'session.closed' }), { kind: 'closed' });
+  assert.deepEqual(parseLiveServerEvent({ type: 'session.closed' }), { kind: 'closed', reason: 'unknown', usageSeconds: null });
+  assert.deepEqual(
+    parseLiveServerEvent({ type: 'session.closed', reason: 'expired', usage: { seconds: 3600 } }),
+    { kind: 'closed', reason: 'expired', usageSeconds: 3600 }
+  );
+  assert.deepEqual(
+    parseLiveServerEvent({ type: 'session.usage.updated', usage: { seconds: 12 }, context_window: { usage_ratio: 0.4 } }),
+    { kind: 'usage', seconds: 12 }
+  );
+  assert.equal(parseLiveServerEvent({ type: 'session.usage.updated', usage: { seconds: -1 } }).kind, 'ignored');
+});
+
+test('errors keep the code and the rejected command for non-fatal handling', () => {
+  assert.deepEqual(
+    parseLiveServerEvent({ type: 'error', error: { message: 'cut off', code: 'moderation', client_event_id: 'catch_up_3' } }),
+    { kind: 'error', detail: 'cut off', code: 'moderation', clientEventId: 'catch_up_3' }
+  );
+  assert.deepEqual(parseLiveServerEvent({ type: 'error' }),
+    { kind: 'error', detail: 'GPT-Live hat die Sitzung abgelehnt.', code: null, clientEventId: null });
 });
 
 test('builds the extension backend endpoint without leaking query fragments', () => {

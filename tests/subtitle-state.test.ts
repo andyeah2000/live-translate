@@ -19,7 +19,8 @@ test('late chunks, a new turn and interrupts update only their own lane', () => 
   state.apply({ kind: 'complete', lane: 'source' }, 3);
   state.apply({ kind: 'chunk', lane: 'target', text: 'Zweiter' }, 4);
 
-  assert.deepEqual(state.snapshot(), { upper: 'late source', lower: 'Zweiter' });
+  // Dual mode has a single rolling German line over finished and current text.
+  assert.deepEqual(state.snapshot(), { upper: 'late source', lower: 'Erster Satz Zweiter' });
   state.apply({ kind: 'interrupt', lane: 'target' }, 5);
   assert.deepEqual(state.snapshot(), { upper: 'late source', lower: 'Erster Satz' });
 });

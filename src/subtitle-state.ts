@@ -18,8 +18,11 @@ export interface SubtitleStateOptions {
   segmentGapMs?: number;
 }
 
-const DEFAULT_MAX_LINE_LENGTH = 140;
+// Two readable subtitle lines of about 42 characters each.
+const DEFAULT_MAX_LINE_LENGTH = 90;
 const DEFAULT_SEGMENT_GAP_MS = 2_500;
+const MIN_SENTENCE_LINE = 24;
+const SENTENCE_END = /[.!?…]["'»«“”)]*\s*$/;
 
 /**
  * Pure subtitle state shared by overlay and native fullscreen rendering.
@@ -66,6 +69,11 @@ export class SubtitleState {
           lane.endMs = lane.startMs;
         }
         this.trimLane(event.lane);
+        // A finished German sentence starts the next line, so the reader sees
+        // whole sentences instead of fragments cut at a fixed width.
+        if (event.lane === 'target' && lane.current.length >= MIN_SENTENCE_LINE && SENTENCE_END.test(lane.current)) {
+          this.finalizeLane('target');
+        }
         break;
       case 'complete':
         this.finalizeLane(event.lane);
@@ -86,7 +94,12 @@ export class SubtitleState {
     const targetFinal = this.target.final;
 
     if (sourceLine) {
-      return { upper: sourceLine, lower: targetCurrent || targetFinal };
+      // Dual mode has one German line: slide over the joined text instead of
+      // showing only the few words left after a line break.
+      const joined = targetFinal && targetCurrent
+        ? `${targetFinal}${/\s$/.test(targetFinal) || /^\s/.test(targetCurrent) ? '' : ' '}${targetCurrent}`
+        : targetCurrent || targetFinal;
+      return { upper: sourceLine, lower: this.keepTail(joined.trim()) };
     }
     if (targetCurrent) {
       return { upper: targetFinal, lower: targetCurrent };

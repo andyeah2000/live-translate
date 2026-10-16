@@ -3,15 +3,37 @@ import type { TranscriptEvent } from '../messages';
 export interface LiveSessionAnswer {
   sessionId: string;
   sdp: string;
+  /** Echo of the pre-negotiated data channel; absent from servers that predate it. */
+  dcid: number | null;
 }
+
+/** `session.closed` reasons documented for GPT-Live. */
+export type LiveCloseReason =
+  | 'close_requested'
+  | 'expired'
+  | 'content'
+  | 'remote_hangup'
+  | 'connection_lost'
+  | 'unknown';
 
 export type LiveServerEvent =
   | { kind: 'started'; sessionId: string }
-  | { kind: 'closed' }
+  | { kind: 'closed'; reason: LiveCloseReason; usageSeconds: number | null }
   | { kind: 'transcript'; event: TranscriptEvent }
-  | { kind: 'error'; detail: string }
+  | { kind: 'usage'; seconds: number }
+  | { kind: 'error'; detail: string; code: string | null; clientEventId: string | null }
   | { kind: 'delegation'; id: string }
   | { kind: 'ignored' };
+
+/**
+ * Pre-negotiated `oai-events` channel (WARP data-channel step). It removes the
+ * in-band DCEP round trip, so server events can flow as soon as SCTP is up.
+ */
+export const EVENTS_CHANNEL_ID = 4;
+
+const CLOSE_REASONS = new Set<LiveCloseReason>([
+  'close_requested', 'expired', 'content', 'remote_hangup', 'connection_lost'
+]);
 
 function recordValue(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -27,6 +49,12 @@ function timestampValue(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+function secondsValue(value: unknown): number | null {
+  const usage = recordValue(value);
+  const seconds = usage?.seconds;
+  return typeof seconds === 'number' && Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
+}
+
 /** Validiert die kleine, browserseitig benötigte Antwort des eigenen Backends. */
 export function parseLiveSessionAnswer(value: unknown): LiveSessionAnswer | null {
   const result = recordValue(value);
@@ -34,10 +62,13 @@ export function parseLiveSessionAnswer(value: unknown): LiveSessionAnswer | null
   const transport = result && recordValue(result.transport);
   const sessionId = session && stringValue(session.id);
   const sdp = transport && stringValue(transport.sdp);
-  return sessionId && sdp ? { sessionId, sdp } : null;
+  const dcid = transport?.dcid;
+  return sessionId && sdp
+    ? { sessionId, sdp, dcid: typeof dcid === 'number' && Number.isInteger(dcid) ? dcid : null }
+    : null;
 }
 
-/** WebRTC trägt Audio; der Datenkanal liefert nur Status und Transkripte. */
+/** WebRTC trägt Audio; der Datenkanal liefert nur Status, Nutzung und Transkripte. */
 export function parseLiveServerEvent(value: unknown): LiveServerEvent {
   const event = recordValue(value);
   const type = event && stringValue(event.type);
@@ -47,7 +78,18 @@ export function parseLiveServerEvent(value: unknown): LiveServerEvent {
     const sessionId = session && stringValue(session.id);
     return sessionId ? { kind: 'started', sessionId } : { kind: 'ignored' };
   }
-  if (type === 'session.closed') return { kind: 'closed' };
+  if (type === 'session.closed') {
+    const reason = stringValue(event.reason) as LiveCloseReason | null;
+    return {
+      kind: 'closed',
+      reason: reason && CLOSE_REASONS.has(reason) ? reason : 'unknown',
+      usageSeconds: secondsValue(event.usage)
+    };
+  }
+  if (type === 'session.usage.updated') {
+    const seconds = secondsValue(event.usage);
+    return seconds === null ? { kind: 'ignored' } : { kind: 'usage', seconds };
+  }
   if (type === 'session.delegation.created') {
     const delegation = recordValue(event.delegation);
     const id = stringValue(delegation?.id);
@@ -71,7 +113,12 @@ export function parseLiveServerEvent(value: unknown): LiveServerEvent {
   if (type === 'error') {
     const error = recordValue(event.error);
     const detail = stringValue(error?.message) ?? stringValue(event.message);
-    return detail ? { kind: 'error', detail } : { kind: 'error', detail: 'GPT-Live hat die Sitzung abgelehnt.' };
+    return {
+      kind: 'error',
+      detail: detail ?? 'GPT-Live hat die Sitzung abgelehnt.',
+      code: stringValue(error?.code),
+      clientEventId: stringValue(error?.client_event_id)
+    };
   }
   return { kind: 'ignored' };
 }

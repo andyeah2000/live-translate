@@ -165,7 +165,7 @@ const chromeMock = {
         if (inputAnswerGate) await inputAnswerGate.promise;
         return inputAnswerResponse;
       }
-      if (message.type === 'subtitle' && subtitleSendGate) {
+      if ((message.type === 'subtitle' || message.type === 'subtitle-batch') && subtitleSendGate) {
         const gate = subtitleSendGate;
         subtitleSendGate = null;
         await gate.promise;
@@ -394,7 +394,7 @@ test('source-lane transcripts are only forwarded in dual subtitle mode', async (
   });
   await sessionBarrier('session-a', 'barrier-source-hidden');
   assert.equal(
-    tabMessages.some(({ message }) => message.type === 'subtitle'),
+    tabMessages.some(({ message }) => message.type === 'subtitle-batch'),
     false,
     'without dual mode the source lane must stay hidden'
   );
@@ -412,15 +412,19 @@ test('source-lane transcripts are only forwarded in dual subtitle mode', async (
     sessionId: 'session-a',
     event: { kind: 'chunk', lane: 'source', text: 'original' }
   });
-  await sessionBarrier('session-a', 'barrier-source-visible');
-  const forwarded = tabMessages.find(({ message }) => message.type === 'subtitle');
+  await waitFor(
+    () => tabMessages.some(({ message }) => message.type === 'subtitle-batch'),
+    'Quell-Untertitel wurde nicht zugestellt'
+  );
+  const forwarded = tabMessages.find(({ message }) => message.type === 'subtitle-batch');
   assert.deepEqual(forwarded?.message, {
-    type: 'subtitle',
-    event: { kind: 'chunk', lane: 'source', text: 'original' }
+    type: 'subtitle-batch',
+    sessionId: 'session-a',
+    events: [{ kind: 'chunk', lane: 'source', text: 'original' }]
   });
 });
 
-test('subtitle disable waits for an in-flight transcript before clearing', async () => {
+test('subtitle disable clears at once and drops subtitles not yet sent', async () => {
   reset();
   const releaseSubtitle = deferred<void>();
   subtitleSendGate = releaseSubtitle;
@@ -430,29 +434,31 @@ test('subtitle disable waits for an in-flight transcript before clearing', async
     event: { kind: 'chunk', lane: 'target', text: 'noch sichtbar' }
   });
   await waitFor(
-    () => tabMessages.some(({ message }) => message.type === 'subtitle'),
+    () => tabMessages.some(({ message }) => message.type === 'subtitle-batch'),
     'Untertitelversand startete nicht'
   );
+  // Queued behind the in-flight batch; disabling must discard it.
+  emit({
+    type: 'transcript',
+    sessionId: 'session-a',
+    event: { kind: 'chunk', lane: 'target', text: ' verworfen' }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 5));
 
   emit({
     type: 'update-output-settings',
     settings: { subtitles: false, translationVolume: 0.6 }
   });
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(
-    tabMessages.some(({ message }) => message.type === 'subtitle-clear'),
-    false,
-    'Disable darf einen bereits laufenden Untertitel nicht überholen'
-  );
-
-  releaseSubtitle.resolve(undefined);
+  // The page receives batch and clear in send order; the worker need not wait.
   await waitFor(
     () => runtimeMessages.some((message) => message.type === 'offscreen-update-output'),
-    'Output-Update wurde nicht serialisiert abgeschlossen'
+    'Output-Update wartete auf den Untertitel'
   );
+  releaseSubtitle.resolve(undefined);
+  await new Promise((resolve) => setTimeout(resolve, 10));
   assert.deepEqual(
     tabMessages.map(({ message }) => message.type),
-    ['subtitle', 'subtitle-clear']
+    ['subtitle-batch', 'subtitle-clear']
   );
 });
 
@@ -543,7 +549,12 @@ test('a stuck offscreen stop response has a deadline and still forcibly closes c
   assert.equal(offscreenDocument, false);
   assert.equal(offscreenCloseCalls, 1);
   assert.equal(runtimeMessages.filter(message => message.type === 'offscreen-stop').length, 1);
-  assert.match((sessionStore.sessionState as { error: string }).error, /unvollständige Finalisierung/);
+  // A deliberate Stop that force-closed the engine succeeded; the missing
+  // provider confirmation is reported as a note, not as a red error.
+  const state = sessionStore.sessionState as { running: boolean; error: string | null; status: string };
+  assert.equal(state.running, false);
+  assert.equal(state.error, null);
+  assert.match(state.status, /unbestätigt/);
 });
 
 test('a stuck offscreen start response is bounded and releases the failed capture', async (t) => {
@@ -599,12 +610,12 @@ test('a frozen page cannot block Stop behind subtitle delivery or page cleanup',
   clearSendGate = deferred<void>();
   stuckInputStop = true;
   emit({ type: 'transcript', sessionId: 'session-a', event: { kind: 'chunk', lane: 'target', text: 'blocked page' } });
-  await waitFor(() => tabMessages.some(({ message }) => message.type === 'subtitle'), 'blocked transcript');
+  await waitFor(() => tabMessages.some(({ message }) => message.type === 'subtitle-batch'), 'blocked transcript');
   assert.deepEqual(await request({ type: 'stop-session' }), { ok: true });
   assert.equal((sessionStore.sessionState as { running: boolean }).running, false);
   const cleanup = tabMessages.find(({ message }) => message.type === 'media-input-stop');
   assert.equal(cleanup?.message.sessionId, 'session-a');
-  assert.deepEqual(tabMessages.map(({ message }) => message.type), ['subtitle', 'media-input-stop', 'subtitle-clear']);
+  assert.deepEqual(tabMessages.map(({ message }) => message.type), ['subtitle-batch', 'media-input-stop', 'subtitle-clear']);
 });
 
 test('a rejected local audio answer stops the matching session visibly', async () => {
@@ -650,12 +661,10 @@ test('forwardTranscript rechecks the session after an asynchronous state read', 
   assert.equal(tabMessages.some(({ message }) => message.type === 'subtitle'), false);
 });
 
-test('subtitle delivery and stop clearing are strictly ordered', async () => {
+test('stop never waits for subtitle acknowledgements and seals the session display', async () => {
   reset();
   const releaseSubtitle = deferred<void>();
-  const releaseClear = deferred<void>();
   subtitleSendGate = releaseSubtitle;
-  clearSendGate = releaseClear;
 
   emit({
     type: 'transcript',
@@ -663,43 +672,40 @@ test('subtitle delivery and stop clearing are strictly ordered', async () => {
     event: { kind: 'chunk', lane: 'target', text: 'geordnet' }
   });
   await waitFor(
-    () => tabMessages.some(({ message }) => message.type === 'subtitle'),
+    () => tabMessages.some(({ message }) => message.type === 'subtitle-batch'),
     'Untertitelversand startete nicht'
   );
 
-  let stopSettled = false;
-  const stopRequest = request({ type: 'stop-session' }).then((response) => {
-    stopSettled = true;
-    return response;
+  // The page receives the batch before the clear (same channel, send order);
+  // the final clear makes it ignore any later batch of this session.
+  assert.deepEqual(await request({ type: 'stop-session' }), { ok: true });
+  const clear = tabMessages.find(({ message }) => message.type === 'subtitle-clear');
+  assert.deepEqual(clear?.message, { type: 'subtitle-clear', sessionId: 'session-a', final: true });
+  releaseSubtitle.resolve(undefined);
+
+  emit({
+    type: 'transcript',
+    sessionId: 'session-a',
+    event: { kind: 'chunk', lane: 'target', text: 'zu spät' }
   });
   await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(tabMessages.some(({ message }) => message.type === 'subtitle-clear'), false);
-
-  releaseSubtitle.resolve(undefined);
-  await waitFor(
-    () => tabMessages.some(({ message }) => message.type === 'subtitle-clear'),
-    'Untertitel-Clear startete nicht'
-  );
-  assert.equal(stopSettled, false, 'Stop darf vor abgeschlossenem subtitle-clear nicht antworten');
-  releaseClear.resolve(undefined);
-  assert.deepEqual(await stopRequest, { ok: true });
   assert.deepEqual(
     tabMessages.map(({ message }) => message.type),
-    ['subtitle', 'media-input-stop', 'subtitle-clear']
+    ['subtitle-batch', 'media-input-stop', 'subtitle-clear']
   );
 });
 
 test('a stale tab removal cannot stop a replacement session', async () => {
   reset();
+  // An output update waiting for its subtitle clear holds the session queue.
   const releaseSubtitle = deferred<void>();
-  subtitleSendGate = releaseSubtitle;
+  clearSendGate = releaseSubtitle;
   emit({
-    type: 'transcript',
-    sessionId: 'session-a',
-    event: { kind: 'chunk', lane: 'target', text: 'blocker' }
+    type: 'update-output-settings',
+    settings: { subtitles: false, subtitleMode: 'translation', translationVolume: 1 }
   });
   await waitFor(
-    () => tabMessages.some(({ message }) => message.type === 'subtitle'),
+    () => tabMessages.some(({ message }) => message.type === 'subtitle-clear'),
     'Session-Queue wurde nicht blockiert'
   );
 
@@ -719,7 +725,7 @@ test('a stale tab removal cannot stop a replacement session', async () => {
   await sessionBarrier('session-b', 'barrier-removed');
 
   assert.deepEqual(sessionStore.sessionState, runningState(2, 'session-b', 'barrier-removed'));
-  assert.equal(tabMessages.some(({ message }) => message.type === 'subtitle-clear'), false);
+  assert.equal(tabMessages.some(({ message }) => message.type === 'subtitle-clear' && message.final === true), false);
 });
 
 test('a hard tab-capture failure clears the matching running session and badge state', async () => {
@@ -760,15 +766,15 @@ test('a stale stopped event cannot kill a replacement capture in the same tab', 
 
 test('a stale completed-navigation event cannot touch a replacement session', async () => {
   reset();
+  // An output update waiting for its subtitle clear holds the session queue.
   const releaseSubtitle = deferred<void>();
-  subtitleSendGate = releaseSubtitle;
+  clearSendGate = releaseSubtitle;
   emit({
-    type: 'transcript',
-    sessionId: 'session-a',
-    event: { kind: 'chunk', lane: 'target', text: 'blocker' }
+    type: 'update-output-settings',
+    settings: { subtitles: false, subtitleMode: 'translation', translationVolume: 1 }
   });
   await waitFor(
-    () => tabMessages.some(({ message }) => message.type === 'subtitle'),
+    () => tabMessages.some(({ message }) => message.type === 'subtitle-clear'),
     'Session-Queue wurde nicht blockiert'
   );
 
@@ -788,6 +794,9 @@ test('a stale completed-navigation event cannot touch a replacement session', as
   releaseSubtitle.resolve(undefined);
   await sessionBarrier('session-b', 'barrier-updated');
 
+  // Re-injecting the idempotent overlay is harmless; the failed injection must
+  // not stop the replacement session that now owns the tab.
   assert.deepEqual(sessionStore.sessionState, runningState(1, 'session-b', 'barrier-updated'));
-  assert.equal(executeScriptCalls, 0);
+  assert.equal(executeScriptCalls, 1, 'injection runs once, outside the session queue');
+  assert.equal(tabMessages.some(({ message }) => message.type === 'subtitle-clear' && message.final === true), false);
 });

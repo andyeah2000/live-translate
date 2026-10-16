@@ -56,6 +56,12 @@ export interface DuckingTelemetry {
   error: string | null;
   translationReady: boolean;
   inputIndependent?: boolean;
+  /** Measured speech-to-speech delay of the German voice. */
+  lagMs?: number | null;
+  /** Billed GPT-Live voice seconds of this translation. */
+  usageSeconds?: number;
+  /** Automatic session renewals (limit, network, catch-up). */
+  reconnects?: number;
 }
 
 /**
@@ -81,11 +87,13 @@ export type Message =
   | { type: 'offscreen-start'; sessionId: string; streamId: string; settings: SessionSettings; inputOffer?: string }
   | { type: 'offscreen-input-answer'; sessionId: string; sdp: string }
   | { type: 'offscreen-update-output'; sessionId: string; settings: OutputSettings }
-  | { type: 'offscreen-stop' }
+  | { type: 'offscreen-stop'; drainMs?: number }
   | { type: 'offscreen-status'; sessionId: string; status: string }
   | { type: 'offscreen-error'; sessionId: string; detail: string }
   | { type: 'ducking-telemetry'; sessionId: string; telemetry: DuckingTelemetry }
   | { type: 'transcript'; sessionId: string; event: TranscriptEvent }
   | { type: 'subtitle'; event: TranscriptEvent }
-  | { type: 'subtitle-clear' }
+  | { type: 'subtitle-batch'; sessionId: string; events: TranscriptEvent[] }
+  /** `final` ends the session's display: later batches of that session are ignored. */
+  | { type: 'subtitle-clear'; sessionId?: string; final?: boolean }
   | { type: 'session-state'; state: SessionState };

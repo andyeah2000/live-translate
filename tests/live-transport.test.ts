@@ -19,6 +19,11 @@ async function harness(run: (state: Awaited<ReturnType<typeof setup>>) => Promis
 
 async function setup(options: { response?: () => Promise<Response>; sourceCaptions?: boolean; failPlayback?: boolean; autoStart?: boolean; readyCallback?: (ready: boolean) => void } = {}) {
   const errors: string[] = [];
+  const recoverable: boolean[] = [];
+  const warnings: string[] = [];
+  const usage: number[] = [];
+  const channelRequests: Array<{ label: string; init?: RTCDataChannelInit }> = [];
+  const requestBodies: Record<string, unknown>[] = [];
   const captions: TranscriptEvent[] = [];
   const statuses: string[] = [];
   const ready: boolean[] = [];
@@ -34,6 +39,8 @@ async function setup(options: { response?: () => Promise<Response>; sourceCaptio
     emit(value: unknown) { this.dispatchEvent(new MessageEvent('message', { data: typeof value === 'string' ? value : JSON.stringify(value) })); }
   }
   const channel = new Channel();
+  // A server without pre-negotiation makes the client open a second, in-band channel.
+  const fallbackChannel = new Channel();
   class Stream {
     constructor(private readonly tracks = [track]) {}
     getAudioTracks() { return this.tracks; }
@@ -45,7 +52,10 @@ async function setup(options: { response?: () => Promise<Response>; sourceCaptio
     closed = false;
     receivers: Array<{ track: typeof track }> = [];
     addTrack() {}
-    createDataChannel() { return channel; }
+    createDataChannel(label: string, init?: RTCDataChannelInit) {
+      channelRequests.push({ label, init });
+      return channelRequests.length === 1 ? channel : fallbackChannel;
+    }
     async createOffer() { return this.localDescription; }
     async setLocalDescription() {}
     async setRemoteDescription() {
@@ -81,7 +91,10 @@ async function setup(options: { response?: () => Promise<Response>; sourceCaptio
       clearTimeout(timer: ReturnType<typeof setTimeout>) { timeouts.delete(timer); clearTimeout(timer); },
       setInterval: (callback: () => void) => setInterval(callback, 10), clearInterval
     } },
-    fetch: { configurable: true, value: options.response ?? (async () => new Response(JSON.stringify({ session: { id: 'live-test' }, transport: { sdp: 'answer' } }))) },
+    fetch: { configurable: true, value: async (_url: string, init: RequestInit) => {
+      requestBodies.push(JSON.parse(String(init.body)));
+      return options.response ? options.response() : new Response(JSON.stringify({ session: { id: 'live-test' }, transport: { sdp: 'answer', dcid: 4 } }));
+    } },
     RTCPeerConnection: { configurable: true, value: function () { return peer; } },
     MediaStream: { configurable: true, value: Stream },
     document: { configurable: true, value: { createElement: () => audio, body: { append() { audio.isConnected = true; } } } }
@@ -92,9 +105,12 @@ async function setup(options: { response?: () => Promise<Response>; sourceCaptio
     serverUrl: 'http://localhost:8787', serverToken: 'local-test', voice: 'meridian',
     inputTranscriptionEnabled: options.sourceCaptions ?? true,
     onTranscript: event => captions.push(event), onStatus: status => statuses.push(status),
-    onReadyChange: value => { ready.push(value); options.readyCallback?.(value); }, onError: detail => errors.push(detail)
+    onReadyChange: value => { ready.push(value); options.readyCallback?.(value); },
+    onError: (detail, canRecover) => { errors.push(detail); recoverable.push(canRecover); },
+    onWarning: detail => warnings.push(detail), onUsage: seconds => usage.push(seconds)
   });
-  return { client, peer, channel, track, audio, output, connections, sourceStreams, captions, errors, statuses, ready,
+  return { client, peer, channel, fallbackChannel, channelRequests, requestBodies, track, audio, output, connections, sourceStreams,
+    captions, errors, recoverable, warnings, usage, statuses, ready,
     fireTimeouts(delay: number) {
       for (const [timer, entry] of [...timeouts]) {
         if (entry.delay !== delay) continue;
@@ -135,7 +151,8 @@ test('session errors during startup retain the provider error', async () => harn
   const rejected = assert.rejects(starting, /quota exceeded/);
   state.channel.emit({ type: 'error', error: { message: 'quota exceeded' } });
   await rejected;
-  assert.deepEqual(state.errors, ['quota exceeded']);
+  // Before start() resolves, its rejection is the only report.
+  assert.deepEqual(state.errors, []);
 }, { autoStart: false }));
 
 test('session.closed before readiness rejects the startup waiter instead of abandoning it', async () => harness(async state => {
@@ -151,19 +168,78 @@ test('session.closed before readiness rejects the startup waiter instead of aban
   finally { clearTimeout(timer); }
   assert.equal(state.peer.closed, true);
   assert.equal(state.pendingTimeouts(), 0);
-  assert.equal(state.errors.length, 1);
+  assert.equal(state.errors.length, 0);
 }, { autoStart: false }));
 
-test('a provider failure immediately after session.started cannot report successful startup', async () => harness(async state => {
+test('a provider termination immediately after session.started cannot report successful startup', async () => harness(async state => {
   const starting = state.client.start();
-  const rejected = assert.rejects(starting, /quota exceeded/);
+  const rejected = assert.rejects(starting, /Verbindung verloren/);
   await new Promise(resolve => setImmediate(resolve));
   state.channel.emit({ type: 'session.started', session: { id: 'live-test' } });
-  state.channel.emit({ type: 'error', error: { message: 'quota exceeded' } });
+  state.channel.emit({ type: 'session.closed', reason: 'connection_lost' });
   await rejected;
   assert.equal(state.peer.closed, true);
-  assert.deepEqual(state.errors, ['quota exceeded']);
+  assert.deepEqual(state.errors, []);
 }, { autoStart: false }));
+
+test('the event channel is pre-negotiated and its id is sent to the own server', async () => harness(async state => {
+  await state.client.start();
+  assert.deepEqual(state.channelRequests, [{ label: 'oai-events', init: { negotiated: true, id: 4 } }]);
+  assert.equal(state.requestBodies[0]?.dcid, 4);
+  state.channel.emit({ type: 'session.output_transcript.delta', delta: 'Hallo' });
+  assert.equal(state.captions.length, 1);
+}));
+
+test('a server without pre-negotiation support gets an in-band event channel', async () => harness(async state => {
+  const starting = state.client.start();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.channelRequests.length, 2);
+  assert.equal(state.channelRequests[1]?.init, undefined);
+  // Events arrive on the in-band channel; the unused negotiated one is ignored.
+  state.fallbackChannel.emit({ type: 'session.started', session: { id: 'live-test' } });
+  await starting;
+  state.channel.emit({ type: 'session.output_transcript.delta', delta: 'ignoriert' });
+  state.fallbackChannel.emit({ type: 'session.output_transcript.delta', delta: 'Hallo' });
+  assert.deepEqual(state.captions.map(caption => caption.kind === 'chunk' ? caption.text : ''), ['Hallo']);
+  state.client.stop();
+  assert.equal(state.channel.readyState, 'closed');
+  assert.equal(state.fallbackChannel.readyState, 'closed');
+}, { autoStart: false, response: async () => new Response(JSON.stringify({ session: { id: 'live-test' }, transport: { sdp: 'answer' } })) }));
+
+test('provider errors after startup are warnings and the interpretation continues', async () => harness(async state => {
+  await state.client.start();
+  state.channel.emit({ type: 'error', error: { message: 'Audio wurde gekürzt', code: 'moderation' } });
+  assert.deepEqual(state.warnings, ['Audio wurde gekürzt']);
+  assert.deepEqual(state.errors, []);
+  assert.equal(state.peer.closed, false);
+  state.channel.emit({ type: 'session.output_transcript.delta', delta: 'weiter' });
+  assert.equal(state.captions.length, 1);
+}));
+
+for (const [reason, canRecover] of [['expired', true], ['connection_lost', true], ['content', true], ['close_requested', false]] as const) {
+  test(`an unexpected session.closed (${reason}) reports recoverable=${canRecover} and final usage`, async () => harness(async state => {
+    await state.client.start();
+    state.channel.emit({ type: 'session.usage.updated', usage: { seconds: 41 } });
+    state.channel.emit({ type: 'session.closed', reason, usage: { seconds: 42 } });
+    assert.deepEqual(state.usage, [41, 42]);
+    assert.equal(state.errors.length, 1);
+    assert.deepEqual(state.recoverable, [canRecover]);
+    assert.equal(state.peer.closed, true);
+  }));
+}
+
+test('steering appends silent context or trusted instructions only while ready', async () => harness(async state => {
+  assert.equal(state.client.steer('thinking', 'vorher'), false);
+  await state.client.start();
+  assert.equal(state.client.steer('thinking', 'Rückstand 4 s', 'pace'), true);
+  assert.equal(state.client.steer('instructions', 'aufholen', 'catch_up'), true);
+  assert.deepEqual(state.channel.sent.map(({ type, event_id, delegation_id, content }) => ({ type, event_id, delegation_id, content })), [
+    { type: 'session.thinking.append', event_id: 'pace_1', delegation_id: null, content: 'Rückstand 4 s' },
+    { type: 'session.instructions.append', event_id: 'catch_up_2', delegation_id: null, content: 'aufholen' }
+  ]);
+  state.channel.readyState = 'closed';
+  assert.equal(state.client.steer('thinking', 'zu', 'pace'), false);
+}));
 
 test('cancellation inside readiness callback cannot install timers after teardown', async () => {
   let cancel = () => {};
@@ -327,16 +403,17 @@ test('caption routing preserves deltas and hides the disabled source lane', asyn
   assert.match(state.errors[0] ?? '', /Sitzung beendet/);
 }, { sourceCaptions: false }));
 
-for (const reason of ['channel-close', 'channel-error', 'peer-failed', 'api-error'] as const) {
+for (const reason of ['channel-close', 'channel-error', 'peer-failed', 'session-closed'] as const) {
   test(`an active ${reason} ends capture readiness and reports one error`, async () => harness(async state => {
     await state.client.start();
-    if (reason === 'api-error') state.channel.emit({ type: 'error', error: { message: 'quota exceeded' } });
+    if (reason === 'session-closed') state.channel.emit({ type: 'session.closed', reason: 'connection_lost' });
     else if (reason === 'peer-failed') {
       state.peer.connectionState = 'failed'; state.peer.dispatchEvent(new Event('connectionstatechange'));
     } else state.channel.dispatchEvent(new Event(reason === 'channel-close' ? 'close' : 'error'));
     assert.equal(state.peer.closed, true);
     assert.deepEqual(state.ready, [true, false]);
     assert.equal(state.errors.length, 1);
+    assert.deepEqual(state.recoverable, [true]);
     state.channel.emit({ type: 'error', message: 'late error' });
     assert.equal(state.errors.length, 1);
   }));

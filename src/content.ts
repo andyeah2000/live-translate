@@ -109,14 +109,15 @@ function setup(): void {
         .line {
           background: rgba(0, 0, 0, 0.75);
           color: #fff;
-          font: 600 20px/1.35 system-ui, sans-serif;
-          padding: 4px 14px;
-          border-radius: 6px;
-          max-width: 70vw;
+          font: 600 clamp(18px, 2.4vmin + 6px, 44px)/1.35 system-ui, sans-serif;
+          padding: 0.2em 0.7em;
+          border-radius: 0.3em;
+          max-width: min(80vw, 46ch);
           text-align: center;
+          text-wrap: balance;
           text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
         }
-        .line.prev { opacity: 0.75; font-size: 17px; }
+        .line.prev { opacity: 0.75; font-size: 0.85em; }
         .line:empty { display: none; }
       `;
       const box = document.createElement('div');
@@ -184,10 +185,26 @@ function setup(): void {
     clearNativeTrack();
   }
 
-  const onMessage = (msg: Message) => {
+  // A final clear ends one session's display. Batches of that session that
+  // were already in flight must not resurrect its last line afterwards.
+  const finishedSessions = new Set<string>();
+  const onMessage = (msg: Message, _sender?: chrome.runtime.MessageSender, respond?: (response?: unknown) => void) => {
     if (msg.type === 'subtitle') {
       applySubtitle(msg.event);
-    } else if (msg.type === 'subtitle-clear') clear();
+    } else if (msg.type === 'subtitle-batch') {
+      if (!finishedSessions.has(msg.sessionId) && Array.isArray(msg.events)) {
+        for (const event of msg.events) subtitleState.apply(event);
+        render();
+        scheduleHide();
+      }
+    } else if (msg.type === 'subtitle-clear') {
+      if (msg.final && typeof msg.sessionId === 'string') finishedSessions.add(msg.sessionId);
+      clear();
+    } else {
+      return;
+    }
+    // Acknowledge at once so the worker can send the next batch.
+    respond?.({ ok: true });
   };
   chrome.runtime.onMessage.addListener(onMessage);
 

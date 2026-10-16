@@ -30,16 +30,25 @@ export function softLimitInPlace(
   }
 }
 
+/**
+ * Headroom of the master limiter. A WaveShaper clamps inputs outside −1…1 to
+ * its end points, so a summed mix (original + German) above 1.0 would be hard
+ * clipped. The output graph scales by 1 / MASTER_INPUT_RANGE before the shaper
+ * and this curve maps that back, keeping the knee for peaks up to ±2.
+ */
+export const MASTER_INPUT_RANGE = 2;
+
 /** Transferkurve für einen WaveShaperNode im gemeinsamen Ausgangspfad. */
 export function createSoftLimiterCurve(
   points = 65_537,
   knee = SOFT_LIMIT_KNEE,
-  ceiling = SOFT_LIMIT_CEILING
+  ceiling = SOFT_LIMIT_CEILING,
+  inputRange = 1
 ): Float32Array<ArrayBuffer> {
   const count = Math.max(3, Math.floor(points));
   const curve = new Float32Array(count);
   for (let index = 0; index < count; index++) {
-    const input = (index / (count - 1)) * 2 - 1;
+    const input = ((index / (count - 1)) * 2 - 1) * inputRange;
     curve[index] = softLimitSample(input, knee, ceiling);
   }
   return curve;

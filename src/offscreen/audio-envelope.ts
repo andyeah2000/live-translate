@@ -35,7 +35,12 @@ export function cosineRamp(
   return curve;
 }
 
-/** Interruptible ramps avoid overlapping setValueCurve schedules in Chrome. */
+/**
+ * Interruptible ramps avoid overlapping setValueCurve schedules in Chrome.
+ * The explicit anchor at `startTime` matters: once an earlier ramp has ended,
+ * cancelAndHoldAtTime adds no event, and a linear ramp would then start from
+ * that past event and jump to most of its target within one render quantum.
+ */
 export function rampAudioParam(
   param: AudioParam,
   target: number,
@@ -48,6 +53,7 @@ export function rampAudioParam(
     param.setValueAtTime(target, startTime);
     return;
   }
+  param.setValueAtTime(current, startTime);
   param.linearRampToValueAtTime(target, startTime + duration);
 }
 

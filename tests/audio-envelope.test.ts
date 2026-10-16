@@ -77,5 +77,20 @@ test('rapid mix retargeting never schedules overlapping value curves', () => {
   } as unknown as AudioParam;
   rampAudioParam(param, .28, 1, .22);
   rampAudioParam(param, .6, 1.025, .22);
-  assert.deepEqual(calls, ['hold', 'ramp', 'hold', 'ramp']);
+  assert.deepEqual(calls, ['hold', 'set', 'ramp', 'hold', 'set', 'ramp']);
+});
+
+test('a ramp after a finished ramp starts at its own start time, not at the old event', () => {
+  // Once the previous ramp has ended, cancelAndHoldAtTime adds no event. Without
+  // an explicit anchor the new ramp would interpolate from the old event time
+  // and jump most of the way to its target in a single render quantum.
+  const calls: Array<[string, number, number?]> = [];
+  const param = {
+    value: 0.28,
+    cancelAndHoldAtTime(time: number) { calls.push(['hold', time]); },
+    setValueAtTime(value: number, time: number) { calls.push(['set', time, value]); },
+    linearRampToValueAtTime(value: number, time: number) { calls.push(['ramp', time, value]); }
+  } as unknown as AudioParam;
+  rampAudioParam(param, 1, 3, 0.7);
+  assert.deepEqual(calls, [['hold', 3], ['set', 3, 0.28], ['ramp', 3.7, 1]]);
 });

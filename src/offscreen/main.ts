@@ -8,10 +8,10 @@ import {
   rampAudioParam
 } from './audio-envelope';
 import { resumeAudioContextWithTimeout } from './audio-context-state';
-import { GptLiveTranslator } from './live';
+import { LiveSession, type LiveTelemetry } from './live-session';
 import { NeuralVoiceDetector } from './neural-vad';
 import { belongsToActiveSession, shouldStartOffscreenSession, waitForLocalAudioConnection } from './session-routing';
-import { createSoftLimiterCurve } from './soft-limiter';
+import { createSoftLimiterCurve, MASTER_INPUT_RANGE } from './soft-limiter';
 import { dubbingSourceGain } from './dubbing-mix';
 import { gatherLocalDescription, validAudioSdp } from '../local-audio-bridge';
 
@@ -44,13 +44,17 @@ interface ActiveSession {
   vadError: string | null;
   providerReady: boolean;
   translatedAudioEnabled: boolean;
+  live: LiveTelemetry;
 }
+
+type AudioHealth = { attached: boolean; live: boolean; muted: boolean; signal: boolean };
 
 interface TranslatorClient {
   start(): Promise<void>;
   finishInput(timeoutMs?: number): Promise<void>;
   stop(): void;
-  audioHealth(): { attached: boolean; live: boolean; muted: boolean; signal: boolean };
+  audioHealth(): AudioHealth;
+  replaceInput(stream: MediaStream): Promise<void>;
 }
 
 let session: ActiveSession | null = null;
@@ -98,7 +102,7 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
       }
     });
   } else if (msg.type === 'offscreen-stop') {
-    void stopGracefully().then(
+    void stopGracefully(msg.drainMs).then(
       () => sendResponse({ ok: true, finalizationError }),
       (error) => {
         console.warn('[live-translate] Graceful Stop fehlgeschlagen:', error);
@@ -172,14 +176,18 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     // Restore the tab's original output before waiting for local ICE. Chrome
     // silences a captured tab, so delaying this graph would swallow its audio.
     // Original and translated audio share a soft limiter; unlike a master
-    // compressor it leaves ordinary ambience levels unchanged.
+    // compressor it leaves ordinary ambience levels unchanged. The pre-gain
+    // gives the summed mix headroom up to ±2 instead of a hard clip at ±1, and
+    // no oversampling keeps the original in sync with the picture (0 ms added).
+    const masterHeadroom = ctx.createGain();
+    masterHeadroom.gain.value = 1 / MASTER_INPUT_RANGE;
     const masterCeiling = ctx.createWaveShaper();
-    masterCeiling.curve = createSoftLimiterCurve();
-    masterCeiling.oversample = '4x';
-    masterCeiling.connect(ctx.destination);
+    masterCeiling.curve = createSoftLimiterCurve(undefined, undefined, undefined, MASTER_INPUT_RANGE);
+    masterCeiling.oversample = 'none';
+    masterHeadroom.connect(masterCeiling).connect(ctx.destination);
     const sourceGain = ctx.createGain();
     sourceGain.gain.value = 1;
-    source.connect(sourceGain).connect(masterCeiling);
+    source.connect(sourceGain).connect(masterHeadroom);
 
     let agentInput = media;
     if (validAudioSdp(inputOffer)) {
@@ -197,20 +205,20 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       await waitForLocalAudioConnection(inputPeer);
       if (generation !== startGeneration) throw new Error('Start abgebrochen.');
       inputPeer.onconnectionstatechange = () => {
-        if (session?.sessionId !== sessionId) return;
+        if (session?.sessionId !== sessionId || !session.inputIndependent) return;
         if (['failed', 'disconnected', 'closed'].includes(inputPeer.connectionState)) {
-          stop();
-          send({ type: 'offscreen-error', sessionId, detail: 'Direkter Videoeingang unterbrochen. Bitte neu starten.' });
+          // Reload, navigation or a player swap ended the direct video input.
+          // Tab audio carries the same programme, so continue the running
+          // GPT-Live session with it instead of ending the translation.
+          fallBackToTabInput(sessionId);
         }
       };
     }
-    const analysisSource = agentInput === media ? source : ctx.createMediaStreamSource(agentInput);
 
     // GPT-Live verhandelt Audio direkt über WebRTC. Der Quelltrack bleibt daher
     // unverändert; Resampling, PCM-Packaging und TTS-Playback im Extension-Code
-    // entfallen vollständig.
-    // Die übersetzte Spur läuft immer mit dem kalibrierten Unity-Pegel und
-    // bekommt einen live regelbaren Gain und einen Sicherheits-Limiter.
+    // entfallen vollständig. Die übersetzte Spur bekommt einen live regelbaren
+    // Gain; der gemeinsame Soft-Limiter schützt ohne zusätzliche Lookahead-Latenz.
     const translatedInput = ctx.createGain();
     const translatedGain = ctx.createGain();
     const translationVolume = clamp01(
@@ -220,13 +228,7 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       1
     );
     translatedGain.gain.value = translationVolume;
-    const translatedLimiter = ctx.createDynamicsCompressor();
-    translatedLimiter.threshold.value = -3;
-    translatedLimiter.knee.value = 3;
-    translatedLimiter.ratio.value = 8;
-    translatedLimiter.attack.value = 0.003;
-    translatedLimiter.release.value = 0.15;
-    translatedInput.connect(translatedGain).connect(translatedLimiter).connect(masterCeiling);
+    translatedInput.connect(translatedGain).connect(masterHeadroom);
 
     const commonCallbacks = {
       onTranscript: (event: TranscriptEvent) => {
@@ -249,11 +251,17 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
         if (session?.sessionId !== sessionId) return;
         stop();
         send({ type: 'offscreen-error', sessionId, detail });
+      },
+      onTelemetry: (telemetry: LiveTelemetry) => {
+        if (session?.sessionId !== sessionId) return;
+        session.live = telemetry;
+        publishDuckingTelemetry(sessionId);
       }
     };
     // Forward both transcript lanes; subtitle selection can change live.
+    // Source transcripts also feed the delay measurement.
     const inputTranscriptionEnabled = true;
-    const client: TranslatorClient = new GptLiveTranslator({
+    const client: TranslatorClient = new LiveSession({
       ctx,
       inputStream: agentInput,
       outputNode: translatedInput,
@@ -263,9 +271,12 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       inputTranscriptionEnabled,
       ...commonCallbacks
     });
+    // Analyse the tab signal that is actually being ducked. A remote WebRTC
+    // track (direct input) delivers no samples to Web Audio without a playing
+    // media element, which would leave the detector listening to silence.
     const vad = new NeuralVoiceDetector({
       ctx,
-      source: analysisSource,
+      source,
       onSpeechChange: (speaking, probability) => {
         if (session?.sessionId !== sessionId) return;
         session.sourceSpeaking = speaking;
@@ -309,7 +320,8 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       vadError: null,
       providerReady: false,
       // GPT-Live liefert den Zielton über den WebRTC-Remote-Track.
-      translatedAudioEnabled: true
+      translatedAudioEnabled: true,
+      live: { lagMs: null, usageSeconds: 0, reconnects: 0 }
     };
     pendingMedia = null;
     pendingContext = null;
@@ -428,7 +440,7 @@ function tick(): void {
   tickCount++;
   // Ton-Monitor alle 50 ms: meldet hörbar-vs-stumm als Popup-Status, damit ein
   // fehlender Zielton ohne Devtools eingrenzbar ist. Nur bei Wechsel senden.
-  if (tickCount % 2 === 0) audioHealthCheck();
+  if (tickCount % 2 === 0) audioHealthCheck(health);
 }
 
 function rampParam(param: AudioParam, target: number, ctx: AudioContext, duration: number): void {
@@ -446,9 +458,8 @@ function applyOutputSettings(settings: OutputSettings): void {
 }
 
 /** Ton-Monitor: unterscheidet stummen Track, Gain 0 und laufenden Zielton. */
-function audioHealthCheck(): void {
+function audioHealthCheck(health: AudioHealth): void {
   if (!session || !session.providerReady) return;
-  const health = session.client.audioHealth();
   let key: string;
   let status: string | null;
   if (!health.attached) {
@@ -486,6 +497,29 @@ function withDuckingWarning(status: string): string {
   return session?.vadError ? `${status} · vereinfachter Audiomix` : status;
 }
 
+function fallBackToTabInput(sessionId: string): void {
+  const active = session;
+  if (active?.sessionId !== sessionId || !active.inputIndependent) return;
+  active.inputIndependent = false;
+  const peer = active.inputPeer;
+  active.inputPeer = null;
+  peer?.close();
+  console.warn('[live-translate] Direkter Videoeingang getrennt, Tab-Audio übernimmt.');
+  void active.client.replaceInput(active.media).then(() => {
+    if (session?.sessionId !== sessionId) return;
+    publishDuckingTelemetry(sessionId);
+    send({ type: 'offscreen-status', sessionId, status: 'Direkter Videoeingang getrennt · Tab-Audio übernommen' });
+  }, (error: unknown) => {
+    if (session?.sessionId !== sessionId) return;
+    stop();
+    send({
+      type: 'offscreen-error',
+      sessionId,
+      detail: `Der Videoeingang konnte nicht auf Tab-Audio umschalten: ${error instanceof Error ? error.message : String(error)}`
+    });
+  });
+}
+
 function handleVadFailure(sessionId: string, detail: string): void {
   if (session?.sessionId !== sessionId || session.vadError) return;
   console.error('[live-translate] Lokale Spracherkennung ausgefallen:', detail);
@@ -517,7 +551,10 @@ function publishDuckingTelemetry(sessionId: string): void {
       probability: session.vadProbability,
       error: session.vadError,
       translationReady: session.providerReady,
-      inputIndependent: session.inputIndependent
+      inputIndependent: session.inputIndependent,
+      lagMs: session.live.lagMs,
+      usageSeconds: session.live.usageSeconds,
+      reconnects: session.live.reconnects
     }
   });
 }
@@ -548,7 +585,7 @@ function stop(): void {
   void ctx.close().catch(() => {});
 }
 
-function stopGracefully(): Promise<void> {
+function stopGracefully(drainMs = MANUAL_STOP_DRAIN_MS): Promise<void> {
   if (gracefulStopPromise) return gracefulStopPromise;
   const active = session;
   if (!active) {
@@ -559,7 +596,7 @@ function stopGracefully(): Promise<void> {
   finalizationError = null;
   const sessionId = active.sessionId;
   gracefulStopPromise = active.client
-    .finishInput(MANUAL_STOP_DRAIN_MS)
+    .finishInput(Math.min(MANUAL_STOP_DRAIN_MS, Math.max(250, Number.isFinite(drainMs) ? drainMs : MANUAL_STOP_DRAIN_MS)))
     .catch((error) => {
       finalizationError = error instanceof Error ? error.message : String(error);
       console.warn('[live-translate] Audio-Ende wurde per Timeout beendet:', error);

@@ -33,7 +33,9 @@ for (const failure of ['missing-audio', 'server-rejection', 'cancel-ice'] as con
     cancel = () => client.stop();
     try {
       await assert.rejects(client.start(), failure === 'missing-audio' ? /keine Audiospur/ : failure === 'cancel-ice' ? /beendet/ : /502/);
-      assert.equal(closed, true);
+      // Without an input track no peer is created at all; otherwise it is released.
+      assert.equal(closed, failure !== 'missing-audio');
+      if (failure === 'missing-audio') assert.equal(fetchCount, 0);
       if (failure === 'cancel-ice') assert.equal(fetchCount, 0, 'cancelled startup must not create a paid session');
     } finally {
       client.stop();

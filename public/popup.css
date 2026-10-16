@@ -62,6 +62,8 @@ button.running { background: #303b29; color: var(--ink); }
 button:disabled { opacity: .6; cursor: progress; }
 #status { margin-top: 8px; font-size: 10px; color: var(--muted); text-align: center; overflow-wrap: anywhere; max-height: 58px; overflow-y: auto; }
 #status.error { color: var(--danger); }
+#liveStats { margin-top: 4px; font: 10px "SFMono-Regular", Menlo, monospace; color: var(--muted); text-align: center; }
+#liveStats:empty { display: none; }
 #status:empty { display: none; }
 .disclosure { display: block; text-align: center; color: #95a28a; font-size: 9px; margin-top: 5px; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }

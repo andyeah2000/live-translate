@@ -35,6 +35,7 @@ class Node {
   connections: Node[] = [];
   gain = new Param();
   connect(node: Node) { this.connections.push(node); return node; }
+  disconnect() { this.connections = []; }
 }
 
 let initialContextState = 'running';
@@ -127,6 +128,9 @@ NeuralVoiceDetector.prototype.stop = () => { vadStops++; };
 await import('../src/offscreen/main');
 
 const trustedSender = { origin: 'chrome-extension://test' };
+// Gain creation order in main.ts: master headroom, original, translated input, translated volume.
+const SOURCE = 1;
+const TRANSLATED = 3;
 function emit(message: Record<string, unknown>) {
   return new Promise<unknown>(resolve => { listener(message, trustedSender, resolve); });
 }
@@ -168,13 +172,13 @@ test('mute received during pending capture is retained and duplicate starts cann
   assert.equal(captureCalls, 1);
   pending.resolve(new Stream());
   await ready();
-  assert.equal(contexts[0]?.gains[2]?.gain.value, 0, 'pending mute must apply before any translated playback');
+  assert.equal(contexts[0]?.gains[TRANSLATED]?.gain.value, 0, 'pending mute must apply before any translated playback');
   health.signal = true;
   detectors[0]?.onSpeechChange(true, 0.95);
-  assert.equal(contexts[0]?.gains[0]?.gain.value, 1, 'muted output never suppresses the original');
+  assert.equal(contexts[0]?.gains[SOURCE]?.gain.value, 1, 'muted output never suppresses the original');
   await emit({ type: 'offscreen-update-output', sessionId: 'test-session', settings: { translationVolume: 0.4 } });
-  assert.equal(contexts[0]?.gains[2]?.gain.value, 0.4);
-  assert.equal(contexts[0]?.gains[0]?.gain.value, 0.28);
+  assert.equal(contexts[0]?.gains[TRANSLATED]?.gain.value, 0.4);
+  assert.equal(contexts[0]?.gains[SOURCE]?.gain.value, 0.28);
   clients[0]?.onTranscript({ kind: 'chunk', lane: 'target', text: 'Hallo' });
   assert.ok(messages.some(message => message.type === 'transcript'));
 });
@@ -247,7 +251,7 @@ test('VAD failure preserves translation with the simplified mix and visible tele
   await waitFor(() => messages.some(message => message.type === 'ducking-telemetry' &&
     (message.telemetry as { error: string | null }).error === 'VAD unavailable'));
   assert.equal(contexts[0]?.state, 'running');
-  assert.equal(contexts[0]?.gains[0]?.gain.value, 0.6);
+  assert.equal(contexts[0]?.gains[SOURCE]?.gain.value, 0.6);
   clients[0]?.onStatus('Verbunden');
   assert.match(String(messages.at(-1)?.status), /vereinfachter Audiomix/);
   detectors[0]?.onError('second error');
@@ -257,15 +261,21 @@ test('local bridge must connect before provider startup while original playback 
   await start('bridge', { inputOffer: 'v=0\r\nm=audio' });
   await waitFor(() => messages.some(message => message.type === 'offscreen-input-answer'));
   assert.equal(clients.length, 0);
-  assert.equal(contexts[0]?.sources[0]?.connections[0], contexts[0]?.gains[0]);
+  assert.equal(contexts[0]?.sources[0]?.connections[0], contexts[0]?.gains[SOURCE]);
   await emit({ type: 'offscreen-update-output', sessionId: 'bridge', settings: { translationVolume: 0 } });
   peers[0]?.change('connected'); await ready();
-  assert.equal(contexts[0]?.gains[2]?.gain.value, 0);
+  assert.equal(contexts[0]?.gains[TRANSLATED]?.gain.value, 0);
   assert.ok(messages.some(message => message.type === 'ducking-telemetry' &&
     (message.telemetry as { inputIndependent: boolean }).inputIndependent));
+  // Reload or player swap: the running GPT-Live session continues on tab audio.
+  messages.length = 0;
   peers[0]?.change('disconnected');
-  assert.ok(messages.some(message => message.type === 'offscreen-error'));
-  assert.equal(contexts[0]?.state, 'closed');
+  await waitFor(() => messages.some(message => message.type === 'offscreen-status' &&
+    /Tab-Audio übernommen/.test(String(message.status))));
+  assert.equal(messages.some(message => message.type === 'offscreen-error'), false);
+  assert.ok(messages.some(message => message.type === 'ducking-telemetry' &&
+    (message.telemetry as { inputIndependent: boolean }).inputIndependent === false));
+  assert.equal(contexts[0]?.state, 'running');
 });
 
 test('failed local bridge connection never opens a paid provider session', async () => {
