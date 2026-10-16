@@ -13,6 +13,8 @@ const plistPath = join(homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`);
 const logDir = join(homedir(), 'Library', 'Logs', 'LiveTranslate');
 const domain = `gui/${userInfo().uid}`;
 
+// The Homebrew symlink survives `brew upgrade`; the resolved Cellar path does not.
+const node = ['/opt/homebrew/bin/node', '/usr/local/bin/node'].find(path => existsSync(path)) ?? process.execPath;
 const xml = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 function launchctl(...args) {
@@ -45,7 +47,7 @@ writeFileSync(plistPath, `<?xml version="1.0" encoding="UTF-8"?>
   <key>Label</key><string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${xml(process.execPath)}</string>
+    <string>${xml(node)}</string>
     <string>--env-file=${xml(envFile)}</string>
     <string>${xml(join(repo, 'server', 'live-server.mjs'))}</string>
   </array>
