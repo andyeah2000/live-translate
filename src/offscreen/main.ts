@@ -10,10 +10,9 @@ import {
 import { resumeAudioContextWithTimeout } from './audio-context-state';
 import { LiveSession, type LiveTelemetry } from './live-session';
 import { NeuralVoiceDetector } from './neural-vad';
-import { belongsToActiveSession, shouldStartOffscreenSession, waitForLocalAudioConnection } from './session-routing';
+import { belongsToActiveSession, shouldStartOffscreenSession } from './session-routing';
 import { createSoftLimiterCurve, MASTER_INPUT_RANGE } from './soft-limiter';
 import { dubbingSourceGain } from './dubbing-mix';
-import { gatherLocalDescription, validAudioSdp } from '../local-audio-bridge';
 
 // Decode-driven sidechain: original audio is reduced only while German plays.
 const TICK_MS = 25;
@@ -25,8 +24,6 @@ interface ActiveSession {
   sessionId: string;
   ctx: AudioContext;
   media: MediaStream;
-  inputPeer: RTCPeerConnection | null;
-  inputIndependent: boolean;
   captureTrack: MediaStreamTrack;
   sourceGain: GainNode;
   translatedGain: GainNode;
@@ -34,6 +31,8 @@ interface ActiveSession {
   client: TranslatorClient;
   tickTimer: number;
   translationVolume: number;
+  /** User level of the original sound; ducking applies on top of it. */
+  originalVolume: number;
   lastDuckGain: number;
   lastTranslatedTarget: number;
   lastAudioHealthKey: string | null;
@@ -54,7 +53,6 @@ interface TranslatorClient {
   finishInput(timeoutMs?: number): Promise<void>;
   stop(): void;
   audioHealth(): AudioHealth;
-  replaceInput(stream: MediaStream): Promise<void>;
 }
 
 let session: ActiveSession | null = null;
@@ -95,7 +93,7 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
     }
     pendingStartSessionId = msg.sessionId;
     pendingOutputSettings = null;
-    void start(msg.sessionId, msg.streamId, msg.settings, msg.inputOffer).finally(() => {
+    void start(msg.sessionId, msg.streamId, msg.settings).finally(() => {
       if (pendingStartSessionId === msg.sessionId) {
         pendingStartSessionId = null;
         pendingOutputSettings = null;
@@ -124,16 +122,13 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
   return undefined;
 });
 
-async function start(sessionId: string, streamId: string, settings: SessionSettings, inputOffer?: string): Promise<void> {
+async function start(sessionId: string, streamId: string, settings: SessionSettings): Promise<void> {
   stop();
   finalizationError = null;
   const generation = ++startGeneration;
   let pendingMedia: MediaStream | null = null;
   let pendingContext: AudioContext | null = null;
-  let pendingInputPeer: RTCPeerConnection | null = null;
   const disposePending = () => {
-    pendingInputPeer?.close();
-    pendingInputPeer = null;
     if (pendingMedia) {
       for (const track of pendingMedia.getTracks()) track.stop();
       pendingMedia = null;
@@ -173,8 +168,8 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     if (!captureTrack) throw new Error('Der Tab-Audiostream enthält keine Audiospur.');
     const source = ctx.createMediaStreamSource(media);
 
-    // Restore the tab's original output before waiting for local ICE. Chrome
-    // silences a captured tab, so delaying this graph would swallow its audio.
+    // Restore the tab's original output first. Chrome silences a captured tab,
+    // so any delay before this graph would swallow its audio.
     // Original and translated audio share a soft limiter; unlike a master
     // compressor it leaves ordinary ambience levels unchanged. The pre-gain
     // gives the summed mix headroom up to ±2 instead of a hard clip at ±1, and
@@ -185,48 +180,20 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     masterCeiling.curve = createSoftLimiterCurve(undefined, undefined, undefined, MASTER_INPUT_RANGE);
     masterCeiling.oversample = 'none';
     masterHeadroom.connect(masterCeiling).connect(ctx.destination);
+    const pendingOutput = pendingOutputSettings?.sessionId === sessionId ? pendingOutputSettings.settings : null;
+    const originalVolume = clamp01(pendingOutput?.originalVolume ?? settings.originalVolume, 1);
     const sourceGain = ctx.createGain();
-    sourceGain.gain.value = 1;
+    sourceGain.gain.value = originalVolume;
     source.connect(sourceGain).connect(masterHeadroom);
 
-    let agentInput = media;
-    if (validAudioSdp(inputOffer)) {
-      const inputPeer = new RTCPeerConnection({ iceServers: [] });
-      pendingInputPeer = inputPeer;
-      const tracks: MediaStreamTrack[] = [];
-      inputPeer.ontrack = event => { if (event.track.kind === 'audio') tracks.push(event.track); };
-      await inputPeer.setRemoteDescription({ type: 'offer', sdp: inputOffer });
-      await inputPeer.setLocalDescription(await inputPeer.createAnswer());
-      const sdp = await gatherLocalDescription(inputPeer);
-      if (generation !== startGeneration) throw new Error('Start abgebrochen.');
-      if (!tracks.length) throw new Error('Direkter Videoeingang enthält keine Audiospur.');
-      agentInput = new MediaStream(tracks);
-      send({ type: 'offscreen-input-answer', sessionId, sdp });
-      await waitForLocalAudioConnection(inputPeer);
-      if (generation !== startGeneration) throw new Error('Start abgebrochen.');
-      inputPeer.onconnectionstatechange = () => {
-        if (session?.sessionId !== sessionId || !session.inputIndependent) return;
-        if (['failed', 'disconnected', 'closed'].includes(inputPeer.connectionState)) {
-          // Reload, navigation or a player swap ended the direct video input.
-          // Tab audio carries the same programme, so continue the running
-          // GPT-Live session with it instead of ending the translation.
-          fallBackToTabInput(sessionId);
-        }
-      };
-    }
-
-    // GPT-Live verhandelt Audio direkt über WebRTC. Der Quelltrack bleibt daher
-    // unverändert; Resampling, PCM-Packaging und TTS-Playback im Extension-Code
-    // entfallen vollständig. Die übersetzte Spur bekommt einen live regelbaren
-    // Gain; der gemeinsame Soft-Limiter schützt ohne zusätzliche Lookahead-Latenz.
+    // GPT-Live hört das Tab-Audio direkt über WebRTC: kein Resampling, kein
+    // PCM-Packaging, keine zweite lokale Verbindung. Die Player-Lautstärke
+    // bleibt dafür auf 100 %; das Original regelt der eigene Regler danach.
+    // Die übersetzte Spur bekommt einen live regelbaren Gain; der gemeinsame
+    // Soft-Limiter schützt ohne zusätzliche Lookahead-Latenz.
     const translatedInput = ctx.createGain();
     const translatedGain = ctx.createGain();
-    const translationVolume = clamp01(
-      pendingOutputSettings?.sessionId === sessionId
-        ? pendingOutputSettings.settings.translationVolume
-        : settings.translationVolume,
-      1
-    );
+    const translationVolume = clamp01(pendingOutput?.translationVolume ?? settings.translationVolume, 1);
     translatedGain.gain.value = translationVolume;
     translatedInput.connect(translatedGain).connect(masterHeadroom);
 
@@ -263,17 +230,16 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     const inputTranscriptionEnabled = true;
     const client: TranslatorClient = new LiveSession({
       ctx,
-      inputStream: agentInput,
+      inputStream: media,
       outputNode: translatedInput,
       serverUrl: settings.liveServerUrl,
       serverToken: settings.liveServerToken,
       voice: settings.liveVoice,
+      sourceLanguage: settings.sourceLanguage,
       inputTranscriptionEnabled,
       ...commonCallbacks
     });
-    // Analyse the tab signal that is actually being ducked. A remote WebRTC
-    // track (direct input) delivers no samples to Web Audio without a playing
-    // media element, which would leave the detector listening to silence.
+    // Analyse exactly the tab signal that is being ducked.
     const vad = new NeuralVoiceDetector({
       ctx,
       source,
@@ -295,8 +261,6 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       sessionId,
       ctx,
       media,
-      inputPeer: pendingInputPeer,
-      inputIndependent: agentInput !== media,
       captureTrack,
       sourceGain,
       translatedGain,
@@ -310,6 +274,7 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
         }
       }, TICK_MS) as unknown as number,
       translationVolume,
+      originalVolume,
       lastDuckGain: Number.NaN,
       lastTranslatedTarget: translationVolume,
       lastAudioHealthKey: null,
@@ -325,7 +290,6 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     };
     pendingMedia = null;
     pendingContext = null;
-    pendingInputPeer = null;
     const handleCaptureEnded = () => {
       if (session?.sessionId !== sessionId) return;
       captureTrack.onended = null;
@@ -415,16 +379,17 @@ function tick(): void {
 
   const health = session.client.audioHealth();
   const duckGain = dubbingSourceGain(session.sourceSpeaking, health.signal, session.translationVolume);
+  const sourceTarget = duckGain * session.originalVolume;
 
-  if (duckGain !== session.lastDuckGain) {
-    session.lastDuckGain = duckGain;
+  if (sourceTarget !== session.lastDuckGain) {
+    session.lastDuckGain = sourceTarget;
     publishDuckingTelemetry(session.sessionId);
     const failOpen =
       duckGain === 1 &&
       (!session.providerReady || !session.translatedAudioEnabled || session.vadError !== null);
     rampParam(
       session.sourceGain.gain,
-      duckGain,
+      sourceTarget,
       ctx,
       duckGain === 1
         ? failOpen
@@ -452,6 +417,14 @@ function rampParam(param: AudioParam, target: number, ctx: AudioContext, duratio
 function applyOutputSettings(settings: OutputSettings): void {
   if (!session) return;
   session.translationVolume = clamp01(settings.translationVolume, 1);
+  const originalVolume = clamp01(settings.originalVolume, session.originalVolume);
+  if (originalVolume !== session.originalVolume) {
+    // A slider move follows the hand at once instead of the slow duck release.
+    session.originalVolume = originalVolume;
+    const target = dubbingSourceGain(session.sourceSpeaking, session.client.audioHealth().signal, session.translationVolume) * originalVolume;
+    session.lastDuckGain = target;
+    rampParam(session.sourceGain.gain, target, session.ctx, CONTROL_FADE_S);
+  }
   // Sofort neu bewerten, damit ein aufgedrehter Regler umgehend wirkt.
   session.lastAudioHealthKey = null;
   tick();
@@ -468,19 +441,19 @@ function audioHealthCheck(health: AudioHealth): void {
     status = null;
   } else if (session.translationVolume <= 0) {
     key = 'volume-zero';
-    status = 'Zielton aus · Lautstärke steht auf 0 %';
+    status = 'Deutsche Stimme stumm · Lautstärke 0 %';
   } else if (!health.live) {
     key = 'track-ended';
-    status = 'Zielstimme abgebrochen · bitte neu starten';
+    status = 'Deutsche Stimme unterbrochen';
   } else if (health.muted) {
     key = 'track-muted';
-    status = 'Zielstimme verbunden, liefert aber keinen Ton';
+    status = 'Verbunden · Stimme liefert noch keinen Ton';
   } else if (!health.signal) {
     key = 'waiting-for-speech';
-    status = 'Verbunden · warte auf deutsche Sprachausgabe';
+    status = 'Bereit · wartet auf Sprache';
   } else {
     key = 'ok';
-    status = 'Deutsche Sprachausgabe · Audiopegel gemessen';
+    status = 'Übersetzt live';
   }
   if (key === session.lastAudioHealthKey) return;
   session.lastAudioHealthKey = key;
@@ -495,29 +468,6 @@ function clamp01(value: number, fallback: number): number {
 
 function withDuckingWarning(status: string): string {
   return session?.vadError ? `${status} · vereinfachter Audiomix` : status;
-}
-
-function fallBackToTabInput(sessionId: string): void {
-  const active = session;
-  if (active?.sessionId !== sessionId || !active.inputIndependent) return;
-  active.inputIndependent = false;
-  const peer = active.inputPeer;
-  active.inputPeer = null;
-  peer?.close();
-  console.warn('[live-translate] Direkter Videoeingang getrennt, Tab-Audio übernimmt.');
-  void active.client.replaceInput(active.media).then(() => {
-    if (session?.sessionId !== sessionId) return;
-    publishDuckingTelemetry(sessionId);
-    send({ type: 'offscreen-status', sessionId, status: 'Direkter Videoeingang getrennt · Tab-Audio übernommen' });
-  }, (error: unknown) => {
-    if (session?.sessionId !== sessionId) return;
-    stop();
-    send({
-      type: 'offscreen-error',
-      sessionId,
-      detail: `Der Videoeingang konnte nicht auf Tab-Audio umschalten: ${error instanceof Error ? error.message : String(error)}`
-    });
-  });
 }
 
 function handleVadFailure(sessionId: string, detail: string): void {
@@ -551,7 +501,6 @@ function publishDuckingTelemetry(sessionId: string): void {
       probability: session.vadProbability,
       error: session.vadError,
       translationReady: session.providerReady,
-      inputIndependent: session.inputIndependent,
       lagMs: session.live.lagMs,
       usageSeconds: session.live.usageSeconds,
       reconnects: session.live.reconnects
@@ -566,11 +515,10 @@ function stop(): void {
   cancelPendingStart = null;
   cancel?.();
   if (!session) return;
-  const { client, vad, media, inputPeer, captureTrack, ctx, tickTimer } = session;
+  const { client, vad, media, captureTrack, ctx, tickTimer } = session;
   session = null;
   clearInterval(tickTimer);
   captureTrack.onended = null;
-  inputPeer?.close();
   try {
     vad.stop();
   } catch (err) {

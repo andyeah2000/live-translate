@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Live Translate",
-  "version": "3.1.0",
-  "description": "Übersetzt englische Videos live über GPT-Live nach Deutsch.",
+  "version": "3.2.0",
+  "description": "Übersetzt Videos und Livestreams live über GPT-Live ins Deutsche, mit deutscher Stimme und Untertiteln.",
   "permissions": [
     "tabCapture",
     "offscreen",
@@ -31,6 +31,12 @@
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
+    }
+  },
+  "commands": {
+    "toggle-translation": {
+      "suggested_key": { "default": "Alt+Shift+T", "mac": "Alt+Shift+T" },
+      "description": "Live-Übersetzung im aktuellen Tab starten oder stoppen"
     }
   },
   "icons": {

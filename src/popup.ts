@@ -5,7 +5,8 @@ import {
   isTranslatableUrl,
   liveStatsPresentation,
   popupMonitorPresentation,
-  popupStatusPresentation
+  popupStatusPresentation,
+  serverHealthPresentation
 } from './popup-logic';
 import { DEFAULT_SETTINGS, loadSettings, normalizeServerUrl, sanitizeSettings, saveSettings, VOICE_IDS } from './settings';
 
@@ -25,12 +26,15 @@ export function initializePopup(): void {
   const toggleButton = el<HTMLButtonElement>('#toggle');
   const monitor = el<HTMLDivElement>('#monitor');
   const statusLine = el<HTMLDivElement>('#status');
+  const originalVolumeInput = el<HTMLInputElement>('#originalVolume');
   const originalValue = el<HTMLElement>('#originalValue');
-  const originalMeter = el<HTMLMeterElement>('#originalMeter');
   const connectionDetails = el<HTMLDetailsElement>('#connection');
   const voiceSelect = el<HTMLSelectElement>('#liveVoice');
-  const inputMode = el<HTMLElement>('#inputMode');
+  const languageSelect = el<HTMLSelectElement>('#sourceLanguage');
   const liveStats = el<HTMLElement>('#liveStats');
+  const tabInfo = el<HTMLElement>('#tabInfo');
+  const shortcut = el<HTMLElement>('#shortcut');
+  const serverState = el<HTMLElement>('#serverState');
 
   let state: SessionState = {
     running: false,
@@ -53,9 +57,11 @@ export function initializePopup(): void {
       liveServerToken: includeConnectionEdits ? liveServerTokenInput.value.trim() : connectionSettings.liveServerToken,
       // The server validates the selected voice and owns the translation prompt.
       liveVoice: voiceSelect.value,
+      sourceLanguage: languageSelect.value === 'auto' ? 'auto' : 'en',
       subtitles: subtitlesInput.checked,
       subtitleMode: dualSubtitlesInput.checked ? 'dual' : 'translation',
       translationVolume: Number(translationVolumeInput.value) / 100,
+      originalVolume: Number(originalVolumeInput.value) / 100
     };
   }
 
@@ -79,7 +85,9 @@ export function initializePopup(): void {
     liveServerUrlInput.disabled = state.running || operationPending || voicePending;
     liveServerTokenInput.disabled = state.running || operationPending || voicePending;
     voiceSelect.disabled = operationPending || voicePending;
-    voiceSelect.title = 'Stimme wechseln – laufende Übersetzung startet automatisch neu';
+    languageSelect.disabled = operationPending || voicePending;
+    voiceSelect.title = 'Stimme wechseln – eine laufende Übersetzung startet automatisch neu';
+    languageSelect.title = 'Englisch erkennt am zuverlässigsten; „Alle Sprachen“ dolmetscht jede Sprache außer Deutsch';
     const status = popupStatusPresentation(state);
     renderStatus(status.error ? status.text : (localError ?? status.text), status.error || localError !== null);
     toggleButton.title = status.text;
@@ -91,14 +99,39 @@ export function initializePopup(): void {
     const presentation = popupMonitorPresentation(state);
     monitor.textContent = presentation.text;
     monitor.dataset.state = presentation.state;
-    const gain = state.running ? (state.ducking?.sourceGain ?? 1) : 1;
-    originalValue.textContent = `${Math.round(gain * 100)} %`;
-    originalMeter.value = gain;
-    inputMode.textContent = state.running ? (state.ducking?.inputIndependent ? 'DIRECT' : 'TAB') : 'LIVE-MIX';
     liveStats.textContent = liveStatsPresentation(state);
-    inputMode.title = state.ducking?.inputIndependent
-      ? 'Agent-Eingang unabhängig von Player-Lautstärke und Stummschaltung'
-      : 'Tab-Eingang: Player-Lautstärke beeinflusst den Agenten; Video auf 100 % stellen';
+    renderTabInfo();
+  }
+
+  // Name the tab being translated, so a running session elsewhere is obvious.
+  let tabTitle: { tabId: number; title: string } | null = null;
+  function renderTabInfo(): void {
+    const tabId = state.running ? state.tabId : null;
+    if (tabId === null) {
+      tabInfo.textContent = '';
+      return;
+    }
+    if (tabTitle?.tabId === tabId) {
+      tabInfo.textContent = `▶ ${tabTitle.title}`;
+      tabInfo.title = tabTitle.title;
+      return;
+    }
+    void chrome.tabs?.get(tabId).then(tab => {
+      tabTitle = { tabId, title: tab.title || new URL(tab.url ?? 'about:blank').hostname || 'Tab' };
+      renderTabInfo();
+    }, () => {});
+  }
+
+  /** Server reachability and token, shown before Start; also pre-warms the OpenAI connection. */
+  async function checkServer(): Promise<void> {
+    const settings = sanitizeSettings(collectSettings());
+    if (!settings.liveServerToken || !normalizeServerUrl(settings.liveServerUrl)) return;
+    const pattern = serverPermissionPattern(settings.liveServerUrl);
+    if (!pattern || !(await chrome.permissions.contains({ origins: [pattern] }).catch(() => false))) return;
+    const presentation = await serverHealthPresentation(settings.liveServerUrl, settings.liveServerToken);
+    serverState.textContent = presentation.text;
+    serverState.dataset.state = presentation.state;
+    if (presentation.state === 'error' && !state.running) connectionDetails.open = true;
   }
 
   async function start(): Promise<boolean> {
@@ -222,9 +255,9 @@ export function initializePopup(): void {
       const settings = collectSettings(false);
       await saveSettings(settings);
       const response = await chrome.runtime.sendMessage({
-        type: 'change-voice', settings
+        type: 'restart-session', settings
       } satisfies Message) as { ok: boolean; error?: string } | undefined;
-      if (!response?.ok) throw new Error(response?.error ?? 'Stimmenwechsel fehlgeschlagen.');
+      if (!response?.ok) throw new Error(response?.error ?? 'Neustart mit den neuen Einstellungen fehlgeschlagen.');
       await refreshState();
     } catch (err) {
       setStatus(err instanceof Error ? err.message : String(err), true);
@@ -238,8 +271,11 @@ export function initializePopup(): void {
     const value = translationVolumeInput.value;
     translationValue.textContent = `${value} %`;
     translationVolumeInput.style.setProperty('--fill', `${value}%`);
+    originalValue.textContent = `${originalVolumeInput.value} %`;
+    originalVolumeInput.style.setProperty('--fill', `${originalVolumeInput.value}%`);
     const applyingSnapshot = operationPending || voicePending;
     translationVolumeInput.disabled = applyingSnapshot;
+    originalVolumeInput.disabled = applyingSnapshot;
     subtitlesInput.disabled = applyingSnapshot;
     dualSubtitlesInput.disabled = applyingSnapshot || !subtitlesInput.checked;
   }
@@ -257,7 +293,8 @@ export function initializePopup(): void {
         settings: {
           subtitles: settings.subtitles,
           subtitleMode: settings.subtitleMode,
-          translationVolume: settings.translationVolume
+          translationVolume: settings.translationVolume,
+          originalVolume: settings.originalVolume
         }
       } satisfies Message)
       .then((response: { ok: boolean; error?: string } | undefined) => {
@@ -287,6 +324,8 @@ export function initializePopup(): void {
       voiceSelect.append(option);
     }
     voiceSelect.value = settings.liveVoice;
+    languageSelect.value = settings.sourceLanguage;
+    originalVolumeInput.value = String(Math.round(settings.originalVolume * 100));
     liveServerUrlInput.value = settings.liveServerUrl;
     liveServerTokenInput.value = settings.liveServerToken;
     subtitlesInput.checked = settings.subtitles;
@@ -297,11 +336,18 @@ export function initializePopup(): void {
     await refreshState(true);
     toggleButton.disabled = false;
     connectionDetails.open = !settings.liveServerToken;
+    void checkServer().catch(() => {});
+    void chrome.commands?.getAll().then(commands => {
+      const key = commands.find(command => command.name === 'toggle-translation')?.shortcut;
+      shortcut.textContent = key ? `${key} startet und stoppt im aktuellen Tab` : '';
+    }, () => {});
 
     toggleButton.addEventListener('click', () => void onToggle());
-    liveServerUrlInput.addEventListener('change', saveConfiguration);
-    liveServerTokenInput.addEventListener('change', saveConfiguration);
+    liveServerUrlInput.addEventListener('change', () => { saveConfiguration(); void checkServer().catch(() => {}); });
+    liveServerTokenInput.addEventListener('change', () => { saveConfiguration(); void checkServer().catch(() => {}); });
     voiceSelect.addEventListener('change', () => void changeVoice());
+    languageSelect.addEventListener('change', () => void changeVoice());
+    originalVolumeInput.addEventListener('input', updateOutputSettings);
     subtitlesInput.addEventListener('change', updateOutputSettings);
     dualSubtitlesInput.addEventListener('change', updateOutputSettings);
     translationVolumeInput.addEventListener('input', updateOutputSettings);

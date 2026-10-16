@@ -257,48 +257,22 @@ test('VAD failure preserves translation with the simplified mix and visible tele
   detectors[0]?.onError('second error');
 });
 
-test('local bridge must connect before provider startup while original playback is already restored', async () => {
-  await start('bridge', { inputOffer: 'v=0\r\nm=audio' });
-  await waitFor(() => messages.some(message => message.type === 'offscreen-input-answer'));
-  assert.equal(clients.length, 0);
+test('the original slider scales the tab sound and ducking applies on top of it', async () => {
+  await start('original', { settings: {
+    liveServerUrl: 'http://127.0.0.1:8787', liveServerToken: 'test', liveVoice: 'meridian',
+    translationVolume: 1, originalVolume: 0.5
+  } });
+  await ready();
+  // Original playback starts at the user level before any German speech.
   assert.equal(contexts[0]?.sources[0]?.connections[0], contexts[0]?.gains[SOURCE]);
-  await emit({ type: 'offscreen-update-output', sessionId: 'bridge', settings: { translationVolume: 0 } });
-  peers[0]?.change('connected'); await ready();
-  assert.equal(contexts[0]?.gains[TRANSLATED]?.gain.value, 0);
-  assert.ok(messages.some(message => message.type === 'ducking-telemetry' &&
-    (message.telemetry as { inputIndependent: boolean }).inputIndependent));
-  // Reload or player swap: the running GPT-Live session continues on tab audio.
-  messages.length = 0;
-  peers[0]?.change('disconnected');
-  await waitFor(() => messages.some(message => message.type === 'offscreen-status' &&
-    /Tab-Audio übernommen/.test(String(message.status))));
-  assert.equal(messages.some(message => message.type === 'offscreen-error'), false);
-  assert.ok(messages.some(message => message.type === 'ducking-telemetry' &&
-    (message.telemetry as { inputIndependent: boolean }).inputIndependent === false));
-  assert.equal(contexts[0]?.state, 'running');
-});
-
-test('failed local bridge connection never opens a paid provider session', async () => {
-  await start('bridge-failed', { inputOffer: 'v=0\r\nm=audio' });
-  await waitFor(() => messages.some(message => message.type === 'offscreen-input-answer'));
-  peers[0]?.change('failed');
-  await waitFor(() => messages.some(message => message.type === 'offscreen-error'));
-  assert.equal(clients.length, 0);
-  assert.equal(contexts[0]?.state, 'closed');
-});
-
-test('stop during local bridge negotiation immediately releases original playback and capture', async () => {
-  const media = new Stream();
-  capture = async () => media;
-  await start('pending-bridge', { inputOffer: 'v=0\r\nm=audio' });
-  await waitFor(() => messages.some(message => message.type === 'offscreen-input-answer'));
-  await emit({ type: 'offscreen-stop' });
-  assert.equal(contexts[0]?.state, 'closed');
-  assert.equal(peers[0]?.connectionState, 'closed');
-  assert.equal(media.tracks[0]?.stopped, true);
-  assert.equal(clients.length, 0);
-  await Promise.resolve();
-  assert.equal(messages.some(message => message.type === 'offscreen-error'), false, 'intentional cancellation must not become a session failure');
+  assert.equal(contexts[0]?.gains[SOURCE]?.gain.value, 0.5);
+  // GPT-Live hears the unscaled tab capture, never the slider-scaled mix.
+  assert.ok(peers.length === 0, 'no second local WebRTC connection');
+  health.signal = true;
+  detectors[0]?.onSpeechChange(true, 0.95);
+  assert.equal(contexts[0]?.gains[SOURCE]?.gain.value, 0.14);
+  await emit({ type: 'offscreen-update-output', sessionId: 'original', settings: { translationVolume: 1, originalVolume: 0 } });
+  assert.equal(contexts[0]?.gains[SOURCE]?.gain.value, 0);
 });
 
 test('graceful stop drains once, reports incomplete finalization, and filters late callbacks', async () => {

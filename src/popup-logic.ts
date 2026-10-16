@@ -26,6 +26,35 @@ export function isTranslatableUrl(url: string | undefined): boolean {
   }
 }
 
+export interface ServerHealthPresentation {
+  text: string;
+  state: 'ok' | 'error';
+}
+
+/** Ask the own server whether it runs and accepts the token; never opens a paid session. */
+export async function serverHealthPresentation(
+  serverUrl: string,
+  token: string,
+  fetchImpl: typeof fetch = globalThis.fetch
+): Promise<ServerHealthPresentation> {
+  const url = `${serverUrl.replace(/\/+$/, '')}/api/health`;
+  try {
+    const response = await fetchImpl(url, {
+      headers: { 'X-Live-Translate-Token': token },
+      credentials: 'omit',
+      signal: AbortSignal.timeout(2_000)
+    });
+    await response.body?.cancel().catch(() => {});
+    if (response.ok) return { text: '● Server bereit', state: 'ok' };
+    if (response.status === 401) return { text: '● Token falsch', state: 'error' };
+    if (response.status === 404) return { text: '● Server veraltet – neu starten', state: 'error' };
+    if (response.status === 503) return { text: '● API-Key fehlt am Server', state: 'error' };
+    return { text: `● Server-Fehler ${response.status}`, state: 'error' };
+  } catch {
+    return { text: '● Server aus – npm run server', state: 'error' };
+  }
+}
+
 export interface PopupStatusPresentation {
   text: string;
   error: boolean;

@@ -5,3 +5,5 @@ export const TRANSLATION_PROFILE = JSON.parse(readFileSync(
 ));
 export const DUBBING_VOICE = TRANSLATION_PROFILE.defaultVoice;
 export const DUBBING_PROMPT = `${TRANSLATION_PROFILE.instructions}\n${TRANSLATION_PROFILE.englishOnlyInstructions}`;
+/** Any non-German source language; German speech stays silent (the original is audible). */
+export const AUTOMATIC_DUBBING_PROMPT = `${TRANSLATION_PROFILE.instructions}\n${TRANSLATION_PROFILE.automaticInstructions}`;

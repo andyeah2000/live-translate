@@ -64,17 +64,25 @@ let offscreenCloseCalls = 0;
 let captureStreamId = 'background-stream';
 let capturedTabs: Array<{ tabId: number; status: string; fullscreen: boolean }> = [];
 let stuckRuntimeMessage: string | null = null;
-let inputAnswerResponse: { ok: boolean; error?: string } = { ok: true };
-let inputAnswerGate: Deferred<void> | null = null;
-let stuckInputOffer = false;
-let stuckInputStop = false;
+let commandListener!: (command: string, tab?: { id?: number; url?: string }) => void;
+let localStore: Record<string, unknown> = {};
+let popupOpened = 0;
 
 const chromeMock = {
   action: {
     setBadgeBackgroundColor: async () => undefined,
-    setBadgeText: async () => undefined
+    setBadgeText: async () => undefined,
+    openPopup: async () => { popupOpened++; }
+  },
+  commands: {
+    onCommand: { addListener: (listener: typeof commandListener) => { commandListener = listener; } }
   },
   storage: {
+    local: {
+      get: async () => ({ ...localStore }),
+      set: async (values: Record<string, unknown>) => { Object.assign(localStore, values); },
+      remove: async (keys: string[]) => { for (const key of keys) delete localStore[key]; }
+    },
     session: {
       get: async (key: string | string[]) => {
         if (Array.isArray(key)) {
@@ -159,12 +167,6 @@ const chromeMock = {
     sendMessage: async (tabId: number, message: Record<string, unknown>) => {
       tabMessages.push({ tabId, message });
       lifecycleEvents.push(`tab:${String(message.type)}`);
-      if (message.type === 'media-input-offer' && stuckInputOffer) return new Promise(() => {});
-      if (message.type === 'media-input-stop' && stuckInputStop) return new Promise(() => {});
-      if (message.type === 'media-input-answer') {
-        if (inputAnswerGate) await inputAnswerGate.promise;
-        return inputAnswerResponse;
-      }
       if ((message.type === 'subtitle' || message.type === 'subtitle-batch') && subtitleSendGate) {
         const gate = subtitleSendGate;
         subtitleSendGate = null;
@@ -245,10 +247,8 @@ function reset(state = runningState(1, 'session-a')): void {
   captureStreamId = 'background-stream';
   capturedTabs = [];
   stuckRuntimeMessage = null;
-  inputAnswerResponse = { ok: true };
-  inputAnswerGate = null;
-  stuckInputOffer = false;
-  stuckInputStop = false;
+  localStore = {};
+  popupOpened = 0;
 }
 
 test('privileged messages from web-page senders are ignored entirely', async () => {
@@ -319,7 +319,7 @@ test('output controls update subtitles and forward live translation volume', asy
 test('voice change restarts the existing source tab with the selected voice', async () => {
   reset(runningState(42, 'old-voice'));
   offscreenDocument = true;
-  const result = await request({ type: 'change-voice', settings: { liveVoice: 'stone' } });
+  const result = await request({ type: 'restart-session', settings: { liveVoice: 'stone' } });
   assert.deepEqual(result, { ok: true });
   const started = runtimeMessages.find(message => message.type === 'offscreen-start');
   assert.equal((started?.settings as { liveVoice: string }).liveVoice, 'stone');
@@ -330,16 +330,16 @@ test('voice change restarts the existing source tab with the selected voice', as
 
 test('voice change while stopped does not start a session', async () => {
   reset(idleState());
-  assert.deepEqual(await request({ type: 'change-voice', settings: { liveVoice: 'stone' } }), { ok: true });
+  assert.deepEqual(await request({ type: 'restart-session', settings: { liveVoice: 'stone' } }), { ok: true });
   assert.equal(runtimeMessages.some(message => message.type === 'offscreen-start'), false);
 });
 
 test('queued voice selections collapse to the latest voice', async () => {
   reset(runningState(42, 'old-voice'));
   await Promise.all([
-    request({ type: 'change-voice', settings: { liveVoice: 'stone' } }),
-    request({ type: 'change-voice', settings: { liveVoice: 'marin' } }),
-    request({ type: 'change-voice', settings: { liveVoice: 'meridian' } })
+    request({ type: 'restart-session', settings: { liveVoice: 'stone' } }),
+    request({ type: 'restart-session', settings: { liveVoice: 'marin' } }),
+    request({ type: 'restart-session', settings: { liveVoice: 'meridian' } })
   ]);
   const starts = runtimeMessages.filter(message => message.type === 'offscreen-start');
   assert.equal(starts.length, 1);
@@ -349,7 +349,7 @@ test('queued voice selections collapse to the latest voice', async () => {
 test('stop cancels pending voice restarts', async () => {
   reset(runningState(42, 'old-voice'));
   await Promise.all([
-    request({ type: 'change-voice', settings: { liveVoice: 'stone' } }),
+    request({ type: 'restart-session', settings: { liveVoice: 'stone' } }),
     request({ type: 'stop-session' })
   ]);
   assert.equal(runtimeMessages.some(message => message.type === 'offscreen-start'), false);
@@ -359,13 +359,15 @@ test('stop cancels pending voice restarts', async () => {
 test('tab capture ID is created in the background immediately before offscreen start', async () => {
   reset(idleState());
   const settings = {
-    settingsVersion: 11,
+    settingsVersion: 12,
     liveServerUrl: 'http://127.0.0.1:8787',
     liveServerToken: 'test-token',
     liveVoice: 'marin',
+    sourceLanguage: 'auto',
     subtitles: true,
     subtitleMode: 'dual',
     translationVolume: 1,
+    originalVolume: 0.7
   };
 
   assert.deepEqual(
@@ -583,59 +585,50 @@ test('output-setting requests report acknowledgement failures to the popup', asy
   });
 });
 
-test('an unresponsive direct-input offer is cancelled before bounded fallback to tab capture', async (t) => {
+test('start prepares overlay and audio engine together and never waits for the page', async () => {
   reset(idleState());
-  stuckInputOffer = true;
-  stuckInputStop = true;
-  const nativeTimeout = globalThis.setTimeout;
-  t.mock.method(globalThis, 'setTimeout', (callback: () => void, delay: number) =>
-    nativeTimeout(callback, delay === 6_000 || delay === 1_000 ? 10 : delay));
+  executeScriptFails = true;
   assert.deepEqual(await request({ type: 'start-session', tabId: 12, settings: {} }), { ok: true });
-  const offer = tabMessages.find(({ message }) => message.type === 'media-input-offer');
-  const cancelled = tabMessages.find(({ message }) => message.type === 'media-input-stop');
-  const started = runtimeMessages.find(message => message.type === 'offscreen-start');
-  assert.equal(cancelled?.message.sessionId, offer?.message.sessionId);
-  assert.equal(cancelled?.message.sessionId, started?.sessionId);
-  assert.equal(started?.inputOffer, undefined);
-  assert.ok(tabMessages.indexOf(cancelled!) > tabMessages.indexOf(offer!));
-  assert.ok(lifecycleEvents.indexOf('tab:media-input-stop') < lifecycleEvents.indexOf('runtime:offscreen-start'));
+  // A page that refuses the overlay still gets the German voice.
+  assert.equal((sessionStore.sessionState as { running: boolean }).running, true);
+  assert.equal(tabMessages.length, 0, 'no page round trip before the provider starts');
+  assert.deepEqual(
+    lifecycleEvents.filter(event => event === 'offscreen:create' || event.startsWith('capture:') || event === 'runtime:offscreen-start'),
+    ['offscreen:create', 'capture:12', 'runtime:offscreen-start']
+  );
 });
 
-test('a frozen page cannot block Stop behind subtitle delivery or page cleanup', async (t) => {
+test('a frozen page cannot block Stop behind subtitle delivery', async (t) => {
   reset();
   const nativeTimeout = globalThis.setTimeout;
   t.mock.method(globalThis, 'setTimeout', (callback: () => void, delay: number) =>
     nativeTimeout(callback, delay === 1_000 ? 20 : delay));
   subtitleSendGate = deferred<void>();
   clearSendGate = deferred<void>();
-  stuckInputStop = true;
   emit({ type: 'transcript', sessionId: 'session-a', event: { kind: 'chunk', lane: 'target', text: 'blocked page' } });
   await waitFor(() => tabMessages.some(({ message }) => message.type === 'subtitle-batch'), 'blocked transcript');
   assert.deepEqual(await request({ type: 'stop-session' }), { ok: true });
   assert.equal((sessionStore.sessionState as { running: boolean }).running, false);
-  const cleanup = tabMessages.find(({ message }) => message.type === 'media-input-stop');
-  assert.equal(cleanup?.message.sessionId, 'session-a');
-  assert.deepEqual(tabMessages.map(({ message }) => message.type), ['subtitle-batch', 'media-input-stop', 'subtitle-clear']);
+  assert.deepEqual(tabMessages.map(({ message }) => message.type), ['subtitle-batch', 'subtitle-clear']);
 });
 
-test('a rejected local audio answer stops the matching session visibly', async () => {
-  reset();
-  inputAnswerResponse = { ok: false, error: 'local answer rejected' };
-  emit({ type: 'offscreen-input-answer', sessionId: 'session-a', sdp: 'v=0\r\nm=audio' });
-  await waitFor(() => (sessionStore.sessionState as { running: boolean }).running === false, 'input-answer failure');
-  assert.equal((sessionStore.sessionState as { error: string }).error, 'local answer rejected');
+test('the keyboard shortcut starts on the active tab and stops a running translation', async () => {
+  reset(idleState());
+  localStore = { liveServerToken: 'stored-token', liveVoice: 'stone' };
+  commandListener('toggle-translation', { id: 21, url: 'https://www.youtube.com/watch?v=x' });
+  await waitFor(() => runtimeMessages.some(message => message.type === 'offscreen-start'), 'shortcut start');
+  const started = runtimeMessages.find(message => message.type === 'offscreen-start') as { settings: { liveVoice: string } };
+  assert.equal(started.settings.liveVoice, 'stone');
+  assert.equal((sessionStore.sessionState as { tabId: number }).tabId, 21);
+  commandListener('toggle-translation', { id: 21, url: 'https://www.youtube.com/watch?v=x' });
+  await waitFor(() => (sessionStore.sessionState as { running: boolean }).running === false, 'shortcut stop');
 });
 
-test('a stale local audio answer failure cannot stop a replacement session', async () => {
-  reset();
-  inputAnswerResponse = { ok: false };
-  inputAnswerGate = deferred<void>();
-  emit({ type: 'offscreen-input-answer', sessionId: 'session-a', sdp: 'v=0\r\nm=audio' });
-  await waitFor(() => tabMessages.some(({ message }) => message.type === 'media-input-answer'), 'input-answer send');
-  sessionStore.sessionState = runningState(2, 'session-b');
-  inputAnswerGate.resolve(undefined);
-  await sessionBarrier('session-b', 'barrier-answer-replaced');
-  assert.equal((sessionStore.sessionState as { running: boolean }).running, true);
+test('the shortcut without a server token opens the popup instead of failing silently', async () => {
+  reset(idleState());
+  commandListener('toggle-translation', { id: 21, url: 'https://example.com/video' });
+  await waitFor(() => popupOpened === 1, 'popup opened');
+  assert.equal(runtimeMessages.some(message => message.type === 'offscreen-start'), false);
 });
 
 test('forwardTranscript rechecks the session after an asynchronous state read', async () => {
@@ -691,7 +684,7 @@ test('stop never waits for subtitle acknowledgements and seals the session displ
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.deepEqual(
     tabMessages.map(({ message }) => message.type),
-    ['subtitle-batch', 'media-input-stop', 'subtitle-clear']
+    ['subtitle-batch', 'subtitle-clear']
   );
 });
 

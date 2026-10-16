@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 class ElementMock {
-  style = { cssText: '', opacity: '' };
+  style = {
+    cssText: '', opacity: '', left: '', right: '', width: '', bottom: '',
+    setProperty() {}, removeProperty() {}
+  };
   textContent = '';
   className = '';
   parentNode: ElementMock | null = null;
@@ -51,6 +54,8 @@ test('fullscreen subtitles create tracks only for visible text and reuse and dis
     fullscreenElement: video as typeof video | null,
     body, documentElement: root,
     createElement: (tag: string) => new ElementMock(tag.toUpperCase()),
+    // No inline video outside fullscreen: the overlay keeps the viewport placement.
+    querySelectorAll: () => [],
     addEventListener: (name: string, callback: () => void) => documentEvents.set(name, callback),
     removeEventListener: (name: string) => documentEvents.delete(name)
   };

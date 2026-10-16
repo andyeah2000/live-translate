@@ -6,8 +6,8 @@ import type {
   SubtitleMode,
   TranscriptEvent
 } from './messages';
-import { sanitizeSettings } from './settings';
-import { validAudioSdp } from './local-audio-bridge';
+import { loadSettings, sanitizeSettings } from './settings';
+import { configurationError, isTranslatableUrl } from './popup-logic';
 import { MessageTimeoutError, withMessageTimeout } from './message-timeout';
 
 const EMPTY_STATE: SessionState = {
@@ -258,25 +258,14 @@ async function startSession(
       error: null,
       ducking: null
     });
-    await injectContentScript(tabId);
-    const inputOffer = await withMessageTimeout(
-      chrome.tabs.sendMessage(tabId, { type: 'media-input-offer', sessionId }),
-      6_000,
-      'Der direkte Videoeingang antwortet nicht.'
-    )
-      .catch(() => null) as { sdp?: unknown } | null;
-    if (!validAudioSdp(inputOffer?.sdp)) {
-      // A timed-out offer may still finish inside the page. Cancel its scoped
-      // capture before using tab audio so the abandoned peer cannot remain
-      // alive for the entire fallback session or affect a later replacement.
-      await withMessageTimeout(
-        chrome.tabs.sendMessage(tabId, { type: 'media-input-stop', sessionId }),
-        1_000,
-        'Der direkte Videoeingang konnte nicht zurückgesetzt werden.'
-      ).catch(() => {});
-    }
-    await ensureOffscreenDocument();
-    await setSubtitleOutput(settings.subtitles, settings.subtitleMode);
+    // Overlay, audio engine and subtitle settings are independent: prepare them
+    // together. A page that refuses the overlay still gets the German voice.
+    await Promise.all([
+      injectContentScript(tabId).catch((error: unknown) =>
+        console.warn('[live-translate] Untertitel-Overlay nicht verfügbar:', error)),
+      ensureOffscreenDocument(),
+      setSubtitleOutput(settings.subtitles, settings.subtitleMode)
+    ]);
     await setState({
       running: true,
       tabId,
@@ -296,16 +285,12 @@ async function startSession(
     // existiert und alle anderen asynchronen Startschritte abgeschlossen sind.
     // Chrome 116+ garantiert genau den Service-Worker→Offscreen-Transfer.
     const streamId = await getTabCaptureStreamId(tabId);
-    await sendToOffscreen({ type: 'offscreen-start', sessionId, streamId, settings,
-      inputOffer: validAudioSdp(inputOffer?.sdp) ? inputOffer.sdp : undefined });
+    await sendToOffscreen({ type: 'offscreen-start', sessionId, streamId, settings });
     return { ok: true };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     // Nur aufräumen, wenn nicht inzwischen bewusst gestoppt/neu gestartet wurde.
-    if (epoch === sessionEpoch) {
-      await sendToTab(tabId, { type: 'media-input-stop', sessionId }).catch(() => {});
-      await stopSession(detail, { drainMs: RESTART_DRAIN_MS });
-    }
+    if (epoch === sessionEpoch) await stopSession(detail, { drainMs: RESTART_DRAIN_MS });
     return { ok: false, error: detail };
   }
 }
@@ -337,7 +322,6 @@ async function stopSession(error: string | null = null, options: StopOptions = {
   }
   if (state.tabId !== null) {
     resetSubtitleDelivery();
-    await sendToTab(state.tabId, { type: 'media-input-stop', sessionId: state.sessionId }).catch(() => {});
     await sendToTab(state.tabId, { type: 'subtitle-clear', sessionId: state.sessionId ?? undefined, final: true } satisfies Message)
       .catch(() => {});
   }
@@ -447,27 +431,6 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
   // akzeptieren, niemals aus dem Renderer-Prozess einer Webseite.
   if (!isTrustedSender(sender)) return undefined;
   switch (msg.type) {
-    case 'offscreen-input-answer':
-      void getState().then(async state => {
-        if (state.running && state.sessionId === msg.sessionId && state.tabId !== null && validAudioSdp(msg.sdp)) {
-          try {
-            const answer = await withMessageTimeout(
-              chrome.tabs.sendMessage(state.tabId, { type: 'media-input-answer', sessionId: msg.sessionId, sdp: msg.sdp }),
-              6_000,
-              'Der direkte Videoeingang antwortet nicht.'
-            ) as { ok?: boolean; error?: string } | undefined;
-            if (!answer?.ok) throw new Error(answer?.error || 'Der direkte Videoeingang konnte nicht verbunden werden.');
-          } catch (error) {
-            await enqueueSessionOperation(async () => {
-              const current = await getState();
-              if (current.running && current.sessionId === msg.sessionId) {
-                await stopSession(error instanceof Error ? error.message : String(error));
-              }
-            });
-          }
-        }
-      }).catch(() => {});
-      break;
     case 'start-session':
       voiceChangeRevision++;
       void enqueueSessionOperation(() =>
@@ -476,7 +439,7 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
         sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) })
       );
       return true;
-    case 'change-voice': {
+    case 'restart-session': {
       const revision = ++voiceChangeRevision;
       void enqueueSessionOperation(async () => {
         if (revision !== voiceChangeRevision) return { ok: true };
@@ -583,7 +546,6 @@ function parseDuckingTelemetry(value: unknown): SessionState['ducking'] {
         : 0,
     error: typeof candidate.error === 'string' ? candidate.error : null,
     translationReady: candidate.translationReady === true,
-    inputIndependent: candidate.inputIndependent === true,
     lagMs: typeof candidate.lagMs === 'number' && Number.isFinite(candidate.lagMs) && candidate.lagMs >= 0
       ? Math.min(candidate.lagMs, 600_000)
       : null,
@@ -595,6 +557,28 @@ function parseDuckingTelemetry(value: unknown): SessionState['ducking'] {
       : 0
   };
 }
+
+// ⌥⇧T / Alt+Shift+T: start or stop without opening the popup, also in
+// fullscreen. The shortcut is a user gesture, so it grants tab capture.
+chrome.commands?.onCommand.addListener((command, tab) => {
+  if (command !== 'toggle-translation') return;
+  voiceChangeRevision++;
+  void enqueueSessionOperation(async () => {
+    if ((await getState()).running) {
+      await stopSession();
+      return;
+    }
+    const target = tab?.id !== undefined ? tab : (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+    if (target?.id === undefined || !isTranslatableUrl(target.url)) return;
+    const settings = await loadSettings();
+    if (configurationError(settings)) {
+      // Missing server token: show the popup where it is entered.
+      await chrome.action.openPopup().catch(() => {});
+      return;
+    }
+    await startSession(target.id, settings);
+  }).catch((err) => console.warn('[live-translate] Tastenkürzel fehlgeschlagen:', err));
+});
 
 // Nach Browser-Neustart oder Extension-Update: eventuell übrig gebliebene
 // Offscreen-Dokumente schließen und den Zustand zurücksetzen.

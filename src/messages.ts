@@ -1,6 +1,9 @@
 /** Untertitel-Darstellung: nur Übersetzung oder Original + Übersetzung. */
 export type SubtitleMode = 'translation' | 'dual';
 
+/** Quellsprache: nur Englisch (robusteste Erkennung) oder jede Sprache außer Deutsch. */
+export type SourceLanguage = 'en' | 'auto';
+
 /** Herkunft eines Transkript-Chunks: Quellsprache oder Übersetzung. */
 export type TranscriptLane = 'source' | 'target';
 
@@ -19,23 +22,28 @@ export type TranscriptEvent =
 
 export interface SessionSettings {
   /** Version der persistierten Einstellungen für kontrollierte Migrationen. */
-  settingsVersion: 11;
+  settingsVersion: 12;
   /** Basis-URL des vertrauenswürdigen GPT-Live-Backends. */
   liveServerUrl: string;
   /** Zugriffstoken für das eigene Backend – niemals ein OpenAI-API-Key. */
   liveServerToken: string;
   /** Auswahl wird beim nächsten Start serverseitig gegen eine Allowlist geprüft. */
   liveVoice: string;
+  /** Wird beim Start serverseitig in die Dolmetscher-Anweisung übernommen. */
+  sourceLanguage: SourceLanguage;
   subtitles: boolean;
   subtitleMode: SubtitleMode;
   /** Lautstärke der übersetzten Zielspur (0–1). */
   translationVolume: number;
+  /** Lautstärke des Originaltons (0–1); das Ducking wirkt zusätzlich. */
+  originalVolume: number;
 }
 
 export interface OutputSettings {
   subtitles: boolean;
   subtitleMode: SubtitleMode;
   translationVolume: number;
+  originalVolume: number;
 }
 
 export interface SessionState {
@@ -55,7 +63,6 @@ export interface DuckingTelemetry {
   probability: number;
   error: string | null;
   translationReady: boolean;
-  inputIndependent?: boolean;
   /** Measured speech-to-speech delay of the German voice. */
   lagMs?: number | null;
   /** Billed GPT-Live voice seconds of this translation. */
@@ -81,11 +88,11 @@ export function isTrustedSender(sender: chrome.runtime.MessageSender): boolean {
 export type Message =
   | { type: 'start-session'; tabId: number; settings: SessionSettings }
   | { type: 'stop-session' }
-  | { type: 'change-voice'; settings: SessionSettings }
+  /** Stimme oder Quellsprache geändert: laufende Übersetzung mit neuen Einstellungen neu starten. */
+  | { type: 'restart-session'; settings: SessionSettings }
   | { type: 'get-state' }
   | { type: 'update-output-settings'; settings: OutputSettings }
-  | { type: 'offscreen-start'; sessionId: string; streamId: string; settings: SessionSettings; inputOffer?: string }
-  | { type: 'offscreen-input-answer'; sessionId: string; sdp: string }
+  | { type: 'offscreen-start'; sessionId: string; streamId: string; settings: SessionSettings }
   | { type: 'offscreen-update-output'; sessionId: string; settings: OutputSettings }
   | { type: 'offscreen-stop'; drainMs?: number }
   | { type: 'offscreen-status'; sessionId: string; status: string }

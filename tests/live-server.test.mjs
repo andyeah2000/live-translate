@@ -153,3 +153,33 @@ test('closing the browser HTTP request aborts its pending upstream session creat
     timer.unref();
   })]);
 });
+
+test('health checks token and origin, never opens a paid session and pre-warms OpenAI once', async t => {
+  const requests = [];
+  const { url, calls } = await fixture(t, {
+    fetchImpl: async (target, init) => { requests.push({ target, method: init.method }); return new Response(null, { status: 200 }); }
+  });
+  const health = url.replace('/api/live/session', '/api/health');
+  const get = headers => fetch(health, { headers: { Origin: origin, 'X-Live-Translate-Token': 'test-token', ...headers } });
+  assert.equal((await get({ Origin: 'https://example.com' })).status, 403);
+  assert.equal((await get({ 'X-Live-Translate-Token': 'wrong' })).status, 401);
+  const ok = await get();
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { ok: true, model: 'gpt-live-1' });
+  assert.equal((await get()).status, 200);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  // One HEAD request warms the TLS connection; repeated pings within 3 s do not.
+  assert.deepEqual(requests, [{ target: 'https://api.openai.com/v1/models?limit=1', method: 'HEAD' }]);
+  assert.equal(calls(), 0);
+});
+
+test('the source language selects the interpreter instructions and is validated', async t => {
+  let body;
+  const { post } = await fixture(t, { fetchImpl: async (_target, init) => { body = JSON.parse(init.body); return Response.json(validSession); } });
+  assert.equal((await post(JSON.stringify({ sdp: 'v=0\r\noffer', sourceLanguage: 'auto' }))).status, 201);
+  assert.match(body.session.instructions, /Erkenne die Quellsprache/);
+  assert.doesNotMatch(body.session.instructions, /Dolmetsche NUR englische Sprache/);
+  assert.equal((await post(JSON.stringify({ sdp: 'v=0\r\noffer', sourceLanguage: 'en' }))).status, 201);
+  assert.match(body.session.instructions, /Dolmetsche NUR englische Sprache/);
+  assert.equal((await post(JSON.stringify({ sdp: 'v=0\r\noffer', sourceLanguage: 'fr' }))).status, 400);
+});

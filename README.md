@@ -53,11 +53,36 @@ GPT-Live (gpt-live-1, Client-Delegation, Anweisungen = Dolmetscher)
   ├─ Audio: Zielstimme als WebRTC-Remote-Track → translatedGain
   └─ Datenkanal oai-events:
        session.started → bereit
-       session.input_transcript.delta → Quell-Untertitel (nur Dual-Modus)
-       session.output_transcript.delta → Ziel-Untertitel
-       session.closed → geordneter Stop mit finaler Usage
-       error → sichtbarer Fehler
+       session.input_transcript.delta → Quell-Untertitel + Verzögerungsmessung
+       session.output_transcript.delta → Ziel-Untertitel + Verzögerungsmessung
+       session.usage.updated → Laufzeit und Kosten im Popup
+       session.closed → Ende; bei Limit oder Netzverlust automatische neue Sitzung
+       error → Hinweis, die Sitzung läuft weiter
 ```
+
+Der Datenkanal ist vorab ausgehandelt (`transport.dcid`, WARP-Schritt) und
+spart beim Start einen Roundtrip; ältere Server ohne diese Funktion erhalten
+automatisch einen normalen Kanal.
+
+## Verzögerung
+
+GPT-Live dolmetscht vollständig und spricht dabei in eigenem Tempo. Deutsch ist
+länger als Englisch, deshalb würde der Rückstand bei schnellen Sprechern ohne
+Regelung immer weiter wachsen (gemessen: über 20 s nach einer Minute). Die
+Erweiterung misst die Verzögerung live, indem sie Namen und Fachwörter im
+englischen und deutschen Transkript auf der gemeinsamen Sitzungszeitachse
+abgleicht (`src/offscreen/lag-monitor.ts`), und regelt in drei Stufen
+(`src/offscreen/live-session.ts`), solange die Quelle spricht:
+
+1. ab 5 s: stiller Kontext (`session.thinking.append`) – das Modell verdichtet,
+   ohne den laufenden Satz abzubrechen,
+2. ab 9 s: der Rückstand wird an der nächsten deutschen Satzgrenze übersprungen
+   (`session.instructions.append`),
+3. ab 14 s: eine frische Sitzung übernimmt mit Überblendung.
+
+Nach dem Ende der Quelle wird nie abgeschnitten. Gemessen mit `gpt-live-1`:
+Interview-Tempo (169 Wörter/min) vollständig bei 2–6 s, Extremtempo
+(238 Wörter/min ohne Pause) begrenzt statt endlos wachsend.
 
 Es gibt keine dreiteilige STT→Chat→TTS-Pipeline mehr im Extension-Code:
 Resampling, PCM-Packaging und TTS-Playback entfallen – WebRTC verhandelt das
@@ -67,7 +92,10 @@ dem Quellton).
 
 ## Audioverhalten der Chrome-Erweiterung
 
-Der Originalton bleibt bei 100 %, solange keine deutsche Ausgabe hörbar ist.
+GPT-Live hört das Tab-Audio direkt; die Player-Lautstärke bleibt deshalb auf
+100 %. Den Originalton regelt der **Original**-Regler im Popup (0 % = nur
+Deutsch). Darunter wirkt die automatische Absenkung:
+der Originalton bleibt auf dem eingestellten Pegel, solange keine deutsche Ausgabe hörbar ist.
 Ein RMS-Monitor der tatsächlich dekodierten Zielspur steuert den Mix: 28 %
 Original bei überlappender Quellsprache, 60 % bei Atmo während des Dubbings.
 220 ms Haltezeit verbinden Silben; weiche Pegelrampen vermeiden harte Kanten.
@@ -77,8 +105,8 @@ Bei VAD-Ausfall bleibt ein vereinfachter ausgabegesteuerter Mix aktiv.
 Bei stummgeschalteter Zielstimme bleibt das Original vollständig erhalten.
 
 Der gemeinsame Ausgang besitzt keinen klangfärbenden Master-Kompressor. Ein
-4×-oversampelter Soft-Knee-Summenbegrenzer greift erst in den obersten 1,94 dB
-ein.
+Soft-Knee-Summenbegrenzer mit Reserve bis ±2 greift erst oberhalb von 0,8 ein,
+ohne Oversampling und ohne Lookahead, damit das Original bildsynchron bleibt.
 
 Die neuen Mixpegel sind Startwerte, keine universelle Lautheits- oder
 Studio-Dubbing-Garantie. Sprache, Musik und Raketenklang liegen im selben
@@ -101,16 +129,24 @@ Der ladbare Build liegt anschließend in `dist/`.
 
 ## Backend starten
 
-Nach dem Klonen muss das Backend separat gestartet werden. Ein bestehender
-Hintergrunddienst wird nicht mit dem Repository installiert. Die optionale
-LaunchAgent-Konfiguration ist in [SERVER_SERVICE.md](SERVER_SERVICE.md) beschrieben.
+Am einfachsten läuft der Server dauerhaft im Hintergrund (macOS-LaunchAgent,
+startet beim Login und nach einem Absturz neu):
+
+```bash
+npm run service:install     # einmalig; erneut ausführen lädt neuen Servercode
+npm run service:uninstall   # entfernen
+```
+
+Alternativ im Vordergrund:
 
 ```bash
 npm run server # liest .env.local
 # optional: LIVE_TRANSLATE_HOST, LIVE_TRANSLATE_PORT, LIVE_TRANSLATE_ALLOWED_ORIGIN
 ```
 
-Der Server nimmt nur `POST /api/live/session` mit Origin-Check
+`GET /api/health` prüft Token und Origin für die Statusanzeige im Popup und
+öffnet dabei die TLS-Verbindung zu OpenAI vor, sodass der Klick auf Start den
+Verbindungsaufbau spart. Der Server nimmt außerdem `POST /api/live/session` mit Origin-Check
 (`chrome-extension://` bzw. konfigurierte Origin) und zeitkonstantem
 Token-Vergleich entgegen und reicht SDP + Übersetzungskonfiguration an
 `POST /v1/live/sessions` mit der serverseitigen Dubbing-Konfiguration weiter. Er prüft die
@@ -124,12 +160,20 @@ ab; die Zeitgrenze gilt bis zum vollständig gelesenen Antwortkörper.
 2. Den Entwicklermodus aktivieren.
 3. **Entpackte Erweiterung laden** wählen.
 4. Den Ordner `dist/` auswählen.
-5. Ein englisches Video starten, das Extension-Popup öffnen und Server-URL
-   sowie Zugriffstoken eintragen.
+5. Ein Video starten, das Extension-Popup öffnen und einmalig Server-URL
+   sowie Zugriffstoken unter „Einstellungen“ eintragen (der Punkt dort zeigt,
+   ob der Server bereit ist).
 
-Das Popup bietet Server-URL, Zugriffstoken, Untertitel, Dual-Untertitel und
-die Lautstärke der Zielspur. Die Handoff-Konfiguration bleibt absichtlich
-fixiert: nur englische Sprache möglichst früh ins Deutsche übersetzen. Die Stimme ist auswählbar; ein Wechsel startet die aktive Sitzung automatisch neu.
+Bedienung:
+
+- **Start/Stop** im Popup oder **⌥⇧T** (Alt+Shift+T) im Video-Tab, auch im Vollbild.
+  Das Kürzel lässt sich unter `chrome://extensions/shortcuts` ändern.
+- **Stimme** und **Quelle** (Englisch oder alle Sprachen): ein Wechsel startet
+  die laufende Übersetzung automatisch neu.
+- **Deutsch** und **Original**: getrennte Lautstärken.
+- **Untertitel** und **+ Original** (zweisprachig); die Untertitel sitzen über
+  dem Video und skalieren mit seiner Größe.
+- Unten im Popup: übersetzter Tab, gemessene Verzögerung, Laufzeit und Kosten.
 Es ist kein Responses-Backend und keine Websuche konfiguriert. Unerwartete
 Delegationsereignisse führen den Dolmetschermodus fort; wiederholte Abweichung
 stoppt die Sitzung mit einer sichtbaren Fehlermeldung.
@@ -161,7 +205,7 @@ Kostenoptimierung in der OpenAI-Doku.
 ```text
 Popup
   └─ Background Service Worker
-       ├─ one-shot Tab-Capture-ID direkt vor dem Offscreen-Start
+       ├─ one-shot Tab-Capture-ID unmittelbar vor dem Offscreen-Start
        ├─ Content Script (Overlay + nativer Fullscreen-TextTrack)
        └─ Offscreen AudioContext
             ├─ ein Originalpfad: ausgabegesteuert 100 % / 60 % / 28 %
@@ -214,10 +258,13 @@ Node.js 24. Ein zusätzlicher macOS-Job prüft Swift-Tests, App-Build und Signat
 ## Grenzen
 
 - Die Erweiterung benötigt das eigene Backend, die macOS-App nicht.
-- Die Erweiterung übersetzt Englisch. In der macOS-App ist zusätzlich eine
-  automatische Quellsprache auswählbar; die Auswahl wirkt als Modellanweisung.
+- Quelle „Englisch“ ist am zuverlässigsten; „Alle Sprachen“ wirkt wie in der
+  macOS-App als Modellanweisung, nicht als garantierter Sprachfilter.
+- Bei sehr schnellen Sprechern ohne Pausen hält die Regelung die Verzögerung
+  begrenzt, indem sie einzelne Sätze überspringt.
 - Zielsprache ist Deutsch; eine Stimme wird vor Beginn der Sitzung ausgewählt.
-- Live-Übersetzung hat netz- und modellabhängig eine merkliche Verzögerung.
+- GPT-Live braucht bei durchgehender Sprache typischerweise 2–6 s; Deutsch
+  wartet oft auf das Verb am Satzende.
 - Eine absolute Garantie für jedes übersetzte Wort ist bei externen Modellen
   nicht seriös. Lokal nachweisbar sind Transport, WebRTC-Lifecycle und
   PCM-Sättigung; Übersetzungsqualität braucht eine bilinguale

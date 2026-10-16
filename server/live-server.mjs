@@ -5,6 +5,10 @@ import { createLiveSessionConfig, parseSessionRequest } from './live-session.mjs
 
 const MAX_REQUEST_BYTES = 128 * 1024;
 const MAX_RESPONSE_BYTES = 256 * 1024;
+const SESSION_PATH = '/api/live/session';
+const HEALTH_PATH = '/api/health';
+/** Keep-alive window of Node's fetch pool; one warm-up covers a Start click. */
+const WARM_UP_INTERVAL_MS = 3_000;
 
 function send(response, status, body, origin = null) {
   // Tell the extension whether an identical retry can succeed (transient upstream state).
@@ -93,20 +97,43 @@ export function createLiveServer({
   const allowedOrigin = origin => Boolean(origin) && (configuredOrigin
     ? origin === configuredOrigin : /^chrome-extension:\/\/[a-p]{32}$/.test(origin));
 
+  // Opening the popup pings /api/health. That pre-opens the TLS connection to
+  // OpenAI, so the session request after Start skips DNS, TCP and TLS setup.
+  let lastWarmUp = 0;
+  const warmUpstream = () => {
+    if (!apiKey || Date.now() - lastWarmUp < WARM_UP_INTERVAL_MS) return;
+    lastWarmUp = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4_000);
+    timer.unref();
+    void fetchImpl('https://api.openai.com/v1/models?limit=1', {
+      method: 'HEAD', headers: { Authorization: `Bearer ${apiKey}` }, signal: controller.signal, redirect: 'error'
+    }).then(response => response.body?.cancel(), () => {}).catch(() => {}).finally(() => clearTimeout(timer));
+  };
+
   return createServer({ requestTimeout: 15_000, headersTimeout: 10_000 }, async (request, response) => {
     const origin = typeof request.headers.origin === 'string' ? request.headers.origin : '';
-    if (request.method === 'OPTIONS' && request.url === '/api/live/session') {
+    if (request.method === 'OPTIONS' && (request.url === SESSION_PATH || request.url === HEALTH_PATH)) {
       if (!allowedOrigin(origin)) return send(response, 403, { error: 'Unexpected request origin.' });
       response.writeHead(204, {
         'Access-Control-Allow-Origin': origin,
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, X-Live-Translate-Token',
         'Access-Control-Max-Age': '600', Vary: 'Origin'
       });
       response.end();
       return;
     }
-    if (request.method !== 'POST' || request.url !== '/api/live/session') {
+    if (request.method === 'GET' && request.url === HEALTH_PATH) {
+      if (!allowedOrigin(origin)) return send(response, 403, { error: 'Unexpected request origin.' });
+      if (!serverToken || !tokenMatches(serverToken, request.headers['x-live-translate-token'])) {
+        return send(response, 401, { error: 'Invalid GPT-Live server token.' }, origin);
+      }
+      if (!apiKey) return send(response, 503, { error: 'Set OPENAI_API_KEY on the GPT-Live server.' }, origin);
+      warmUpstream();
+      return send(response, 200, { ok: true, model: 'gpt-live-1' }, origin);
+    }
+    if (request.method !== 'POST' || request.url !== SESSION_PATH) {
       return send(response, 404, { error: 'Not found.' }, allowedOrigin(origin) ? origin : null);
     }
     if (!allowedOrigin(origin)) return send(response, 403, { error: 'Unexpected request origin.' });

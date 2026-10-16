@@ -154,6 +154,7 @@ export class LiveSession {
       serverUrl: this.opts.serverUrl,
       serverToken: this.opts.serverToken,
       voice: this.opts.voice,
+      sourceLanguage: this.opts.sourceLanguage,
       inputTranscriptionEnabled: this.opts.inputTranscriptionEnabled,
       onTranscript: event => {
         if (isCurrent()) this.handleTranscript(event);
@@ -171,7 +172,7 @@ export class LiveSession {
       },
       onError: (detail, recoverable) => this.handleConnectionEnd(slot, detail, recoverable),
       onWarning: detail => {
-        if (isCurrent()) this.opts.onStatus(`GPT-Live-Hinweis: ${detail}`);
+        if (isCurrent()) this.opts.onStatus(`Hinweis von GPT-Live: ${detail}`);
       },
       onUsage: seconds => {
         slot.usageSeconds = Math.max(slot.usageSeconds, seconds);
@@ -272,7 +273,7 @@ export class LiveSession {
     this.lastRotation = this.now();
     const slot = this.createSlot();
     this.standby = slot;
-    this.opts.onStatus('Übersetzung holt auf · neue GPT-Live-Sitzung startet');
+    this.opts.onStatus('Holt auf…');
     void slot.connection.start().catch((error: unknown) => {
       if (this.standby !== slot) return;
       this.standby = null;

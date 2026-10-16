@@ -1,4 +1,6 @@
-import { DUBBING_PROMPT, DUBBING_VOICE, TRANSLATION_PROFILE } from './dubbing-prompt.mjs';
+import { AUTOMATIC_DUBBING_PROMPT, DUBBING_PROMPT, DUBBING_VOICE, TRANSLATION_PROFILE } from './dubbing-prompt.mjs';
+
+const SOURCE_LANGUAGES = new Set(['en', 'auto']);
 
 export const LIVE_VOICES = new Set(TRANSLATION_PROFILE.voices);
 
@@ -18,8 +20,10 @@ export function parseSessionRequest(value) {
   }
   if (request.voice !== undefined && !LIVE_VOICES.has(request.voice)) return null;
   if (request.dcid !== undefined && !validDcid(request.dcid)) return null;
+  if (request.sourceLanguage !== undefined && !SOURCE_LANGUAGES.has(request.sourceLanguage)) return null;
   const parsed = { sdp: request.sdp };
   if (request.voice !== undefined) parsed.voice = request.voice;
+  if (request.sourceLanguage !== undefined) parsed.sourceLanguage = request.sourceLanguage;
   if (request.dcid !== undefined) parsed.dcid = request.dcid;
   return parsed;
 }
@@ -29,7 +33,7 @@ export function createLiveSessionConfig(request) {
   return {
     session: {
       model: TRANSLATION_PROFILE.model,
-      instructions: DUBBING_PROMPT,
+      instructions: request.sourceLanguage === 'auto' ? AUTOMATIC_DUBBING_PROMPT : DUBBING_PROMPT,
       store: false,
       audio: {
         output: {

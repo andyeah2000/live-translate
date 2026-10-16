@@ -15,19 +15,29 @@ test('sanitizeSettings keeps only the canonical values', () => {
       unknownMode: 'legacy'
     }),
     {
-      settingsVersion: 11,
+      settingsVersion: 12,
       liveServerUrl: 'http://127.0.0.1:8787',
       liveServerToken: 'secret-token',
       liveVoice: 'meridian',
+      sourceLanguage: 'en',
       subtitles: false,
       subtitleMode: 'translation',
-      translationVolume: 0.2
+      translationVolume: 0.2,
+      originalVolume: 1
     }
   );
 });
 
 test('obsolete language options cannot change the fixed German translation', () => {
   assert.deepEqual(sanitizeSettings({ targetLanguage: 'fr', keyterms: 'unused', echoTargetLanguage: true }), DEFAULT_SETTINGS);
+});
+
+test('source language and original volume accept only known, bounded values', () => {
+  assert.equal(sanitizeSettings({ sourceLanguage: 'auto' }).sourceLanguage, 'auto');
+  assert.equal(sanitizeSettings({ sourceLanguage: 'fr' }).sourceLanguage, 'en');
+  assert.equal(sanitizeSettings({ originalVolume: 0.3 }).originalVolume, 0.3);
+  assert.equal(sanitizeSettings({ originalVolume: 4 }).originalVolume, 1);
+  assert.equal(sanitizeSettings({ originalVolume: Number.NaN }).originalVolume, 1);
 });
 
 test('sanitizeSettings bounds voice, server and session options to known values', () => {
@@ -84,13 +94,15 @@ test('load preserves only canonical controls and removes every unknown key', asy
   try {
     const migrated = await loadSettings();
     assert.deepEqual(migrated, {
-      settingsVersion: 11,
+      settingsVersion: 12,
       liveServerUrl: 'http://127.0.0.1:8787',
       liveServerToken: 'local-token',
       liveVoice: 'meridian',
+      sourceLanguage: 'en',
       subtitles: false,
       subtitleMode: 'translation',
-      translationVolume: 0.64
+      translationVolume: 0.64,
+      originalVolume: 1
     });
     assert.deepEqual(persisted, migrated);
     for (const key of ['legacyToggle', 'grokKey', 'geminiKey', 'deeplKey']) {

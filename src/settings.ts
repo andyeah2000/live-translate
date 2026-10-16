@@ -1,21 +1,24 @@
-import type { SessionSettings, SubtitleMode } from './messages';
+import type { SessionSettings, SourceLanguage, SubtitleMode } from './messages';
 import { TRANSLATION_PROFILE } from './translation-profile';
 
 /** GPT-Live-Stimmen aus dem gemeinsamen Übersetzungsprofil (offizielle OpenAI-Liste). */
 export const VOICE_IDS: ReadonlySet<string> = new Set(TRANSLATION_PROFILE.voices);
 
 const SUBTITLE_MODES = new Set<SubtitleMode>(['translation', 'dual']);
+const SOURCE_LANGUAGES = new Set<SourceLanguage>(['en', 'auto']);
 export const MAX_SERVER_TOKEN_LENGTH = 1_024;
 const DEFAULT_SERVER_URL = 'http://127.0.0.1:8787';
 
 export const DEFAULT_SETTINGS: SessionSettings = {
-  settingsVersion: 11,
+  settingsVersion: 12,
   liveServerUrl: DEFAULT_SERVER_URL,
   liveServerToken: '',
   liveVoice: TRANSLATION_PROFILE.defaultVoice,
+  sourceLanguage: 'en',
   subtitles: true,
   subtitleMode: 'translation',
   translationVolume: 1,
+  originalVolume: 1
 };
 
 const CANONICAL_SETTING_KEYS = new Set(Object.keys(DEFAULT_SETTINGS));
@@ -63,9 +66,11 @@ export function sanitizeSettings(value: unknown): SessionSettings {
       .trim()
       .slice(0, MAX_SERVER_TOKEN_LENGTH),
     liveVoice: enumValue(candidate.liveVoice, VOICE_IDS, DEFAULT_SETTINGS.liveVoice),
+    sourceLanguage: enumValue(candidate.sourceLanguage, SOURCE_LANGUAGES, DEFAULT_SETTINGS.sourceLanguage),
     subtitles: booleanValue(candidate.subtitles, DEFAULT_SETTINGS.subtitles),
     subtitleMode: enumValue(candidate.subtitleMode, SUBTITLE_MODES, DEFAULT_SETTINGS.subtitleMode),
-    translationVolume: volumeValue(candidate.translationVolume, DEFAULT_SETTINGS.translationVolume)
+    translationVolume: volumeValue(candidate.translationVolume, DEFAULT_SETTINGS.translationVolume),
+    originalVolume: volumeValue(candidate.originalVolume, DEFAULT_SETTINGS.originalVolume)
   };
 }
 

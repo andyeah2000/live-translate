@@ -46,6 +46,7 @@ async function mount(options: {
 } = {}) {
   const previousChrome = globalThis.chrome;
   const previousDocument = globalThis.document;
+  const previousFetch = globalThis.fetch;
   const elements = new Map<string, ElementMock>();
   const get = (selector: string) => {
     if (!elements.has(selector)) elements.set(selector, new ElementMock());
@@ -58,6 +59,8 @@ async function mount(options: {
   let listener: (message: Message, sender: chrome.runtime.MessageSender) => void = () => {};
   Object.assign(globalThis, {
     document: { querySelector: get, createElement: () => new ElementMock() },
+    // Server health probe: never reach a real local server from unit tests.
+    fetch: async () => new Response('{"ok":true}', { status: 200 }),
     chrome: {
       storage: { local: {
         get: async () => ({ ...stored }),
@@ -83,7 +86,11 @@ async function mount(options: {
           return options.permission ?? true;
         }
       },
-      tabs: { query: async () => [{ id: 7, url: options.url ?? 'https://example.com/video' }] }
+      tabs: {
+        query: async () => [{ id: 7, url: options.url ?? 'https://example.com/video' }],
+        get: async (id: number) => ({ id, title: 'Keynote – Live', url: options.url ?? 'https://example.com/video' })
+      },
+      commands: { getAll: async () => [{ name: 'toggle-translation', shortcut: '⌥⇧T' }] }
     }
   });
   if (popupModule) popupModule.initializePopup();
@@ -96,7 +103,7 @@ async function mount(options: {
       { url: trusted ? 'chrome-extension://test/background.js' : 'https://example.com/' }
     ),
     restore() {
-      Object.assign(globalThis, { chrome: previousChrome, document: previousDocument });
+      Object.assign(globalThis, { chrome: previousChrome, document: previousDocument, fetch: previousFetch });
     }
   };
 }
@@ -208,7 +215,7 @@ test('stop and voice failures are shown and leave controls usable', async () => 
     assert.equal(popup.get('#status').textContent, 'Backend nicht erreichbar');
     popup.get('#liveVoice').value = 'stone';
     popup.get('#liveVoice').dispatch('change');
-    await until(() => popup.messages.some(message => message.type === 'change-voice'));
+    await until(() => popup.messages.some(message => message.type === 'restart-session'));
     assert.equal(popup.get('#liveVoice').disabled, false);
   } finally { popup.restore(); }
 });
@@ -219,9 +226,9 @@ test('successful start, voice change and stop refresh the visible session', asyn
     if (message.type === 'get-state') return state;
     if (message.type === 'start-session') state = {
       ...idleState(), running: true, tabId: 7, sessionId: 'test-session', status: 'Live verbunden',
-      ducking: { ready: true, speaking: false, sourceGain: 0.42, probability: 0, error: null, translationReady: true, inputIndependent: true }
+      ducking: { ready: true, speaking: false, sourceGain: 0.42, probability: 0, error: null, translationReady: true, lagMs: 2_400, usageSeconds: 75 }
     };
-    if (message.type === 'change-voice') state = { ...state, status: 'Stimme aktualisiert' };
+    if (message.type === 'restart-session') state = { ...state, status: 'Stimme aktualisiert' };
     if (message.type === 'stop-session') state = idleState();
     return { ok: true };
   } });
@@ -232,8 +239,10 @@ test('successful start, voice change and stop refresh the visible session', asyn
     await until(() => !popup.get('#toggle').disabled);
     assert.equal(popup.messages.filter(message => message.type === 'start-session').length, 1);
     assert.equal(popup.get('#toggle').textContent, 'Stop');
-    assert.equal(popup.get('#originalValue').textContent, '42 %');
-    assert.equal(popup.get('#inputMode').textContent, 'DIRECT');
+    assert.equal(popup.get('#monitor').textContent, 'Original · 42%');
+    await until(() => popup.get('#tabInfo').textContent === '▶ Keynote – Live');
+    assert.equal(popup.get('#liveStats').textContent, 'Verzögerung 2,4 s · 1:15 min · ≈ 0,06 $');
+    assert.equal(popup.get('#shortcut').textContent, '⌥⇧T startet und stoppt im aktuellen Tab');
     assert.deepEqual(popup.permissions, []);
     popup.get('#liveVoice').value = 'marin';
     popup.get('#liveVoice').dispatch('change');
@@ -294,7 +303,7 @@ test('service worker startup failure is visible and a later broadcast recovers t
 });
 
 test('output controls are locked while a start or voice snapshot is being applied', async () => {
-  for (const action of ['start-session', 'change-voice'] as const) {
+  for (const action of ['start-session', 'restart-session'] as const) {
     let finish!: (value: { ok: boolean }) => void;
     const pending = new Promise<{ ok: boolean }>(resolve => { finish = resolve; });
     const popup = await mount({ send: async message => {
@@ -325,14 +334,14 @@ test('an active session can still be stopped during a pending voice change', asy
   let state = { ...idleState(), running: true, tabId: 7, sessionId: 'active' };
   const popup = await mount({ send: async message => {
     if (message.type === 'get-state') return state;
-    if (message.type === 'change-voice') return pending;
+    if (message.type === 'restart-session') return pending;
     if (message.type === 'stop-session') state = { ...state, running: false };
     return { ok: true };
   } });
   try {
     await popup.ready();
     popup.get('#liveVoice').dispatch('change');
-    await until(() => popup.messages.some(message => message.type === 'change-voice'));
+    await until(() => popup.messages.some(message => message.type === 'restart-session'));
     assert.equal(popup.get('#toggle').disabled, false, 'Stop remains available during voice negotiation');
     popup.get('#toggle').dispatch('click');
     await until(() => popup.messages.some(message => message.type === 'stop-session'));

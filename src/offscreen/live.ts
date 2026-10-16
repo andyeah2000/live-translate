@@ -21,6 +21,8 @@ export interface GptLiveTranslatorOptions {
   serverUrl: string;
   serverToken: string;
   voice?: string;
+  /** 'en' interprets English only; 'auto' every non-German language. */
+  sourceLanguage?: 'en' | 'auto';
   inputTranscriptionEnabled: boolean;
   onTranscript: (event: TranscriptEvent) => void;
   onStatus: (status: string) => void;
@@ -117,7 +119,7 @@ export class GptLiveTranslator {
 
   private async startConnection(): Promise<void> {
     if (this.stopped) throw new Error('Die GPT-Live-Sitzung wurde beendet.');
-    this.opts.onStatus('Verbinde mit GPT-Live…');
+    this.opts.onStatus('Verbinde…');
     if (this.opts.inputStream.getAudioTracks().length === 0) {
       throw new SessionRequestError('Der Quell-Tab enthält keine Audiospur für GPT-Live.', false);
     }
@@ -262,7 +264,7 @@ export class GptLiveTranslator {
     }
     this.closing = true;
     this.setReady(false);
-    this.opts.onStatus('GPT-Live-Sitzung wird beendet…');
+    this.opts.onStatus('Beende…');
     const events = this.events;
     const detail = 'GPT-Live konnte session.close nicht senden (unvollständige Finalisierung).';
     if (!events || events.readyState !== 'open') {
@@ -365,7 +367,7 @@ export class GptLiveTranslator {
           'Content-Type': 'application/json',
           'X-Live-Translate-Token': this.opts.serverToken
         },
-        body: JSON.stringify({ sdp, voice: this.opts.voice, dcid: EVENTS_CHANNEL_ID })
+        body: JSON.stringify({ sdp, voice: this.opts.voice, sourceLanguage: this.opts.sourceLanguage, dcid: EVENTS_CHANNEL_ID })
       });
     } catch {
       if (this.stopped) throw this.failure ?? new Error('Die GPT-Live-Sitzung wurde beendet.');
@@ -460,7 +462,7 @@ export class GptLiveTranslator {
         track.onended(new Event('ended'));
         return;
       }
-      this.opts.onStatus(`GPT-Live aktiv · Zielstimme verbunden · Spur ${this.attachedTrackIds.size}`);
+      console.info(`[live-translate] Deutsche Stimme verbunden (Spur ${this.attachedTrackIds.size}).`);
     } catch (error) {
       this.fail(`Die GPT-Live-Audiospur konnte nicht wiedergegeben werden: ${errorMessage(error)}`, false);
     }
@@ -483,16 +485,13 @@ export class GptLiveTranslator {
       if (this.stopped || this.closing || this.sessionClosed) return;
       this.resolveStart?.();
       this.clearStartTimer();
-      const audioTracks = this.peer
-        ?.getReceivers()
-        .filter((receiver) => receiver.track.kind === 'audio').length ?? 0;
-      this.opts.onStatus(`GPT-Live aktiv · Übersetzung läuft · Audio-Spuren: ${audioTracks}`);
+      this.opts.onStatus('Bereit · wartet auf Sprache');
       // Der Audiotrack kommt meist mit oder kurz nach session.started. Falls
       // nach 10 s immer noch keiner da ist, liegt der Fehler im Audiopfad –
       // das wird jetzt als Status sichtbar, statt still zu bleiben.
       this.audioWatchdog = window.setTimeout(() => {
         if (!this.stopped && this.ready && this.remoteAudio === null) {
-          this.opts.onStatus('Verbunden, aber kein Zielton vom Server · Untertitel laufen weiter');
+          this.opts.onStatus('Verbunden · deutsche Stimme fehlt, Untertitel laufen');
         }
       }, 10_000);
     } else if (event.kind === 'transcript') {

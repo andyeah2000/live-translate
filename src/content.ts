@@ -1,13 +1,11 @@
 import type { Message, TranscriptEvent } from './messages';
 import { placeSubtitleHost, subtitleFullscreenElement, subtitleOverlayTarget } from './subtitle-placement';
 import { SubtitleState } from './subtitle-state';
-import { installMediaInput } from './media-input';
 
 const flagged = window as unknown as { __liveTranslateLoaded?: boolean };
 if (!flagged.__liveTranslateLoaded) {
   flagged.__liveTranslateLoaded = true;
   setup();
-  installMediaInput();
 }
 
 function setup(): void {
@@ -99,7 +97,7 @@ function setup(): void {
         'justify-content: center',
         'z-index: 2147483647',
         'pointer-events: none',
-        'transition: opacity 0.4s'
+        'transition: opacity 0.25s'
       ].join(';');
 
       const shadow = host.attachShadow({ mode: 'closed' });
@@ -109,10 +107,10 @@ function setup(): void {
         .line {
           background: rgba(0, 0, 0, 0.75);
           color: #fff;
-          font: 600 clamp(18px, 2.4vmin + 6px, 44px)/1.35 system-ui, sans-serif;
+          font: 600 var(--lt-size, clamp(18px, 2.4vmin + 6px, 44px))/1.35 system-ui, sans-serif;
           padding: 0.2em 0.7em;
           border-radius: 0.3em;
-          max-width: min(80vw, 46ch);
+          max-width: min(var(--lt-width, 80vw), 46ch);
           text-align: center;
           text-wrap: balance;
           text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
@@ -138,7 +136,64 @@ function setup(): void {
       document.documentElement
     );
     placeSubtitleHost(host, target);
+    positionOverlay();
   }
+
+  /** The largest visible video on the page, which the subtitles belong to. */
+  function mainVideo(): HTMLVideoElement | null {
+    let best: HTMLVideoElement | null = null;
+    let bestArea = 0;
+    for (const video of document.querySelectorAll('video')) {
+      const rect = video.getBoundingClientRect();
+      const visibleWidth = Math.min(rect.right, innerWidth) - Math.max(rect.left, 0);
+      const visibleHeight = Math.min(rect.bottom, innerHeight) - Math.max(rect.top, 0);
+      const area = Math.max(0, visibleWidth) * Math.max(0, visibleHeight);
+      if (area > bestArea) {
+        best = video;
+        bestArea = area;
+      }
+    }
+    return bestArea >= 120 * 68 ? best : null;
+  }
+
+  /**
+   * Sit over the lower part of the playing video, sized to it, instead of at
+   * the window edge over comments. Fullscreen and pages without a visible
+   * video keep the viewport placement.
+   */
+  function positionOverlay(): void {
+    if (!host) return;
+    const video = document.fullscreenElement ? null : mainVideo();
+    if (!video) {
+      host.style.left = '0';
+      host.style.right = '0';
+      host.style.width = '';
+      host.style.bottom = '7%';
+      host.style.removeProperty('--lt-size');
+      host.style.removeProperty('--lt-width');
+      return;
+    }
+    const rect = video.getBoundingClientRect();
+    const left = Math.max(0, rect.left);
+    const right = Math.min(innerWidth, rect.right);
+    host.style.left = `${left}px`;
+    host.style.right = 'auto';
+    host.style.width = `${Math.max(0, right - left)}px`;
+    host.style.bottom = `${Math.max(0, innerHeight - Math.min(rect.bottom, innerHeight)) + rect.height * 0.08}px`;
+    host.style.setProperty('--lt-size', `${Math.round(Math.min(44, Math.max(16, rect.height * 0.045)))}px`);
+    host.style.setProperty('--lt-width', `${Math.round((right - left) * 0.9)}px`);
+  }
+
+  let positionFrame = 0;
+  const schedulePosition = () => {
+    if (positionFrame || !host || host.style.opacity === '0') return;
+    positionFrame = requestAnimationFrame(() => {
+      positionFrame = 0;
+      positionOverlay();
+    });
+  };
+  window.addEventListener('scroll', schedulePosition, { passive: true, capture: true });
+  window.addEventListener('resize', schedulePosition, { passive: true });
 
   function render(): void {
     const snapshot = subtitleState.snapshot();
@@ -229,6 +284,8 @@ function setup(): void {
       window.clearInterval(healthTimer);
       document.removeEventListener('fullscreenchange', onFullscreenChange);
       window.removeEventListener('pagehide', clear);
+      window.removeEventListener('scroll', schedulePosition, { capture: true });
+      window.removeEventListener('resize', schedulePosition);
       try {
         chrome.runtime.onMessage.removeListener(onMessage);
       } catch {

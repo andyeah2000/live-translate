@@ -92,3 +92,14 @@ test('monitor distinguishes idle, connecting, ready and fatal errors', () => {
   assert.deepEqual(popupMonitorPresentation(runningState({ ducking: null })), { text: 'Verbindet', state: 'loading' });
   assert.deepEqual(popupMonitorPresentation(runningState()), { text: 'Original · 100%', state: 'active' });
 });
+
+test('server status names the concrete fix for every failure', async () => {
+  const { serverHealthPresentation } = await import('../src/popup-logic');
+  const reply = (status: number) => async () => new Response('{}', { status });
+  assert.deepEqual(await serverHealthPresentation('http://127.0.0.1:8787/', 't', reply(200)), { text: '● Server bereit', state: 'ok' });
+  assert.equal((await serverHealthPresentation('http://127.0.0.1:8787', 't', reply(401))).text, '● Token falsch');
+  assert.equal((await serverHealthPresentation('http://127.0.0.1:8787', 't', reply(404))).text, '● Server veraltet – neu starten');
+  assert.equal((await serverHealthPresentation('http://127.0.0.1:8787', 't', reply(503))).text, '● API-Key fehlt am Server');
+  const offline = async () => { throw new TypeError('fetch failed'); };
+  assert.equal((await serverHealthPresentation('http://127.0.0.1:8787', 't', offline)).text, '● Server aus – npm run server');
+});
