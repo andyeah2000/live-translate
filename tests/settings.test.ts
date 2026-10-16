@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DEFAULT_SETTINGS, loadSettings, sanitizeSettings } from '../src/settings';
+import { DEFAULT_SETTINGS, loadSettings, normalizeServerUrl, sanitizeSettings, saveSettings } from '../src/settings';
 
 test('sanitizeSettings keeps only the canonical values', () => {
   assert.deepEqual(sanitizeSettings(null), DEFAULT_SETTINGS);
@@ -96,6 +96,49 @@ test('load preserves only canonical controls and removes every unknown key', asy
     for (const key of ['legacyToggle', 'grokKey', 'geminiKey', 'deeplKey']) {
       assert.ok(removed.includes(key), `${key} was not removed`);
     }
+  } finally {
+    if (previousChrome === undefined) delete (globalThis as { chrome?: unknown }).chrome;
+    else (globalThis as { chrome?: unknown }).chrome = previousChrome;
+  }
+});
+
+test('backend URL normalization rejects ambiguous and insecure addresses', () => {
+  assert.equal(normalizeServerUrl(' HTTPS://BACKEND.EXAMPLE/base/// '), 'https://backend.example/base');
+  assert.equal(normalizeServerUrl('http://localhost:8787/'), 'http://localhost:8787');
+  for (const url of ['', 'not a URL', 'http://remote.example', 'https://user:pass@example.com',
+    'https://example.com?token=secret', 'https://example.com/#fragment', null]) {
+    assert.equal(normalizeServerUrl(url), null, `must reject ${url}`);
+  }
+});
+
+test('settings migration waits for pending writes and failed saves do not block later saves', async () => {
+  const previousChrome = (globalThis as { chrome?: unknown }).chrome;
+  let stored = { ...DEFAULT_SETTINGS };
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let writes = 0;
+  let fail = false;
+  Object.assign(globalThis, { chrome: { storage: { local: {
+    get: async () => ({ ...stored }),
+    set: async (settings: typeof stored) => {
+      if (++writes === 1) await gate;
+      if (fail) throw new Error('storage unavailable');
+      stored = { ...settings };
+    },
+    remove: async () => {}
+  } } } });
+  try {
+    const save = saveSettings({ ...DEFAULT_SETTINGS, liveVoice: 'stone' });
+    const load = loadSettings();
+    release();
+    await save;
+    assert.equal((await load).liveVoice, 'stone');
+    assert.equal(stored.liveVoice, 'stone');
+    fail = true;
+    await assert.rejects(saveSettings(DEFAULT_SETTINGS), /storage unavailable/);
+    fail = false;
+    await saveSettings({ ...DEFAULT_SETTINGS, liveVoice: 'quartz' });
+    assert.equal(stored.liveVoice, 'quartz');
   } finally {
     if (previousChrome === undefined) delete (globalThis as { chrome?: unknown }).chrome;
     else (globalThis as { chrome?: unknown }).chrome = previousChrome;

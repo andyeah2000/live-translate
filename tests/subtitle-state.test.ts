@@ -61,3 +61,12 @@ test('timestamp gaps, not turn events, split GPT-Live transcript segments', () =
   state.apply({ kind: 'chunk', lane: 'target', text: ' Neuer Satz', startMs: 250, endMs: 300 }, 2);
   assert.deepEqual(state.snapshot(), { upper: 'Hallo', lower: ' Neuer Satz' });
 });
+
+test('interrupt resets the timestamp origin before a restarted media timeline', () => {
+  const state = new SubtitleState({ segmentGapMs: 100 });
+  state.apply({ kind: 'chunk', lane: 'target', text: 'discarded', startMs: 10000, endMs: 10100 }, 0);
+  state.apply({ kind: 'interrupt', lane: 'target' }, 1);
+  state.apply({ kind: 'chunk', lane: 'target', text: 'Neu', startMs: 0, endMs: 20 }, 2);
+  state.apply({ kind: 'chunk', lane: 'target', text: 'Danach', startMs: 200, endMs: 250 }, 3);
+  assert.deepEqual(state.snapshot(), { upper: 'Neu', lower: 'Danach' });
+});

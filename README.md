@@ -101,9 +101,9 @@ Der ladbare Build liegt anschließend in `dist/`.
 
 ## Backend starten
 
-Auf diesem Mac ist inzwischen ein automatischer Hintergrunddienst installiert:
-siehe [SERVER_SERVICE.md](SERVER_SERVICE.md). Kein Terminalstart nötig.
-Der folgende manuelle Start ist nur für andere Installationen gedacht.
+Nach dem Klonen muss das Backend separat gestartet werden. Ein bestehender
+Hintergrunddienst wird nicht mit dem Repository installiert. Die optionale
+LaunchAgent-Konfiguration ist in [SERVER_SERVICE.md](SERVER_SERVICE.md) beschrieben.
 
 ```bash
 npm run server # liest .env.local
@@ -113,9 +113,10 @@ npm run server # liest .env.local
 Der Server nimmt nur `POST /api/live/session` mit Origin-Check
 (`chrome-extension://` bzw. konfigurierte Origin) und zeitkonstantem
 Token-Vergleich entgegen und reicht SDP + Übersetzungskonfiguration an
-`POST /v1/live/sessions` mit der serverseitigen Dubbing-Konfiguration weiter. Er gibt die
-OpenAI-Antwort (`session.id` + `transport.sdp`) unverändert an die Extension
-zurück.
+`POST /v1/live/sessions` mit der serverseitigen Dubbing-Konfiguration weiter. Er prüft die
+OpenAI-Antwort und gibt nur die Sitzungs-ID und das WebRTC-SDP an die Extension
+zurück. Abgebrochene Browser-Anfragen brechen auch die laufende Serveranfrage
+ab; die Zeitgrenze gilt bis zum vollständig gelesenen Antwortkörper.
 
 ## Installation
 

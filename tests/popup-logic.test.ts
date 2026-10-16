@@ -32,6 +32,11 @@ test('start validation requires the GPT-Live server token', () => {
     configurationError({ ...DEFAULT_SETTINGS, liveServerUrl: '' }) ?? '',
     /Server-URL/
   );
+  for (const token of [' ', 'line\nbreak', 'two words', 'a'.repeat(1025), 'ä']) {
+    assert.match(configurationError({ ...DEFAULT_SETTINGS, liveServerToken: token }) ?? '', /token/i);
+  }
+  assert.equal(configurationError(DEFAULT_SETTINGS, false), null, 'saved tokens may be removed');
+  assert.match(configurationError({ ...DEFAULT_SETTINGS, liveServerUrl: 'garbage' }) ?? '', /HTTPS/);
   assert.equal(
     configurationError({ ...DEFAULT_SETTINGS, liveServerToken: 'local-token' }),
     null
@@ -48,6 +53,11 @@ test('URL validation blocks privileged and store pages', () => {
   assert.equal(isTranslatableUrl('blob:https://example.com/2f7a0b'), false);
   assert.equal(isTranslatableUrl('https://chromewebstore.google.com/detail/example'), false);
   assert.equal(isTranslatableUrl(undefined), false);
+  assert.equal(isTranslatableUrl('not a URL'), false);
+  assert.equal(isTranslatableUrl('javascript:alert(1)'), false);
+  assert.equal(isTranslatableUrl('HTTPS://CHROMEWEBSTORE.GOOGLE.COM/detail/example'), false);
+  assert.equal(isTranslatableUrl('https://chromewebstore.google.com.example.org/video'), true);
+  assert.equal(isTranslatableUrl('file:///Users/example/video.html'), true);
 });
 
 test('popup exposes live status text instead of silently discarding it', () => {
@@ -74,4 +84,11 @@ test('popup prioritizes a local ducking failure over the loading state', () => {
     }
   });
   assert.deepEqual(popupMonitorPresentation(state), { text: 'Mix vereinfacht', state: 'active' });
+});
+
+test('monitor distinguishes idle, connecting, ready and fatal errors', () => {
+  assert.deepEqual(popupMonitorPresentation(runningState({ error: 'Offline' })), { text: 'Fehler', state: 'error' });
+  assert.deepEqual(popupMonitorPresentation(runningState({ running: false })), { text: 'Bereit', state: 'idle' });
+  assert.deepEqual(popupMonitorPresentation(runningState({ ducking: null })), { text: 'Verbindet', state: 'loading' });
+  assert.deepEqual(popupMonitorPresentation(runningState()), { text: 'Original · 100%', state: 'active' });
 });

@@ -8,6 +8,7 @@ import {
 
 const ICE_GATHER_TIMEOUT_MS = 10_000;
 const START_TIMEOUT_MS = 20_000;
+const DISCONNECT_TIMEOUT_MS = 10_000;
 
 export interface GptLiveTranslatorOptions {
   ctx: AudioContext;
@@ -36,7 +37,9 @@ export class GptLiveTranslator {
   private meterSamples = new Float32Array(2048);
   private readonly outputActivity = new OutputActivity();
   private readonly requestAbort = new AbortController();
-  private startPoll: number | null = null;
+  private startPromise: Promise<void> | null = null;
+  private failure: Error | null = null;
+  private resolveStart: (() => void) | null = null;
   private rejectStart: ((error: Error) => void) | null = null;
   private stopped = false;
   private closing = false;
@@ -44,6 +47,8 @@ export class GptLiveTranslator {
   private startTimer: number | null = null;
   private receiverTimer: number | null = null;
   private audioWatchdog: number | null = null;
+  private disconnectTimer: number | null = null;
+  private playbackGeneration = 0;
   private attachedTrackIds = new Set<string>();
   private closePromise: Promise<void> = Promise.resolve();
   private resolveClosed: (() => void) | null = null;
@@ -55,13 +60,13 @@ export class GptLiveTranslator {
 
   constructor(private readonly opts: GptLiveTranslatorOptions) {}
 
-  async start(): Promise<void> {
-    try {
-      await this.startConnection();
-    } catch (error) {
+  start(): Promise<void> {
+    if (this.stopped) return Promise.reject(this.failure ?? new Error('Die GPT-Live-Sitzung wurde beendet.'));
+    this.startPromise ??= this.startConnection().catch((error: unknown) => {
       this.stop();
-      throw error;
-    }
+      throw this.failure ?? error;
+    });
+    return this.startPromise;
   }
 
   private async startConnection(): Promise<void> {
@@ -81,15 +86,27 @@ export class GptLiveTranslator {
 
     connection.addEventListener('track', (event) => this.attachRemoteAudio(event));
     connection.addEventListener('connectionstatechange', () => {
-      if (this.stopped) return;
+      if (this.stopped || this.sessionClosed) return;
       if (
         connection.connectionState === 'failed' ||
+        connection.connectionState === 'closed' ||
         (this.closing && connection.connectionState === 'disconnected')
       ) {
         const detail = this.closing
           ? 'Die GPT-Live-WebRTC-Verbindung wurde vor session.closed getrennt (unvollständige Finalisierung).'
           : 'Die GPT-Live-WebRTC-Verbindung ist fehlgeschlagen.';
         this.fail(detail);
+      } else if (connection.connectionState === 'disconnected') {
+        // Disconnected can recover after a short network interruption. It must
+        // not leave an indefinitely silent session marked ready if it cannot.
+        this.disconnectTimer ??= window.setTimeout(() => {
+          this.disconnectTimer = null;
+          if (connection.connectionState === 'disconnected') {
+            this.fail('Die GPT-Live-WebRTC-Verbindung wurde unterbrochen. Bitte neu starten.');
+          }
+        }, DISCONNECT_TIMEOUT_MS);
+      } else {
+        this.clearDisconnectTimer();
       }
     });
 
@@ -112,7 +129,7 @@ export class GptLiveTranslator {
       );
     });
     events.addEventListener('error', () => {
-      if (this.stopped) return;
+      if (this.stopped || this.sessionClosed) return;
       this.fail(
         this.closing
           ? 'Die GPT-Live-Ereignisverbindung ist vor session.closed fehlgeschlagen (unvollständige Finalisierung).'
@@ -128,7 +145,7 @@ export class GptLiveTranslator {
     if (!sdp) throw new Error('Chrome konnte kein WebRTC-Angebot für GPT-Live erzeugen.');
 
     const answer = await this.createSession(sdp);
-    if (this.stopped || connection !== this.peer) return;
+    if (this.stopped || connection !== this.peer) throw this.failure ?? new Error('Die GPT-Live-Sitzung wurde beendet.');
     await connection.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
     await this.waitForStart();
     this.watchReceivers();
@@ -140,7 +157,16 @@ export class GptLiveTranslator {
   }
 
   private async closeSession(timeoutMs: number): Promise<void> {
-    if (this.stopped || this.closing) return;
+    if (this.sessionClosed) return;
+    if (this.stopped) {
+      throw this.failure ?? new Error('GPT-Live wurde ohne session.closed beendet (unvollständige Finalisierung).');
+    }
+    if (!this.ready) {
+      // No commands are valid before session.started. Cancelling here must
+      // settle startup too, rather than leave its waiter alive after close.
+      this.stop();
+      throw new Error('GPT-Live wurde vor session.started beendet (unvollständige Finalisierung).');
+    }
     this.closing = true;
     this.setReady(false);
     this.opts.onStatus('GPT-Live-Sitzung wird beendet…');
@@ -180,7 +206,7 @@ export class GptLiveTranslator {
     if (this.stopped) return;
     this.stopped = true;
     this.requestAbort.abort();
-    this.rejectStart?.(new Error('Die GPT-Live-Sitzung wurde beendet.'));
+    this.rejectStart?.(this.failure ?? new Error('Die GPT-Live-Sitzung wurde beendet.'));
     this.rejectStart = null;
     this.closing = true;
     this.clearTimers();
@@ -209,6 +235,10 @@ export class GptLiveTranslator {
     this.remoteAudio = null;
     this.meter?.disconnect();
     this.meter = null;
+    if (this.lastTrack) this.lastTrack.onunmute = null;
+    this.lastTrack = null;
+    this.attachedTrackIds.clear();
+    this.playbackGeneration++;
     if (this.playback) {
       this.playback.pause();
       this.playback.srcObject = null;
@@ -240,6 +270,7 @@ export class GptLiveTranslator {
         body: JSON.stringify({ sdp, voice: this.opts.voice })
       });
     } catch {
+      if (this.stopped) throw this.failure ?? new Error('Die GPT-Live-Sitzung wurde beendet.');
       throw new Error('Der GPT-Live-Server ist nicht erreichbar. Bitte Server-URL und Netzwerk prüfen.');
     }
     if (!response.ok) {
@@ -257,15 +288,10 @@ export class GptLiveTranslator {
   }
 
   private attachRemoteAudio(event: RTCTrackEvent): void {
-    if (this.stopped || event.track.kind !== 'audio') return;
-    // Standardpfad: den vom Event gelieferten Stream nehmen, sonst einen
-    // bauen. Nur so ist sicher, dass exakt der verhandelte Track spielt.
-    const offered = event.streams.length > 0 ? event.streams[0] : undefined;
-    const stream =
-      offered !== undefined && offered.getAudioTracks().includes(event.track)
-        ? offered
-        : new MediaStream([event.track]);
-    this.connectTrack(event.track, stream);
+    if (this.stopped || this.sessionClosed || event.track.kind !== 'audio') return;
+    // MediaStreamAudioSourceNode chooses one track from a multi-track stream.
+    // Isolate the event track so another stream member can never be selected.
+    this.connectTrack(event.track, new MediaStream([event.track]));
   }
 
   /**
@@ -274,7 +300,7 @@ export class GptLiveTranslator {
    * angebunden. Ohne das bliebe die Sitzung bei laufenden Untertiteln stumm.
    */
   private watchReceivers(): void {
-    if (this.receiverTimer !== null || this.stopped) return;
+    if (this.receiverTimer !== null || this.stopped || this.closing || this.sessionClosed) return;
     this.receiverTimer = window.setInterval(() => {
       const peer = this.peer;
       if (this.stopped || this.closing || peer === null) {
@@ -297,8 +323,9 @@ export class GptLiveTranslator {
   }
 
   private connectTrack(track: MediaStreamTrack, stream: MediaStream): void {
-    if (this.stopped) return;
+    if (this.stopped || (this.lastTrack === track && this.remoteAudio !== null)) return;
     try {
+      if (this.lastTrack) this.lastTrack.onunmute = null;
       this.remoteAudio?.disconnect();
       console.info(
         `[live-translate] Remote-Audiotrack: readyState=${track.readyState} muted=${track.muted} enabled=${track.enabled}`
@@ -315,8 +342,11 @@ export class GptLiveTranslator {
       this.playback.muted = true;
       this.playback.srcObject = stream;
       if (!this.playback.isConnected) document.body.append(this.playback);
+      const playbackGeneration = ++this.playbackGeneration;
       void this.playback.play().catch(() => {
-        if (this.stopped) return;
+        // Replacing srcObject can reject the previous play() with AbortError.
+        // Only the current playback attempt may terminate this session.
+        if (this.stopped || this.sessionClosed || playbackGeneration !== this.playbackGeneration) return;
         this.fail('Chrome konnte die Zielstimme nicht starten. Bitte die Übersetzung neu starten.');
       });
       this.attachedTrackIds.add(track.id);
@@ -333,7 +363,7 @@ export class GptLiveTranslator {
   }
 
   private handleEvent(data: unknown): void {
-    if (this.stopped || typeof data !== 'string' || data.length > 262_144) return;
+    if (this.stopped || this.sessionClosed || typeof data !== 'string' || data.length > 262_144) return;
     let payload: unknown;
     try {
       payload = JSON.parse(data);
@@ -342,8 +372,10 @@ export class GptLiveTranslator {
     }
     const event = parseLiveServerEvent(payload);
     if (event.kind === 'started') {
-      if (this.closing) return;
+      if (this.closing || this.ready) return;
       this.setReady(true);
+      this.resolveStart?.();
+      this.clearStartTimer();
       // Empfängerstand direkt in den Status: So ist ohne Devtools sichtbar,
       // ob die Antwort überhaupt eine Audiospur enthält.
       const audioTracks = this.peer
@@ -395,27 +427,15 @@ export class GptLiveTranslator {
   }
 
   private waitForStart(): Promise<void> {
+    if (this.stopped) return Promise.reject(this.failure ?? new Error('Die GPT-Live-Sitzung wurde beendet.'));
     if (this.ready) return Promise.resolve();
     return new Promise((resolve, reject) => {
+      this.resolveStart = resolve;
       this.rejectStart = reject;
       this.startTimer = window.setTimeout(() => {
         this.clearStartTimer();
         reject(new Error('GPT-Live hat die Sitzung nicht rechtzeitig gestartet.'));
       }, START_TIMEOUT_MS);
-      const wait = () => {
-        if (this.ready) {
-          this.clearStartTimer();
-          resolve();
-          return;
-        }
-        if (this.stopped) {
-          this.clearStartTimer();
-          reject(new Error('Die GPT-Live-Sitzung wurde beendet.'));
-          return;
-        }
-        this.startPoll = window.setTimeout(wait, 25);
-      };
-      wait();
     });
   }
 
@@ -439,7 +459,8 @@ export class GptLiveTranslator {
 
   private fail(detail: string): void {
     if (this.stopped) return;
-    this.rejectClosed?.(new Error(detail));
+    this.failure = new Error(detail);
+    this.rejectClosed?.(this.failure);
     this.rejectClosed = null;
     this.resolveClosed = null;
     this.stop();
@@ -447,8 +468,8 @@ export class GptLiveTranslator {
   }
 
   private clearStartTimer(): void {
-    if (this.startPoll !== null) window.clearTimeout(this.startPoll);
-    this.startPoll = null;
+    this.rejectStart = null;
+    this.resolveStart = null;
     if (this.startTimer === null) return;
     window.clearTimeout(this.startTimer);
     this.startTimer = null;
@@ -457,6 +478,7 @@ export class GptLiveTranslator {
   private clearTimers(): void {
     this.clearStartTimer();
     this.clearReceiverTimer();
+    this.clearDisconnectTimer();
     if (this.audioWatchdog !== null) window.clearTimeout(this.audioWatchdog);
     this.audioWatchdog = null;
   }
@@ -465,6 +487,12 @@ export class GptLiveTranslator {
     if (this.receiverTimer === null) return;
     window.clearInterval(this.receiverTimer);
     this.receiverTimer = null;
+  }
+
+  private clearDisconnectTimer(): void {
+    if (this.disconnectTimer === null) return;
+    window.clearTimeout(this.disconnectTimer);
+    this.disconnectTimer = null;
   }
 }
 

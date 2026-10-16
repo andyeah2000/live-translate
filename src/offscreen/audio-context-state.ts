@@ -13,7 +13,7 @@ export function resumeAudioContextWithTimeout(
       () => reject(new Error(`Die Audio-Engine reagiert nicht (Status: ${ctx.state}).`)),
       timeoutMs
     );
-    ctx.resume().then(
+    Promise.resolve().then(() => ctx.resume()).then(
       () => {
         globalThis.clearTimeout(timer);
         if (ctx.state === 'running') {

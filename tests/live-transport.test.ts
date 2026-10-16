@@ -17,11 +17,12 @@ async function harness(run: (state: Awaited<ReturnType<typeof setup>>) => Promis
   }
 }
 
-async function setup(options: { response?: () => Promise<Response>; sourceCaptions?: boolean; failPlayback?: boolean } = {}) {
+async function setup(options: { response?: () => Promise<Response>; sourceCaptions?: boolean; failPlayback?: boolean; autoStart?: boolean } = {}) {
   const errors: string[] = [];
   const captions: TranscriptEvent[] = [];
   const statuses: string[] = [];
   const ready: boolean[] = [];
+  const timeouts = new Map<ReturnType<typeof setTimeout>, { callback: () => void; delay: number }>();
   const track = { kind: 'audio', id: 'remote', readyState: 'live', muted: false, enabled: true, onunmute: null as (() => void) | null };
   class Channel extends EventTarget {
     readyState = 'open';
@@ -46,15 +47,20 @@ async function setup(options: { response?: () => Promise<Response>; sourceCaptio
     createDataChannel() { return channel; }
     async createOffer() { return this.localDescription; }
     async setLocalDescription() {}
-    async setRemoteDescription() { queueMicrotask(() => channel.emit({ type: 'session.started', session: { id: 'live-test' } })); }
+    async setRemoteDescription() {
+      if (options.autoStart !== false) queueMicrotask(() => channel.emit({ type: 'session.started', session: { id: 'live-test' } }));
+    }
     getReceivers() { return this.receivers; }
     close() { this.closed = true; }
-    attach() { this.dispatchEvent(Object.assign(new Event('track'), { track, streams: [new Stream()] })); }
+    attach(remote = track, tracks = [remote]) {
+      this.dispatchEvent(Object.assign(new Event('track'), { track: remote, streams: [new Stream(tracks)] }));
+    }
   }
   const peer = new Peer();
   let disconnected = 0;
   const output = {};
   const connections: unknown[] = [];
+  const sourceStreams: Stream[] = [];
   const meter = { fftSize: 0, connect(node: unknown) { connections.push(node); return node; }, disconnect() { disconnected++; }, getFloatTimeDomainData(data: Float32Array) { data.fill(0.1); } };
   const source = { connect(node: unknown) { connections.push(node); return meter; }, disconnect() { disconnected++; } };
   let played = 0;
@@ -65,23 +71,154 @@ async function setup(options: { response?: () => Promise<Response>; sourceCaptio
     pause() {}, remove() { removed = true; }, removeAttribute() {}
   };
   Object.defineProperties(globalThis, {
-    window: { configurable: true, value: { setTimeout, clearTimeout, setInterval: (callback: () => void) => setInterval(callback, 10), clearInterval } },
+    window: { configurable: true, value: {
+      setTimeout(callback: () => void, delay: number) {
+        const timer = setTimeout(() => { timeouts.delete(timer); callback(); }, delay);
+        timeouts.set(timer, { callback, delay });
+        return timer;
+      },
+      clearTimeout(timer: ReturnType<typeof setTimeout>) { timeouts.delete(timer); clearTimeout(timer); },
+      setInterval: (callback: () => void) => setInterval(callback, 10), clearInterval
+    } },
     fetch: { configurable: true, value: options.response ?? (async () => new Response(JSON.stringify({ session: { id: 'live-test' }, transport: { sdp: 'answer' } }))) },
     RTCPeerConnection: { configurable: true, value: function () { return peer; } },
     MediaStream: { configurable: true, value: Stream },
     document: { configurable: true, value: { createElement: () => audio, body: { append() { audio.isConnected = true; } } } }
   });
   const client = new GptLiveTranslator({
-    ctx: { createMediaStreamSource: () => source, createAnalyser: () => meter } as unknown as AudioContext,
+    ctx: { createMediaStreamSource: (stream: Stream) => { sourceStreams.push(stream); return source; }, createAnalyser: () => meter } as unknown as AudioContext,
     inputStream: new Stream() as unknown as MediaStream, outputNode: output as AudioNode,
     serverUrl: 'http://localhost:8787', serverToken: 'local-test', voice: 'meridian',
     inputTranscriptionEnabled: options.sourceCaptions ?? true,
     onTranscript: event => captions.push(event), onStatus: status => statuses.push(status),
     onReadyChange: value => ready.push(value), onError: detail => errors.push(detail)
   });
-  return { client, peer, channel, track, audio, output, connections, captions, errors, statuses, ready,
+  return { client, peer, channel, track, audio, output, connections, sourceStreams, captions, errors, statuses, ready,
+    fireTimeouts(delay: number) {
+      for (const [timer, entry] of [...timeouts]) {
+        if (entry.delay !== delay) continue;
+        clearTimeout(timer); timeouts.delete(timer); entry.callback();
+      }
+    },
     resources: () => ({ disconnected, played, removed }) };
 }
+
+test('concurrent start calls share one connection and stopped clients cannot restart', async () => harness(async state => {
+  const first = state.client.start();
+  assert.equal(state.client.start(), first);
+  await first;
+  state.client.stop();
+  await assert.rejects(state.client.start(), /beendet/);
+}));
+
+test('startup cancellation while decoding the answer cannot report success', async () => {
+  let cancel = () => {};
+  await harness(async state => {
+    cancel = () => state.client.stop();
+    await assert.rejects(state.client.start(), /beendet/);
+    assert.equal(state.peer.closed, true);
+    assert.deepEqual(state.ready, []);
+  }, { response: async () => {
+    const response = new Response('{}');
+    response.json = async () => {
+      queueMicrotask(cancel);
+      return { session: { id: 'live-test' }, transport: { sdp: 'answer' } };
+    };
+    return response;
+  } });
+});
+
+test('session errors during startup retain the provider error', async () => harness(async state => {
+  const starting = state.client.start();
+  const rejected = assert.rejects(starting, /quota exceeded/);
+  state.channel.emit({ type: 'error', error: { message: 'quota exceeded' } });
+  await rejected;
+  assert.deepEqual(state.errors, ['quota exceeded']);
+}, { autoStart: false }));
+
+test('an unfinished stopped session cannot claim graceful finalization', async () => harness(async state => {
+  await state.client.start();
+  state.client.stop();
+  await assert.rejects(state.client.finishInput(), /unvollständige Finalisierung/);
+}));
+
+test('cancelling before session.started settles startup without sending a premature close command', async () => harness(async state => {
+  const starting = assert.rejects(state.client.start(), /beendet/);
+  await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(state.client.finishInput(), /vor session.started/);
+  await starting;
+  assert.deepEqual(state.channel.sent, []);
+  assert.deepEqual(state.ready, []);
+  assert.equal(state.peer.closed, true);
+}, { autoStart: false }));
+
+test('an immediate graceful close after session.started does not strand the startup waiter', async () => harness(async state => {
+  const starting = state.client.start();
+  await new Promise(resolve => setImmediate(resolve));
+  state.channel.emit({ type: 'session.started', session: { id: 'live-test' } });
+  const finishing = state.client.finishInput();
+  state.channel.emit({ type: 'session.closed' });
+  await Promise.all([starting, finishing]);
+  assert.deepEqual(state.ready, [true, false]);
+  assert.deepEqual(state.errors, []);
+}, { autoStart: false }));
+
+test('brief disconnects recover but a persistent disconnect terminates the session', async () => harness(async state => {
+  await state.client.start();
+  state.peer.connectionState = 'disconnected';
+  state.peer.dispatchEvent(new Event('connectionstatechange'));
+  assert.equal(state.peer.closed, false);
+  state.peer.connectionState = 'connected';
+  state.peer.dispatchEvent(new Event('connectionstatechange'));
+  state.fireTimeouts(10_000);
+  assert.equal(state.peer.closed, false);
+  state.peer.connectionState = 'disconnected';
+  state.peer.dispatchEvent(new Event('connectionstatechange'));
+  state.fireTimeouts(10_000);
+  assert.equal(state.peer.closed, true);
+  assert.match(state.errors[0] ?? '', /Verbindung/);
+  assert.deepEqual(state.ready, [true, false]);
+}));
+
+test('session.closed is terminal even when late transport events arrive', async () => harness(async state => {
+  await state.client.start();
+  const finishing = state.client.finishInput();
+  state.channel.emit({ type: 'session.output_transcript.delta', delta: 'final' });
+  state.channel.emit({ type: 'session.closed' });
+  await finishing;
+  state.channel.emit({ type: 'session.output_transcript.delta', delta: 'late' });
+  state.channel.emit({ type: 'session.delegation.created', delegation: { id: 'late' } });
+  state.channel.dispatchEvent(new Event('error'));
+  state.peer.connectionState = 'failed';
+  state.peer.dispatchEvent(new Event('connectionstatechange'));
+  assert.equal(state.captions.length, 1);
+  assert.deepEqual(state.errors, []);
+  assert.deepEqual(state.channel.sent.map(event => event.type), ['session.close']);
+}));
+
+test('remote playback selects the event track and ignores a duplicate track event', async () => harness(async state => {
+  await state.client.start();
+  const otherTrack = { ...state.track, id: 'aaa-other' };
+  state.peer.attach(state.track, [otherTrack, state.track]);
+  state.peer.attach();
+  await Promise.resolve();
+  assert.deepEqual(state.sourceStreams[0]?.getAudioTracks(), [state.track]);
+  assert.equal(state.resources().played, 1);
+}));
+
+test('an obsolete play rejection cannot kill a replacement audio track', async () => harness(async state => {
+  await state.client.start();
+  let rejectOld: (error: Error) => void = () => {};
+  state.audio.play = () => new Promise((_resolve, reject) => { rejectOld = reject; });
+  state.peer.attach();
+  state.audio.play = async () => {};
+  state.peer.attach({ ...state.track, id: 'replacement' });
+  rejectOld(new Error('play interrupted by replacement srcObject'));
+  await Promise.resolve();
+  assert.equal(state.peer.closed, false);
+  assert.deepEqual(state.errors, []);
+  assert.equal(state.client.audioHealth().live, true);
+}));
 
 test('remote audio has one audible Web Audio path and releases every resource', async () => harness(async state => {
   await state.client.start();

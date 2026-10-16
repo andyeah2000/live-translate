@@ -98,11 +98,15 @@ public final class LiveConnection {
                     case .closed(let seconds, _):
                         self.finalized = true; self.ready = false
                         if let seconds { self.usageSeconds = seconds }
-                    case .error(let detail): self.failure = LiveError.transport(detail)
+                    case .error(let detail):
+                        self.failure = LiveError.transport(detail)
+                        self.ready = false
                     default: break
                     }
                     self.onEvent?(event)
-                    if self.finalized { return }
+                    // Provider errors end this translation session. Later
+                    // events cannot restore readiness or confirm a failed run.
+                    if self.finalized || self.failure != nil { return }
                 }
             } catch {
                 guard let self, self.activeID == id, !Task.isCancelled, !self.finalized else { return }
@@ -120,10 +124,11 @@ public final class LiveConnection {
         do {
             try await sendData(profile.startEvent(voice: voice, englishOnly: englishOnly))
             let deadline = ContinuousClock.now + startupTimeout
-            while !ready {
+            while true {
                 try Task.checkCancellation()
                 if let failure { throw failure }
                 if finalized || closing || activeID != id { throw LiveError.transport("Sitzungsstart abgebrochen.") }
+                if ready { break }
                 guard ContinuousClock.now < deadline else { throw LiveError.timeout("GPT-Live antwortet nicht auf den Sitzungsstart.") }
                 try await Task.sleep(for: .milliseconds(25))
             }
@@ -155,6 +160,7 @@ public final class LiveConnection {
     public func close() async throws {
         guard socket != nil else { return }
         defer { release() }
+        if let failure { throw failure }
         if finalized { return }
         if !closing {
             closing = true

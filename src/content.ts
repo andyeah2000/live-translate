@@ -133,6 +133,12 @@ function setup(): void {
   }
 
   function render(): void {
+    const snapshot = subtitleState.snapshot();
+    if (!snapshot.upper && !snapshot.lower) {
+      if (host) host.style.opacity = '0';
+      clearNativeTrack();
+      return;
+    }
     const video = fullscreenVideo();
     if (video && renderNativeSubtitle(video)) {
       if (host) host.style.opacity = '0';
@@ -140,7 +146,6 @@ function setup(): void {
     }
     clearNativeTrack();
     ensureOverlay();
-    const snapshot = subtitleState.snapshot();
     if (previousLineEl) previousLineEl.textContent = snapshot.upper;
     if (currentLineEl) currentLineEl.textContent = snapshot.lower;
     if (host) host.style.opacity = '1';
@@ -150,7 +155,7 @@ function setup(): void {
     if (hideTimer !== undefined) clearTimeout(hideTimer);
     hideTimer = window.setTimeout(() => {
       if (host) host.style.opacity = '0';
-      clearNativeCue();
+      clearNativeTrack();
       subtitleState.hide();
     }, HIDE_AFTER_MS);
   }
@@ -163,6 +168,7 @@ function setup(): void {
 
   function clear(): void {
     if (hideTimer !== undefined) clearTimeout(hideTimer);
+    hideTimer = undefined;
     host?.remove();
     host = null;
     previousLineEl = null;

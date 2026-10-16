@@ -3,7 +3,75 @@
 Diese Datei trennt nachgewiesene Eigenschaften von Modellqualität, die ohne
 eine bilinguale menschliche Referenz nicht seriös garantiert werden kann.
 
-## Aktueller Prüfstand: 24. September 2026
+## Prüfstand: 16. Oktober 2026 · Version 3.0.1
+
+Geprüfte Ausgangsbasis: `f7d1a896230df5a0ce022198cefcf0e768814db6`.
+Dieser Durchlauf behebt belegte Fehler in Chrome, Backend und nativem
+Sitzungsstart. Er ist keine Zusicherung, dass unbekannte Fehler ausgeschlossen sind.
+
+- Vollständiges `npm run check` mit Node **24.22.0**, entsprechend der
+  CI-Hauptversion: TypeScript, ESLint, **165/165 Tests**, Coverage, MV3-Build und
+  Dependency-Audit erfolgreich. **0 bekannte Schwachstellen**.
+- TypeScript-Coverage: **96,88 % Lines / 85,50 % Branches / 85,51 % Functions**.
+  Alle ursprünglichen Mindestwerte **90/75/80** bleiben bestehen. Popup,
+  Content Script, direkte Media-Aufnahme und Offscreen-Bootstrap werden jetzt
+  zusätzlich getestet. Die Coverage-Ausführung enthält 146 TypeScript-Tests;
+  die Gesamtzahl 165 umfasst auch die separaten JavaScript-Tests.
+- **22/22 Swift-Tests** bestanden, einschließlich drei neuer Regressionen für
+  unmittelbar aufeinanderfolgende Start-, Fehler- und Abschlussereignisse.
+  Lokaler Befehl: `swift test --package-path macos --scratch-path /tmp/live-translate-swift-20261016`.
+  Der separate Buildpfad umgeht FileProvider-Metadaten im Documents-Ordner,
+  die beim ersten Versuch die lokale Codesign-Prüfung des Ressourcenbundles
+  blockierten. Ein neues signiertes macOS-Releasepaket wurde nicht erstellt.
+- Popup des gebündelten Builds in Chrome mit lokal simulierten Chrome-APIs
+  geprüft: initiale Anzeige, Start, Stop, sichtbare Statusmeldungen und
+  Ablehnung einer unzulässigen HTTP-Serveradresse. Das ist eine UI-Prüfung,
+  kein Nachweis einer echten Tab-Aufnahme oder Provider-Übersetzung.
+- Zehn Backend-Tests verwenden echte lokale HTTP-Verbindungen mit einem
+  simulierten OpenAI-Upstream. Abdeckung: Authentifizierung/Origin, Requestlimit,
+  Antwortvalidierung, Header-/Body-Timeout, Browserabbruch und Fehlerantworten.
+- Unabhängige Gegenprüfungen von Backend, Chrome-Lifecycle und UI durchgeführt;
+  die dabei gefundene verwaiste lokale Verbindung bei Offer-Timeout wurde
+  ebenfalls behoben und durch Regressionstests abgesichert.
+
+### Behobene Fehlergruppen
+
+- Start/Stopp: begrenzte Message-Antwortzeiten, unmittelbares Aufräumen auch
+  während eines Starts, keine doppelten WebRTC-Verbindungen, keine falsche
+  Start- oder Finalisierungsbestätigung nach Abbruch.
+- Audio: Originalton schon während lokaler Verbindungsverhandlung,
+  geprüfter direkter Eingang vor Providerstart, gespeicherte Stummschaltung
+  während des Starts, sichtbares Ende nach Verlust der Audio-Engine oder
+  Quellspur; verspätete Ereignisse verändern keine Ersatzsitzung.
+- WebRTC: Erholung bei kurzer Netzunterbrechung, begrenzter Disconnect-Zustand,
+  eindeutige Zielspur und Schutz vor Fehlern eines ersetzten Playback-Versuchs.
+- Popup/Einstellungen: sichtbare Statusmeldungen, Schutz vor veralteten
+  Zustandsantworten, einheitliche URL-/Tokenprüfung, geordnete Speicherung,
+  sichtbare Fehler bei Ausgabeänderungen.
+- Untertitel: keine leeren nativen Fullscreen-Tracks, Wiederverwendung und
+  Deaktivierung vorhandener Tracks, Zeitachsen-Reset nach Unterbrechung.
+- Backend: Abbruchweitergabe, vollständige Antwortprüfung, begrenzte Bodygröße,
+  lesbarer HTTP-413-Fehler statt Socket-Abbruch, keine ungeprüfte Weiterleitung
+  zusätzlicher Upstream-Felder.
+- Native App: Providerfehler können nicht durch spätere Bereitschafts- oder
+  Abschlussereignisse verdeckt werden.
+- Abhängigkeiten: `brace-expansion` im Lockfile von 5.0.9 auf 5.0.12 aktualisiert.
+
+### Modell und verbleibende Live-Abnahme
+
+`gpt-live-1`, WebRTC und die serverseitigen Dolmetscheranweisungen bleiben
+beibehalten. Der Session-Vertrag wurde am 16. Oktober 2026 mit der
+[offiziellen Create-Session-Dokumentation](https://developers.openai.com/api/reference/resources/live/methods/create)
+abgeglichen.
+
+In diesem frischen Checkout sind weder `.env.local`/`OPENAI_API_KEY` noch der
+früher dokumentierte LaunchAgent vorhanden. Es wurden keine kostenpflichtigen
+Live-Anfragen ausgeführt. Echte Chrome-Tab-Aufnahme, hörbare Übersetzung,
+bilinguale Genauigkeit und Ende-zu-Ende-Latenz bleiben daher offen.
+Die folgenden älteren Ergebnisse sind historische Evidenz und wurden nur dort
+erneut geprüft, wo der aktuelle Abschnitt dies ausdrücklich ausweist.
+
+## Historischer Prüfstand: 24. September 2026
 
 - `npm run check`: erfolgreich; Typecheck, ESLint, 105 Tests einschließlich
   Server-Tests, Coverage, MV3-Build und Audit mit null bekannten Schwachstellen.

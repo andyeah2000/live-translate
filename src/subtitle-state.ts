@@ -73,6 +73,8 @@ export class SubtitleState {
       case 'interrupt':
         lane.current = '';
         lane.lastUpdate = 0;
+        lane.startMs = undefined;
+        lane.endMs = undefined;
         break;
     }
     return this.snapshot();

@@ -10,7 +10,7 @@ import {
 import { resumeAudioContextWithTimeout } from './audio-context-state';
 import { GptLiveTranslator } from './live';
 import { NeuralVoiceDetector } from './neural-vad';
-import { belongsToActiveSession, shouldStartOffscreenSession } from './session-routing';
+import { belongsToActiveSession, shouldStartOffscreenSession, waitForLocalAudioConnection } from './session-routing';
 import { createSoftLimiterCurve } from './soft-limiter';
 import { dubbingSourceGain } from './dubbing-mix';
 import { gatherLocalDescription, validAudioSdp } from '../local-audio-bridge';
@@ -59,6 +59,8 @@ let tickCount = 0;
 // Nur die jüngste start()-Ausführung darf eine Session anlegen.
 let startGeneration = 0;
 let pendingStartSessionId: string | null = null;
+let pendingOutputSettings: { sessionId: string; settings: OutputSettings } | null = null;
+let cancelPendingStart: (() => void) | null = null;
 let gracefulStopPromise: Promise<void> | null = null;
 let finalizationError: string | null = null;
 
@@ -88,8 +90,12 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
       return undefined;
     }
     pendingStartSessionId = msg.sessionId;
+    pendingOutputSettings = null;
     void start(msg.sessionId, msg.streamId, msg.settings, msg.inputOffer).finally(() => {
-      if (pendingStartSessionId === msg.sessionId) pendingStartSessionId = null;
+      if (pendingStartSessionId === msg.sessionId) {
+        pendingStartSessionId = null;
+        pendingOutputSettings = null;
+      }
     });
   } else if (msg.type === 'offscreen-stop') {
     void stopGracefully().then(
@@ -105,6 +111,10 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
     sendResponse({ ok: true });
     if (belongsToActiveSession(session?.sessionId ?? null, msg.sessionId)) {
       applyOutputSettings(msg.settings);
+    } else if (belongsToActiveSession(pendingStartSessionId, msg.sessionId)) {
+      // Capture permission/ICE may still be pending after the start ack. Keep
+      // the latest slider value, especially mute, for the graph being built.
+      pendingOutputSettings = { sessionId: msg.sessionId, settings: msg.settings };
     }
   }
   return undefined;
@@ -112,10 +122,24 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
 
 async function start(sessionId: string, streamId: string, settings: SessionSettings, inputOffer?: string): Promise<void> {
   stop();
+  finalizationError = null;
   const generation = ++startGeneration;
   let pendingMedia: MediaStream | null = null;
   let pendingContext: AudioContext | null = null;
   let pendingInputPeer: RTCPeerConnection | null = null;
+  const disposePending = () => {
+    pendingInputPeer?.close();
+    pendingInputPeer = null;
+    if (pendingMedia) {
+      for (const track of pendingMedia.getTracks()) track.stop();
+      pendingMedia = null;
+    }
+    if (pendingContext) {
+      void pendingContext.close().catch(() => {});
+      pendingContext = null;
+    }
+  };
+  cancelPendingStart = disposePending;
   try {
     const media = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -144,6 +168,19 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     const captureTrack = media.getAudioTracks()[0];
     if (!captureTrack) throw new Error('Der Tab-Audiostream enthält keine Audiospur.');
     const source = ctx.createMediaStreamSource(media);
+
+    // Restore the tab's original output before waiting for local ICE. Chrome
+    // silences a captured tab, so delaying this graph would swallow its audio.
+    // Original and translated audio share a soft limiter; unlike a master
+    // compressor it leaves ordinary ambience levels unchanged.
+    const masterCeiling = ctx.createWaveShaper();
+    masterCeiling.curve = createSoftLimiterCurve();
+    masterCeiling.oversample = '4x';
+    masterCeiling.connect(ctx.destination);
+    const sourceGain = ctx.createGain();
+    sourceGain.gain.value = 1;
+    source.connect(sourceGain).connect(masterCeiling);
+
     let agentInput = media;
     if (validAudioSdp(inputOffer)) {
       const inputPeer = new RTCPeerConnection({ iceServers: [] });
@@ -157,29 +194,17 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
       if (!tracks.length) throw new Error('Direkter Videoeingang enthält keine Audiospur.');
       agentInput = new MediaStream(tracks);
       send({ type: 'offscreen-input-answer', sessionId, sdp });
+      await waitForLocalAudioConnection(inputPeer);
+      if (generation !== startGeneration) throw new Error('Start abgebrochen.');
       inputPeer.onconnectionstatechange = () => {
         if (session?.sessionId !== sessionId) return;
-        if (inputPeer.connectionState === 'failed' || inputPeer.connectionState === 'disconnected') {
+        if (['failed', 'disconnected', 'closed'].includes(inputPeer.connectionState)) {
           stop();
           send({ type: 'offscreen-error', sessionId, detail: 'Direkter Videoeingang unterbrochen. Bitte neu starten.' });
         }
       };
     }
     const analysisSource = agentInput === media ? source : ctx.createMediaStreamSource(agentInput);
-
-    // Ein Originalpfad; der Sidechain folgt ausschließlich hörbarem Dubbing.
-    // DynamicsCompressorNode besitzt in Chrome automatisches Makeup-Gain und
-    // verfärbte deshalb selbst den vermeintlich unberührten Originalton. Beide
-    // Pfade summieren direkt in diesen deterministischen Soft-Knee-Waveshaper:
-    // normale Atmo bleibt unverändert, nur die obersten 1,94 dB werden sicher
-    // begrenzt. 4x-Oversampling kostet konstante 4 ms, verhindert aber Aliasing.
-    const masterCeiling = ctx.createWaveShaper();
-    masterCeiling.curve = createSoftLimiterCurve();
-    masterCeiling.oversample = '4x';
-    masterCeiling.connect(ctx.destination);
-    const sourceGain = ctx.createGain();
-    sourceGain.gain.value = 1;
-    source.connect(sourceGain).connect(masterCeiling);
 
     // GPT-Live verhandelt Audio direkt über WebRTC. Der Quelltrack bleibt daher
     // unverändert; Resampling, PCM-Packaging und TTS-Playback im Extension-Code
@@ -188,7 +213,13 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     // bekommt einen live regelbaren Gain und einen Sicherheits-Limiter.
     const translatedInput = ctx.createGain();
     const translatedGain = ctx.createGain();
-    translatedGain.gain.value = settings.translationVolume;
+    const translationVolume = clamp01(
+      pendingOutputSettings?.sessionId === sessionId
+        ? pendingOutputSettings.settings.translationVolume
+        : settings.translationVolume,
+      1
+    );
+    translatedGain.gain.value = translationVolume;
     const translatedLimiter = ctx.createDynamicsCompressor();
     translatedLimiter.threshold.value = -3;
     translatedLimiter.knee.value = 3;
@@ -267,9 +298,9 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
           console.error('[live-translate] Tick-Fehler:', err);
         }
       }, TICK_MS) as unknown as number,
-      translationVolume: settings.translationVolume,
+      translationVolume,
       lastDuckGain: Number.NaN,
-      lastTranslatedTarget: settings.translationVolume,
+      lastTranslatedTarget: translationVolume,
       lastAudioHealthKey: null,
       sourceSpeaking: false,
       resumePending: false,
@@ -326,11 +357,7 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
     }
   } catch (err) {
     console.error('[live-translate] Start fehlgeschlagen:', err);
-    if (pendingMedia) {
-      for (const track of pendingMedia.getTracks()) track.stop();
-    }
-    if (pendingContext) void pendingContext.close().catch(() => {});
-    pendingInputPeer?.close();
+    disposePending();
     if (generation === startGeneration) {
       stop();
       send({
@@ -339,12 +366,20 @@ async function start(sessionId: string, streamId: string, settings: SessionSetti
         detail: err instanceof Error ? err.message : String(err)
       });
     }
+  } finally {
+    if (cancelPendingStart === disposePending) cancelPendingStart = null;
   }
 }
 
 function tick(): void {
   if (!session) return;
   const { ctx } = session;
+  if (ctx.state === 'closed') {
+    const sessionId = session.sessionId;
+    stop();
+    send({ type: 'offscreen-error', sessionId, detail: 'Chrome hat die Audio-Engine beendet. Bitte neu starten.' });
+    return;
+  }
   // Selbstheilung mit sichtbarem Fehler statt stumm geschluckter Resume-Probleme.
   // Auch ein resume(), das weder auflöst noch ablehnt, endet über den Timeout
   // in einem sichtbaren Fehler statt in einer dauerhaft stummen Sitzung.
@@ -489,6 +524,10 @@ function publishDuckingTelemetry(sessionId: string): void {
 
 function stop(): void {
   startGeneration++;
+  pendingOutputSettings = null;
+  const cancel = cancelPendingStart;
+  cancelPendingStart = null;
+  cancel?.();
   if (!session) return;
   const { client, vad, media, inputPeer, captureTrack, ctx, tickTimer } = session;
   session = null;

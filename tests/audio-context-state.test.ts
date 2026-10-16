@@ -31,3 +31,7 @@ test('audio context resume has a hard deadline', async () => {
 test('device permission errors propagate without leaving the resume deadline running', async () => {
   await assert.rejects(resumeAudioContextWithTimeout(fakeContext('suspended', async () => { throw 'device denied'; }), 500), /device denied/);
 });
+
+test('synchronous browser resume errors also cancel the deadline', async () => {
+  await assert.rejects(resumeAudioContextWithTimeout(fakeContext('closed', () => { throw new Error('context closed'); }), 500), /context closed/);
+});

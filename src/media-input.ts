@@ -27,7 +27,12 @@ export function installMediaInput(): void {
     if (!stream.getAudioTracks().length) throw new Error('Video liefert keine direkte Audiospur.');
     const connection = new RTCPeerConnection({ iceServers: [] });
     peer = connection;
-    stream.getAudioTracks().forEach(track => connection.addTrack(track, stream!));
+    stream.getAudioTracks().forEach(track => {
+      connection.addTrack(track, stream!);
+      // A media source replacement can end captured tracks without changing ICE.
+      // Close the bridge so the receiver's connection watchdog sees the loss.
+      track.onended = () => { if (peer === connection) stop(); };
+    });
     await connection.setLocalDescription(await connection.createOffer());
     const sdp = await gatherLocalDescription(connection);
     if (peer !== connection) throw new Error('Audioaufnahme ersetzt.');
@@ -44,13 +49,32 @@ export function installMediaInput(): void {
       });
       return true;
     }
-    if (message.type === 'media-input-answer' && message.sessionId === id && validAudioSdp(message.sdp)) {
+    if (message.type === 'media-input-answer') {
+      if (message.sessionId !== id || !validAudioSdp(message.sdp)) {
+        respond({ ok: false, error: 'Ungültige oder veraltete direkte Audioverbindung.' });
+        return;
+      }
       const expected = generation;
-      void peer?.setRemoteDescription({ type: 'answer', sdp: message.sdp }).catch(() => {
-        if (generation === expected) stop();
-      });
+      const connection = peer;
+      if (!connection) {
+        respond({ ok: false, error: 'Die direkte Audioaufnahme wurde beendet.' });
+        return;
+      }
+      void connection.setRemoteDescription({ type: 'answer', sdp: message.sdp }).then(
+        () => respond(generation === expected && peer === connection
+          ? { ok: true }
+          : { ok: false, error: 'Die direkte Audioaufnahme wurde ersetzt.' }),
+        () => {
+          if (generation === expected) stop();
+          respond({ ok: false, error: 'Die direkte Audioverbindung konnte nicht hergestellt werden.' });
+        }
+      );
+      return true;
     }
-    if (message.type === 'media-input-stop') stop();
+    if (message.type === 'media-input-stop') {
+      if (message.sessionId === undefined || message.sessionId === id) stop();
+      respond({ ok: true });
+    }
     return;
   });
   window.addEventListener('pagehide', stop);

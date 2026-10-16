@@ -1,7 +1,11 @@
-# Automatischer Server auf diesem Mac
+# Optionaler automatischer Server auf macOS
 
-Der Server läuft als Benutzer-LaunchAgent `com.andreas.live-translate`.
-Er startet bei Anmeldung und wird nach Prozessende automatisch neu gestartet.
+Die folgende Konfiguration beschreibt den zuvor eingerichteten Benutzer-LaunchAgent
+`com.andreas.live-translate`. Sie ist kein Nachweis, dass dieser Dienst auf dem
+aktuellen Mac installiert ist: Klonen oder Bauen des Repositories installiert
+keinen LaunchAgent. Ohne vorhandenen Dienst wird das Backend mit `npm run server`
+gestartet. Ein eingerichteter LaunchAgent startet bei Anmeldung und wird nach
+Prozessende automatisch neu gestartet.
 Codex und Terminal müssen nicht geöffnet bleiben. Im Ruhezustand arbeitet
 der Mac nicht weiter; nach dem Aufwachen kann eine neue Übersetzungssitzung nötig sein.
 
@@ -21,6 +25,7 @@ Dienst deaktivieren:
 Erneut aktivieren:
 `launchctl bootstrap gui/501 /Users/andreastumbrink/Library/LaunchAgents/com.andreas.live-translate.plist`
 
-Nicht gleichzeitig `npm run server` starten: Port 8787 gehört dem Hintergrunddienst.
+Wenn dieser Hintergrunddienst läuft, nicht zusätzlich `npm run server` starten:
+Port 8787 ist dann bereits belegt.
 Nach einem Verschieben des Projekts oder Entfernen von Homebrew Node müssen
 die absoluten Pfade in der Dienstdatei angepasst werden.

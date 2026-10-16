@@ -8,6 +8,7 @@ import type {
 } from './messages';
 import { sanitizeSettings } from './settings';
 import { validAudioSdp } from './local-audio-bridge';
+import { MessageTimeoutError, withMessageTimeout } from './message-timeout';
 
 const EMPTY_STATE: SessionState = {
   running: false,
@@ -78,12 +79,21 @@ function broadcast(msg: Message): void {
 async function sendToOffscreen(msg: Message): Promise<void> {
   for (let attempt = 0; attempt < 20; attempt++) {
     try {
-      const response = (await chrome.runtime.sendMessage(msg)) as { ok?: boolean; finalizationError?: string | null } | undefined;
+      const response = (await withMessageTimeout(
+        chrome.runtime.sendMessage(msg),
+        // A graceful stop drains up to 15 s; allow its final acknowledgement.
+        msg.type === 'offscreen-stop' ? 17_000 : 3_000,
+        'Die Audioverarbeitung antwortet nicht.'
+      )) as { ok?: boolean; finalizationError?: string | null } | undefined;
       if (response?.ok) {
         if (msg.type === 'offscreen-stop' && response.finalizationError) lastFinalizationError = response.finalizationError;
         return;
       }
-    } catch {
+    } catch (error) {
+      // A recipient that keeps its response port open must not multiply the
+      // full deadline by the retry count. Closing the document remains an
+      // independent way to stop a damaged audio engine.
+      if (error instanceof MessageTimeoutError) throw error;
       // Offscreen-Dokument (noch) nicht erreichbar.
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -202,8 +212,22 @@ async function startSession(
   const sessionId = crypto.randomUUID();
   try {
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
-    const inputOffer = await chrome.tabs.sendMessage(tabId, { type: 'media-input-offer', sessionId })
+    const inputOffer = await withMessageTimeout(
+      chrome.tabs.sendMessage(tabId, { type: 'media-input-offer', sessionId }),
+      6_000,
+      'Der direkte Videoeingang antwortet nicht.'
+    )
       .catch(() => null) as { sdp?: unknown } | null;
+    if (!validAudioSdp(inputOffer?.sdp)) {
+      // A timed-out offer may still finish inside the page. Cancel its scoped
+      // capture before using tab audio so the abandoned peer cannot remain
+      // alive for the entire fallback session or affect a later replacement.
+      await withMessageTimeout(
+        chrome.tabs.sendMessage(tabId, { type: 'media-input-stop', sessionId }),
+        1_000,
+        'Der direkte Videoeingang konnte nicht zurückgesetzt werden.'
+      ).catch(() => {});
+    }
     await ensureOffscreenDocument();
     await chrome.storage.session.set({
       subtitlesEnabled: settings.subtitles,
@@ -358,7 +382,21 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
     case 'offscreen-input-answer':
       void getState().then(async state => {
         if (state.running && state.sessionId === msg.sessionId && state.tabId !== null && validAudioSdp(msg.sdp)) {
-          await chrome.tabs.sendMessage(state.tabId, { type: 'media-input-answer', sessionId: msg.sessionId, sdp: msg.sdp });
+          try {
+            const answer = await withMessageTimeout(
+              chrome.tabs.sendMessage(state.tabId, { type: 'media-input-answer', sessionId: msg.sessionId, sdp: msg.sdp }),
+              6_000,
+              'Der direkte Videoeingang antwortet nicht.'
+            ) as { ok?: boolean; error?: string } | undefined;
+            if (!answer?.ok) throw new Error(answer?.error || 'Der direkte Videoeingang konnte nicht verbunden werden.');
+          } catch (error) {
+            await enqueueSessionOperation(async () => {
+              const current = await getState();
+              if (current.running && current.sessionId === msg.sessionId) {
+                await stopSession(error instanceof Error ? error.message : String(error));
+              }
+            });
+          }
         }
       }).catch(() => {});
       break;
@@ -395,8 +433,11 @@ chrome.runtime.onMessage.addListener((msg: Message, sender, sendResponse) => {
       return true;
     case 'update-output-settings':
       void enqueueSessionOperation(() => updateOutputSettings(msg))
-        .catch((err) => console.warn('[live-translate] Ausgabe-Einstellung fehlgeschlagen:', err));
-      break;
+        .then(() => sendResponse({ ok: true }), (err) => {
+          console.warn('[live-translate] Ausgabe-Einstellung fehlgeschlagen:', err);
+          sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
+        });
+      return true;
     case 'transcript':
       transcriptQueue = transcriptQueue
         .catch(() => {})

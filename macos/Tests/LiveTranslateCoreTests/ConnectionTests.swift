@@ -70,6 +70,55 @@ private final class FakeTransport: LiveTransport {
     #expect(transport.sent.count == 1)
 }
 
+@MainActor @Test func queuedProviderErrorsCannotBeHiddenByReadinessEvents() async throws {
+    let started = #"{"type":"session.started"}"#
+    let error = #"{"type":"error","error":{"message":"The session failed."}}"#
+    for events in [[started, error], [error, started]] {
+        let transport = FakeTransport()
+        for event in events { transport.emit(event) }
+        let connection = LiveConnection(transportFactory: { _ in transport })
+        await #expect(throws: LiveError.self) {
+            try await connection.start(apiKey: "local-test", profile: TranslationProfile.bundled(), voice: "meridian", englishOnly: true)
+        }
+        #expect(transport.closed)
+        #expect(!connection.ready)
+        #expect(!connection.finalized)
+        connection.abort()
+    }
+}
+
+@MainActor @Test func aTerminalErrorCannotRestoreReadinessOrClaimLateFinalization() async throws {
+    let transport = FakeTransport()
+    transport.emit(#"{"type":"session.started"}"#)
+    let connection = LiveConnection(transportFactory: { _ in transport })
+    try await connection.start(apiKey: "local-test", profile: TranslationProfile.bundled(), voice: "meridian", englishOnly: true)
+    var eventsAfterStartup = 0
+    connection.onEvent = { _ in eventsAfterStartup += 1 }
+    transport.emit(#"{"type":"error","error":{"message":"The session failed."}}"#)
+    transport.emit(#"{"type":"session.started"}"#)
+    transport.emit(#"{"type":"session.closed","usage":{"seconds":99}}"#)
+    try await Task.sleep(for: .milliseconds(5))
+    #expect(!connection.ready)
+    #expect(!connection.finalized)
+    #expect(eventsAfterStartup == 1)
+    await #expect(throws: LiveError.self) { try await connection.sendAudio(PCM.silence) }
+    await #expect(throws: LiveError.self) { try await connection.close() }
+    #expect(transport.closed)
+}
+
+@MainActor @Test func closureDuringStartupCannotReportAReadySession() async throws {
+    let transport = FakeTransport()
+    transport.emit(#"{"type":"session.started"}"#)
+    transport.emit(#"{"type":"session.closed","usage":{"seconds":1}}"#)
+    let connection = LiveConnection(transportFactory: { _ in transport })
+    await #expect(throws: LiveError.self) {
+        try await connection.start(apiKey: "local-test", profile: TranslationProfile.bundled(), voice: "meridian", englishOnly: true)
+    }
+    #expect(transport.closed)
+    #expect(!connection.ready)
+    #expect(connection.finalized)
+}
+
 @MainActor @Test func timeoutsReleaseTransportsWithoutClaimingFinalization() async throws {
     let startingTransport = FakeTransport()
     let starting = LiveConnection(transportFactory: { _ in startingTransport }, startupTimeout: .milliseconds(5))

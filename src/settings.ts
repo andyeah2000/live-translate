@@ -7,7 +7,7 @@ export const VOICE_IDS = new Set([
 ]);
 
 const SUBTITLE_MODES = new Set<SubtitleMode>(['translation', 'dual']);
-const MAX_SERVER_TOKEN_LENGTH = 1_024;
+export const MAX_SERVER_TOKEN_LENGTH = 1_024;
 const DEFAULT_SERVER_URL = 'http://127.0.0.1:8787';
 
 export const DEFAULT_SETTINGS: SessionSettings = {
@@ -36,20 +36,18 @@ function volumeValue(value: unknown, fallback: number): number {
     : fallback;
 }
 
-function serverUrlValue(value: unknown, fallback: string): string {
-  if (typeof value !== 'string') return fallback;
+/** Validate the same backend address before permission prompts and persistence. */
+export function normalizeServerUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
   try {
     const url = new URL(value.trim());
     const localHttp =
       url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost');
-    if (url.protocol !== 'https:' && !localHttp) return fallback;
-    url.username = '';
-    url.password = '';
-    url.search = '';
-    url.hash = '';
-    return url.toString().replace(/\/$/, '');
+    if (url.protocol !== 'https:' && !localHttp) return null;
+    if (url.username || url.password || url.search || url.hash) return null;
+    return url.toString().replace(/\/+$/, '');
   } catch {
-    return fallback;
+    return null;
   }
 }
 
@@ -62,7 +60,7 @@ export function sanitizeSettings(value: unknown): SessionSettings {
   const candidate = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
   return {
     settingsVersion: DEFAULT_SETTINGS.settingsVersion,
-    liveServerUrl: serverUrlValue(candidate.liveServerUrl, DEFAULT_SETTINGS.liveServerUrl),
+    liveServerUrl: normalizeServerUrl(candidate.liveServerUrl) ?? DEFAULT_SETTINGS.liveServerUrl,
     liveServerToken: stringValue(candidate.liveServerToken, '')
       .trim()
       .slice(0, MAX_SERVER_TOKEN_LENGTH),
@@ -73,20 +71,27 @@ export function sanitizeSettings(value: unknown): SessionSettings {
   };
 }
 
-export async function loadSettings(): Promise<SessionSettings> {
-  const stored = await chrome.storage.local.get(null);
-  const settings = sanitizeSettings(stored);
-  // Remove obsolete credentials and options; retain only current controls.
-  await chrome.storage.local.set(settings);
-  const unknownKeys = Object.keys(stored).filter((key) => !CANONICAL_SETTING_KEYS.has(key));
-  if (unknownKeys.length > 0) await chrome.storage.local.remove(unknownKeys);
-  return settings;
+let storageQueue: Promise<unknown> = Promise.resolve();
+
+function queueStorage<T>(operation: () => Promise<T>): Promise<T> {
+  const result = storageQueue.catch(() => {}).then(operation);
+  storageQueue = result;
+  return result;
 }
 
-let saveQueue: Promise<void> = Promise.resolve();
+export function loadSettings(): Promise<SessionSettings> {
+  return queueStorage(async () => {
+    const stored = await chrome.storage.local.get(null);
+    const settings = sanitizeSettings(stored);
+    // Remove obsolete credentials and options; retain only current controls.
+    await chrome.storage.local.set(settings);
+    const unknownKeys = Object.keys(stored).filter((key) => !CANONICAL_SETTING_KEYS.has(key));
+    if (unknownKeys.length > 0) await chrome.storage.local.remove(unknownKeys);
+    return settings;
+  });
+}
 
 export function saveSettings(settings: SessionSettings): Promise<void> {
   const sanitized = sanitizeSettings(settings);
-  saveQueue = saveQueue.catch(() => {}).then(() => chrome.storage.local.set(sanitized));
-  return saveQueue;
+  return queueStorage(() => chrome.storage.local.set(sanitized));
 }

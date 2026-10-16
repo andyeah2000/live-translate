@@ -63,6 +63,11 @@ let offscreenCloseAlwaysFails = false;
 let offscreenCloseCalls = 0;
 let captureStreamId = 'background-stream';
 let capturedTabs: Array<{ tabId: number; status: string; fullscreen: boolean }> = [];
+let stuckRuntimeMessage: string | null = null;
+let inputAnswerResponse: { ok: boolean; error?: string } = { ok: true };
+let inputAnswerGate: Deferred<void> | null = null;
+let stuckInputOffer = false;
+let stuckInputStop = false;
 
 const chromeMock = {
   action: {
@@ -99,6 +104,7 @@ const chromeMock = {
     sendMessage: async (message: Record<string, unknown>) => {
       runtimeMessages.push(message);
       lifecycleEvents.push(`runtime:${String(message.type)}`);
+      if (message.type === stuckRuntimeMessage) return new Promise(() => {});
       return typeof message.type === 'string' && message.type.startsWith('offscreen-')
         ? { ok: true }
         : undefined;
@@ -152,6 +158,13 @@ const chromeMock = {
   tabs: {
     sendMessage: async (tabId: number, message: Record<string, unknown>) => {
       tabMessages.push({ tabId, message });
+      lifecycleEvents.push(`tab:${String(message.type)}`);
+      if (message.type === 'media-input-offer' && stuckInputOffer) return new Promise(() => {});
+      if (message.type === 'media-input-stop' && stuckInputStop) return new Promise(() => {});
+      if (message.type === 'media-input-answer') {
+        if (inputAnswerGate) await inputAnswerGate.promise;
+        return inputAnswerResponse;
+      }
       if (message.type === 'subtitle' && subtitleSendGate) {
         const gate = subtitleSendGate;
         subtitleSendGate = null;
@@ -231,6 +244,11 @@ function reset(state = runningState(1, 'session-a')): void {
   offscreenCloseCalls = 0;
   captureStreamId = 'background-stream';
   capturedTabs = [];
+  stuckRuntimeMessage = null;
+  inputAnswerResponse = { ok: true };
+  inputAnswerGate = null;
+  stuckInputOffer = false;
+  stuckInputStop = false;
 }
 
 test('privileged messages from web-page senders are ignored entirely', async () => {
@@ -511,6 +529,85 @@ test('verified stop failure preserves the running state and reports failure', as
     status: 'Stop fehlgeschlagen',
     error: 'Die Audioverarbeitung konnte nicht beendet werden: mock close failed'
   });
+});
+
+test('a stuck offscreen stop response has a deadline and still forcibly closes capture', async (t) => {
+  reset();
+  offscreenDocument = true;
+  stuckRuntimeMessage = 'offscreen-stop';
+  const nativeTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (callback: () => void, delay: number) =>
+    nativeTimeout(callback, delay === 17_000 ? 10 : delay));
+
+  assert.deepEqual(await request({ type: 'stop-session' }), { ok: true });
+  assert.equal(offscreenDocument, false);
+  assert.equal(offscreenCloseCalls, 1);
+  assert.equal(runtimeMessages.filter(message => message.type === 'offscreen-stop').length, 1);
+  assert.match((sessionStore.sessionState as { error: string }).error, /unvollständige Finalisierung/);
+});
+
+test('a stuck offscreen start response is bounded and releases the failed capture', async (t) => {
+  reset(idleState());
+  stuckRuntimeMessage = 'offscreen-start';
+  const nativeTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (callback: () => void, delay: number) =>
+    nativeTimeout(callback, delay === 3_000 ? 10 : delay));
+
+  const result = await request({ type: 'start-session', tabId: 12, settings: {} });
+  assert.deepEqual(result, { ok: false, error: 'Die Audioverarbeitung antwortet nicht.' });
+  assert.equal(offscreenDocument, false);
+  assert.equal((sessionStore.sessionState as { running: boolean }).running, false);
+});
+
+test('output-setting requests report acknowledgement failures to the popup', async (t) => {
+  reset();
+  const settings = { subtitles: true, subtitleMode: 'translation', translationVolume: 0.5 };
+  assert.deepEqual(await request({ type: 'update-output-settings', settings }), { ok: true });
+  stuckRuntimeMessage = 'offscreen-update-output';
+  const nativeTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (callback: () => void, delay: number) =>
+    nativeTimeout(callback, delay === 3_000 ? 10 : delay));
+  assert.deepEqual(await request({ type: 'update-output-settings', settings }), {
+    ok: false, error: 'Die Audioverarbeitung antwortet nicht.'
+  });
+});
+
+test('an unresponsive direct-input offer is cancelled before bounded fallback to tab capture', async (t) => {
+  reset(idleState());
+  stuckInputOffer = true;
+  stuckInputStop = true;
+  const nativeTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (callback: () => void, delay: number) =>
+    nativeTimeout(callback, delay === 6_000 || delay === 1_000 ? 10 : delay));
+  assert.deepEqual(await request({ type: 'start-session', tabId: 12, settings: {} }), { ok: true });
+  const offer = tabMessages.find(({ message }) => message.type === 'media-input-offer');
+  const cancelled = tabMessages.find(({ message }) => message.type === 'media-input-stop');
+  const started = runtimeMessages.find(message => message.type === 'offscreen-start');
+  assert.equal(cancelled?.message.sessionId, offer?.message.sessionId);
+  assert.equal(cancelled?.message.sessionId, started?.sessionId);
+  assert.equal(started?.inputOffer, undefined);
+  assert.ok(tabMessages.indexOf(cancelled!) > tabMessages.indexOf(offer!));
+  assert.ok(lifecycleEvents.indexOf('tab:media-input-stop') < lifecycleEvents.indexOf('runtime:offscreen-start'));
+});
+
+test('a rejected local audio answer stops the matching session visibly', async () => {
+  reset();
+  inputAnswerResponse = { ok: false, error: 'local answer rejected' };
+  emit({ type: 'offscreen-input-answer', sessionId: 'session-a', sdp: 'v=0\r\nm=audio' });
+  await waitFor(() => (sessionStore.sessionState as { running: boolean }).running === false, 'input-answer failure');
+  assert.equal((sessionStore.sessionState as { error: string }).error, 'local answer rejected');
+});
+
+test('a stale local audio answer failure cannot stop a replacement session', async () => {
+  reset();
+  inputAnswerResponse = { ok: false };
+  inputAnswerGate = deferred<void>();
+  emit({ type: 'offscreen-input-answer', sessionId: 'session-a', sdp: 'v=0\r\nm=audio' });
+  await waitFor(() => tabMessages.some(({ message }) => message.type === 'media-input-answer'), 'input-answer send');
+  sessionStore.sessionState = runningState(2, 'session-b');
+  inputAnswerGate.resolve(undefined);
+  await sessionBarrier('session-b', 'barrier-answer-replaced');
+  assert.equal((sessionStore.sessionState as { running: boolean }).running, true);
 });
 
 test('forwardTranscript rechecks the session after an asynchronous state read', async () => {
