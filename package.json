@@ -21,7 +21,7 @@
     "macos:build": "node scripts/build-macos.mjs"
   },
   "devDependencies": {
-    "@types/chrome": "^0.3.5",
+    "@types/chrome": "^0.3.6",
     "esbuild": "^0.28.2",
     "eslint": "^10.13.0",
     "tsx": "^4.23.15",
