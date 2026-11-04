@@ -23,7 +23,7 @@
   "devDependencies": {
     "@types/chrome": "^0.3.5",
     "esbuild": "^0.28.2",
-    "eslint": "^10.13.0",
+    "eslint": "^10.14.0",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.71.2"
