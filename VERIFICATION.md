@@ -108,8 +108,8 @@ Sitzungsstart. Er ist keine Zusicherung, dass unbekannte Fehler ausgeschlossen s
 
 ### Modell und verbleibende Live-Abnahme
 
-`gpt-live-1`, WebRTC und die serverseitigen Dolmetscheranweisungen bleiben
-beibehalten. Der Session-Vertrag wurde am 16. Oktober 2026 mit der
+`gpt-live-1.1` in der bestehenden Live-Session, WebRTC und die serverseitigen Dolmetscheranweisungen bleiben
+beibehalten. Endpunkt, Session-Felder und Ereignisnamen sind unverändert. Der Session-Vertrag wurde am 16. Oktober 2026 mit der
 [offiziellen Create-Session-Dokumentation](https://developers.openai.com/api/reference/resources/live/methods/create)
 abgeglichen.
 

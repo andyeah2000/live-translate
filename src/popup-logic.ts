@@ -85,7 +85,7 @@ export function popupMonitorPresentation(state: SessionState): PopupMonitorPrese
   return { text: `Original · ${Math.round(state.ducking.sourceGain * 100)}%`, state: 'active' };
 }
 
-/** GPT-Live voice price per minute (developers.openai.com/api/docs/models/gpt-live-1). */
+/** GPT-Live voice price per minute (developers.openai.com/api/docs/models/gpt-live-1.1). */
 export const GPT_LIVE_USD_PER_MINUTE = 0.05;
 
 /** Delay, running time and cost of the active translation, or '' when idle. */
