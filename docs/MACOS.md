@@ -65,7 +65,7 @@ Das kompakte Pop-up enthält keine schnell wechselnden Sprach-/Hör-Indikatoren.
 ## Entwicklung und Prüfung
 
 ```bash
-swift test --package-path macos
+npm run macos:test
 npm run macos:build
 swift run --package-path macos LiveTranslateProbe --audio-self-test
 ```

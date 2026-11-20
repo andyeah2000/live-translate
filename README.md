@@ -18,6 +18,8 @@ npm run macos:test
 npm run macos:build
 ```
 
+ONNX Runtime 1.30.0 kommt aus den offiziellen Archiven auf download.onnxruntime.ai: `scripts/fetch-onnxruntime.mjs` prüft beide SHA-256-Summen und legt das xcframework plus die Objective-C-API für SwiftPM ab. Zum Aktualisieren die Version und die beiden Prüfsummen in diesem Skript auf die neuen Pod-Archive setzen und das Skript erneut ausführen.
+
 Die App liegt unter `macos/build/Live Translate.app` und lässt sich in den
 Programme-Ordner kopieren. Sie öffnet ein kleines Pop-up am Symbol in der
 Menüleiste und besitzt kein Dock-Symbol und kein Hauptfenster. Einstellungen,

@@ -8,13 +8,31 @@ let package = Package(
         .executable(name: "LiveTranslate", targets: ["LiveTranslate"]),
         .executable(name: "LiveTranslateProbe", targets: ["LiveTranslateProbe"])
     ],
-    dependencies: [
-        .package(url: "https://github.com/microsoft/onnxruntime-swift-package-manager", exact: "1.24.2")
-    ],
     targets: [
+        .binaryTarget(name: "onnxruntime", path: "Vendor/onnxruntime.xcframework"),
+        .target(
+            name: "OnnxRuntimeBindings",
+            dependencies: ["onnxruntime"],
+            path: "Vendor/OnnxRuntimeBindings",
+            publicHeadersPath: "include",
+            cSettings: [.headerSearchPath("capi")],
+            cxxSettings: [
+                .headerSearchPath("capi"),
+                .unsafeFlags(["-std=c++17", "-fobjc-arc-exceptions"])
+            ],
+            linkerSettings: [
+                .linkedFramework("CoreML"),
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("Foundation"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("Network"),
+                .linkedFramework("Security"),
+                .linkedFramework("SystemConfiguration"),
+                .linkedLibrary("c++")
+            ]
+        ),
         .target(name: "LiveTranslateCore", resources: [.process("Resources")]),
-        .target(name: "LiveTranslateAudio", dependencies: ["LiveTranslateCore",
-            .product(name: "onnxruntime", package: "onnxruntime-swift-package-manager")]),
+        .target(name: "LiveTranslateAudio", dependencies: ["LiveTranslateCore", "OnnxRuntimeBindings"]),
         .executableTarget(name: "LiveTranslate", dependencies: ["LiveTranslateCore", "LiveTranslateAudio"]),
         .executableTarget(name: "LiveTranslateProbe", dependencies: ["LiveTranslateCore", "LiveTranslateAudio"]),
         .testTarget(name: "LiveTranslateCoreTests", dependencies: ["LiveTranslateCore", "LiveTranslateAudio"])

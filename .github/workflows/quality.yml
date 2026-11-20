@@ -50,7 +50,7 @@ jobs:
           node-version: 24
 
       - name: Native protocol and audio tests
-        run: swift test --package-path macos
+        run: npm run macos:test
 
       - name: Build and verify the menu bar app
         env:

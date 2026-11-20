@@ -8,4 +8,5 @@ coverage/
 macos/.build/
 macos/build/
 macos/.swiftpm/
+macos/Vendor/
 artifacts/
