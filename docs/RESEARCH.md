@@ -8,7 +8,7 @@ bereits gemessene Übersetzungsqualität dieser App.
 
 | Primärquelle | Umsetzung |
 |---|---|
-| [GPT-Live](https://developers.openai.com/api/docs/guides/live), [Modell](https://developers.openai.com/api/docs/models/gpt-live-1) | `gpt-live-1`, kontinuierliches Hören und Sprechen, direktes Audio hinein und hinaus |
+| [GPT-Live](https://developers.openai.com/api/docs/guides/live), [Modell](https://developers.openai.com/api/docs/models/gpt-live-1.1) | `gpt-live-1.1` in der bestehenden Live-Session (`v1/live/sessions`), kontinuierliches Hören und Sprechen, direktes Audio hinein und hinaus |
 | [WebSocket](https://developers.openai.com/api/docs/guides/voice-websockets?api=live) | Native App: `wss://api.openai.com/v1/live/sessions`, Bearer-Key im Header, erstes Ereignis `session.start`, PCM16 mono mit 24 kHz |
 | [WebRTC](https://developers.openai.com/api/docs/guides/voice-webrtc?api=live) | Erweiterung: SDP über lokales Backend, Audio per MediaStreamTrack und Ereignisse über `oai-events`; kein zweites `session.start` |
 | [Sitzungen](https://developers.openai.com/api/docs/guides/live-conversations) | Erst nach `session.started` senden; mit `session.close` beenden und `session.closed` abwarten; kumulative Nutzungswerte ersetzen statt addieren |

@@ -27,7 +27,7 @@ import { createLiveSessionConfig, parseSessionRequest } from '../server/live-ses
 test('forwards only the exact GPT-Live handoff configuration', () => {
   assert.deepEqual(createLiveSessionConfig({ sdp: 'offer-sdp' }), {
     session: {
-      model: 'gpt-live-1',
+      model: 'gpt-live-1.1',
       instructions: DUBBING_PROMPT,
       store: false,
       audio: { output: { voice: 'meridian' } },

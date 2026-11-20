@@ -1,7 +1,7 @@
 # Live Translate
 
 Gesprochene Live-Übersetzung ins Deutsche mit **OpenAI GPT-Live
-(`gpt-live-1`)**. Als kleine native macOS-Menüleisten-App für Systemton oder
+(`gpt-live-1.1`)**. Als kleine native macOS-Menüleisten-App für Systemton oder
 eine einzelne App, zusätzlich als Chrome-Erweiterung für einen Tab.
 
 Die macOS-App verbindet sich direkt per WebSocket mit OpenAI. Die Erweiterung
@@ -48,7 +48,7 @@ Tab-Audio (MediaStreamTrack)
   │  WebRTC Offer (Browser) → POST /api/live/session (eigener Server)
   │                           → POST https://api.openai.com/v1/live/sessions
   ▼
-GPT-Live (gpt-live-1, Client-Delegation, Anweisungen = Dolmetscher)
+GPT-Live (gpt-live-1.1, Client-Delegation, Anweisungen = Dolmetscher)
   │
   ├─ Audio: Zielstimme als WebRTC-Remote-Track → translatedGain
   └─ Datenkanal oai-events:

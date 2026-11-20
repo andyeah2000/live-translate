@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { TRANSLATION_PROFILE } from './dubbing-prompt.mjs';
 import { createLiveSessionConfig, parseSessionRequest } from './live-session.mjs';
 
 const MAX_REQUEST_BYTES = 128 * 1024;
@@ -131,7 +132,7 @@ export function createLiveServer({
       }
       if (!apiKey) return send(response, 503, { error: 'Set OPENAI_API_KEY on the GPT-Live server.' }, origin);
       warmUpstream();
-      return send(response, 200, { ok: true, model: 'gpt-live-1' }, origin);
+      return send(response, 200, { ok: true, model: TRANSLATION_PROFILE.model }, origin);
     }
     if (request.method !== 'POST' || request.url !== SESSION_PATH) {
       return send(response, 404, { error: 'Not found.' }, allowedOrigin(origin) ? origin : null);

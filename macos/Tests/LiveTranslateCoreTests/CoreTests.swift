@@ -38,7 +38,7 @@ import Testing
     let event = try JSONSerialization.jsonObject(with: profile.startEvent(voice: "meridian", englishOnly: true)) as! [String: Any]
     let session = event["session"] as! [String: Any]
     #expect(event["type"] as? String == "session.start")
-    #expect(session["model"] as? String == "gpt-live-1")
+    #expect(session["model"] as? String == "gpt-live-1.1")
     #expect(session["store"] as? Bool == false)
     #expect((session["delegation"] as? [String: String]) == ["type": "client"])
     #expect(throws: LiveError.self) { try profile.startEvent(voice: "unexpected", englishOnly: true) }
