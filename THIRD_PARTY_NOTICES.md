@@ -37,10 +37,12 @@ SOFTWARE.
 ## ONNX Runtime (Web and native macOS)
 
 Local WASM runtime assets are provided by
-[Microsoft ONNX Runtime](https://github.com/microsoft/onnxruntime) through the
+[Microsoft ONNX Runtime](https://onnxruntime.ai/) through the
 `onnxruntime-web` npm package. The macOS app statically links ONNX Runtime
-1.24.2 via Microsoft's `onnxruntime-swift-package-manager` and embeds the same
-Silero model listed above.
+1.30.0 from the official CocoaPods archives
+`https://download.onnxruntime.ai/pod-archive-onnxruntime-c-1.30.0.zip` and
+`https://download.onnxruntime.ai/pod-archive-onnxruntime-objc-1.30.0.zip`
+and embeds the same Silero model listed above.
 
 - Copyright: Microsoft Corporation
 - License: MIT

@@ -6,6 +6,7 @@ import { selectSigningIdentity } from './macos-signing.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const packagePath = join(root, 'macos');
+execFileSync(process.execPath, [join(root, 'scripts', 'fetch-onnxruntime.mjs')], { stdio: 'inherit' });
 const explicitIdentity = process.env.LIVE_TRANSLATE_SIGN_IDENTITY;
 const signingIdentity = selectSigningIdentity(explicitIdentity?.trim() ? '' : execFileSync(
   'security', ['find-identity', '-v', '-p', 'codesigning'], { encoding: 'utf8' }

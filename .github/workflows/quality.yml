@@ -49,6 +49,9 @@ jobs:
         with:
           node-version: 24
 
+      - name: Fetch ONNX Runtime 1.30.0
+        run: node scripts/fetch-onnxruntime.mjs
+
       - name: Native protocol and audio tests
         run: swift test --package-path macos
 
