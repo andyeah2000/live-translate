@@ -22,7 +22,7 @@ const vendor = join(root, 'macos', 'Vendor');
 const framework = join(vendor, 'onnxruntime.xcframework');
 const bindings = join(vendor, 'OnnxRuntimeBindings');
 const stampPath = join(vendor, '.fetch-stamp');
-const stamp = `${version}\n${archives.c.sha256}\n${archives.objc.sha256}\n`;
+const stamp = `${version}\n${archives.c.sha256}\n${archives.objc.sha256}\nframework-root-binary\n`;
 
 if (existsSync(stampPath) && readFileSync(stampPath, 'utf8') === stamp
   && existsSync(join(framework, 'Info.plist'))
@@ -46,6 +46,13 @@ try {
   rmSync(vendor, { recursive: true, force: true });
   mkdirSync(vendor, { recursive: true });
   cpSync(join(cDir, 'onnxruntime.xcframework'), framework, { recursive: true });
+  const slice = join(framework, 'macos-arm64_x86_64', 'onnxruntime.framework');
+  const binary = join(slice, 'Versions', 'A', 'onnxruntime');
+  const headers = join(slice, 'Versions', 'A', 'Headers');
+  rmSync(join(slice, 'onnxruntime'), { force: true });
+  cpSync(binary, join(slice, 'onnxruntime'));
+  rmSync(join(slice, 'Headers'), { recursive: true, force: true });
+  cpSync(headers, join(slice, 'Headers'), { recursive: true });
   cpSync(join(cDir, 'Headers'), join(bindings, 'capi'), { recursive: true });
   mkdirSync(join(bindings, 'include'), { recursive: true });
   copyBindings(join(objcDir, 'objectivec'), bindings);
