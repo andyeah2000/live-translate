@@ -17,7 +17,7 @@
     "service:uninstall": "node scripts/server-service.mjs --uninstall",
     "build": "npm run typecheck && npm run bundle",
     "check": "npm run typecheck && npm run lint && npm run test && npm run coverage && npm run bundle && npm audit --audit-level=moderate",
-    "macos:test": "node scripts/fetch-onnxruntime.mjs && swift test --package-path macos",
+    "macos:test": "node scripts/fetch-onnxruntime.mjs && swift test --package-path macos -Xlinker -F -Xlinker \"$(pwd)/macos/Vendor/onnxruntime.xcframework/macos-arm64_x86_64\"",
     "macos:build": "node scripts/build-macos.mjs"
   },
   "devDependencies": {

@@ -14,8 +14,10 @@ const signingIdentity = selectSigningIdentity(explicitIdentity?.trim() ? '' : ex
 if (signingIdentity === '-') {
   console.warn('Ad-hoc-Testbuild: macOS-Audiofreigaben bleiben nach Codeänderungen nicht erhalten.');
 }
-execFileSync('swift', ['build', '--package-path', packagePath, '-c', 'release'], { stdio: 'inherit' });
-const bin = execFileSync('swift', ['build', '--package-path', packagePath, '-c', 'release', '--show-bin-path'], { encoding: 'utf8' }).trim();
+const frameworkSearch = join(packagePath, 'Vendor', 'onnxruntime.xcframework', 'macos-arm64_x86_64');
+const swiftLink = ['-Xlinker', '-F', '-Xlinker', frameworkSearch];
+execFileSync('swift', ['build', '--package-path', packagePath, '-c', 'release', ...swiftLink], { stdio: 'inherit' });
+const bin = execFileSync('swift', ['build', '--package-path', packagePath, '-c', 'release', '--show-bin-path', ...swiftLink], { encoding: 'utf8' }).trim();
 const app = join(packagePath, 'build', 'Live Translate.app');
 mkdirSync(join(app, 'Contents', 'MacOS'), { recursive: true });
 mkdirSync(join(app, 'Contents', 'Resources'), { recursive: true });
